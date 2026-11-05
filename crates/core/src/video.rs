@@ -477,8 +477,12 @@ impl VideoReceiver {
             return Ok(()); // already delivered or dropped
         }
         let resync_shard = h.flags & (frame_flags::KEYFRAME | frame_flags::RECOVERY) != 0;
-        if self.awaiting_resync && !resync_shard {
-            // Undecodable until a keyframe/recovery frame arrives; don't buffer.
+        // While waiting for a keyframe/recovery frame, frames that follow a
+        // resync frame still being assembled must be kept: they become
+        // decodable as soon as it completes. Anything else is undecodable.
+        let follows_resync =
+            self.awaiting_resync && self.frames.range(..id).any(|(_, p)| p.known && Self::is_resync(p));
+        if self.awaiting_resync && !resync_shard && !follows_resync {
             self.newest_seen = Some(self.newest_seen.map_or(id, |n| n.max(id)));
             return Ok(());
         }
@@ -487,7 +491,7 @@ impl VideoReceiver {
         // never heard of get placeholder entries so they can be NACKed whole.
         match self.newest_seen {
             Some(n) if id > n => {
-                if !self.awaiting_resync {
+                if !self.awaiting_resync || follows_resync {
                     let from = n + 1;
                     let lo = self.next_id.map_or(from, |x| x.max(from));
                     for missing in lo..id {
@@ -576,7 +580,7 @@ impl VideoReceiver {
                 for b in p.blocks.iter_mut().flatten() {
                     b.buf = Vec::new();
                 }
-                self.try_deliver();
+                self.try_deliver(now);
             }
         }
         Ok(())
@@ -586,7 +590,7 @@ impl VideoReceiver {
         p.flags & (frame_flags::KEYFRAME | frame_flags::RECOVERY) != 0
     }
 
-    fn try_deliver(&mut self) {
+    fn try_deliver(&mut self, now: u64) {
         loop {
             // A complete keyframe/recovery frame ahead of a stuck position (or
             // while awaiting resync) lets us jump forward.
@@ -631,6 +635,12 @@ impl VideoReceiver {
                 self.next_id = Some(k);
                 continue;
             }
+            // Make sure the frame we are waiting for is tracked, so it gets
+            // NACKed or eventually given up on (it may have been entirely lost
+            // or discarded while we were waiting for a keyframe).
+            if self.newest_seen.is_some_and(|n| n >= next) {
+                self.frames.entry(next).or_insert_with(|| Partial::unknown(now));
+            }
             return;
         }
     }
@@ -649,9 +659,14 @@ impl VideoReceiver {
         let nack_interval = (rtt_us * 3 / 2).max(2_000);
         let mut give_up = false;
         if self.awaiting_resync {
-            // Only (partial) resync frames are worth keeping while we wait.
+            // Keep (partial) resync frames and whatever follows the first one;
+            // everything older is undecodable.
             let max_wait = self.cfg.max_wait_us;
-            self.frames.retain(|_, p| p.known && Self::is_resync(p) && now.saturating_sub(p.first_us) < max_wait * 4);
+            let first_resync = self.frames.iter().find(|(_, p)| p.known && Self::is_resync(p)).map(|(id, _)| *id);
+            self.frames.retain(|id, p| {
+                (p.known && Self::is_resync(p) && now.saturating_sub(p.first_us) < max_wait * 4)
+                    || first_resync.is_some_and(|r| *id > r)
+            });
         }
 
         for (&id, p) in self.frames.iter_mut() {
@@ -738,7 +753,7 @@ impl VideoReceiver {
             self.awaiting_resync = true;
             self.next_id = Some(self.frames.keys().next().copied().unwrap_or(newest + 1));
             out.push(RecvEvent::NeedKeyframe { last_delivered: self.last_delivered });
-            self.try_deliver();
+            self.try_deliver(now);
         }
         out
     }
@@ -862,6 +877,50 @@ mod tests {
         // and every delivered frame must be intact (checked in run()).
         let (d, c) = run(0.20, 240, |i| if i % 60 == 0 { 100_000 } else { 20_000 }, 4);
         assert!(d > 100, "delivered {d}, {c:?}");
+    }
+
+    /// A keyframe that needs a retransmission while the following P-frames
+    /// already arrived must not stall the stream (regression).
+    #[test]
+    fn delayed_keyframe_with_following_frames() {
+        let mut tx = VideoSender::new(1371);
+        tx.fec = FecPolicy { ratio: 0.0, min_parity: 0, max_block_data: 64 };
+        let mut rx = VideoReceiver::new();
+        let mut now = 1_000u64;
+        let mut sent = Vec::new();
+        for i in 0..5u32 {
+            let key = i == 0;
+            let f = make_frame(i, if key { 20_000 } else { 3_000 }, key);
+            let mut pkts = Vec::new();
+            tx.send_frame(&f, if key { frame_flags::KEYFRAME } else { 0 }, |p| pkts.push(p.to_vec()));
+            for (j, p) in pkts.iter().enumerate() {
+                if key && j == 3 {
+                    continue; // lose one keyframe shard (no FEC)
+                }
+                rx.on_shard(&p[1..], now).unwrap();
+                now += 10;
+            }
+            sent.push(f);
+        }
+        assert!(rx.pop_ready().is_none());
+        // NACK -> retransmit completes the keyframe; all frames must follow.
+        let mut delivered = Vec::new();
+        for _ in 0..20 {
+            now += 1_000;
+            for ev in rx.poll(now, 500) {
+                if let RecvEvent::Nack(n) = ev {
+                    let mut rtx = Vec::new();
+                    tx.on_nack(&n[1..], |p| rtx.push(p.to_vec())).unwrap();
+                    for p in rtx {
+                        rx.on_shard(&p[1..], now).unwrap();
+                    }
+                }
+            }
+            while let Some(f) = rx.pop_ready() {
+                delivered.push(f.frame_id);
+            }
+        }
+        assert_eq!(delivered, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

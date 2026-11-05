@@ -546,6 +546,7 @@ fn render_loop(
     let mut last = Instant::now();
     let mut meta_last: Option<FrameMeta> = None;
     let mut errors = 0u32;
+    let mut log_n = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let s = win_size.load(Ordering::Relaxed);
         if s != size {
@@ -602,6 +603,10 @@ fn render_loop(
                 ),
                 None => format!("sard — {host_name} — waiting for video…"),
             };
+            if log_n % 5 == 0 {
+                info!("{title}");
+            }
+            log_n += 1;
             let _ = proxy.send_event(UserEvent::Stats(title));
             n = 0;
             bytes = 0;

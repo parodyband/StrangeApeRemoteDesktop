@@ -349,7 +349,16 @@ fn video_loop(
     Ok(())
 }
 
-/// Loss-driven bitrate controller: back off quickly on loss, probe up slowly.
+/// Congestion-aware bitrate controller.
+///
+/// Random packet loss (typical on Wi-Fi) is handled by FEC and retransmission,
+/// and lowering the bitrate would not reduce it. Only signals that indicate
+/// an overloaded path reduce the bitrate:
+/// * frames lost despite FEC + retransmission,
+/// * queueing delay (smoothed RTT well above the minimum RTT),
+/// * extreme raw loss (> 25%).
+///
+/// It probes back up slowly after a period of clean reports.
 struct RateControl {
     ceiling: u32,
     current: u32,
@@ -358,20 +367,21 @@ struct RateControl {
 }
 
 impl RateControl {
-    fn on_report(&mut self, received: u32, lost: u32) -> Option<u32> {
+    fn on_report(&mut self, received: u32, lost: u32, frames_lost: u32, rtt_us: u64, min_rtt_us: u64) -> Option<u32> {
         let total = received + lost;
-        if total < 20 {
+        if total < 20 && frames_lost == 0 {
             return None;
         }
-        let loss = lost as f32 / total as f32;
+        let loss = lost as f32 / total.max(1) as f32;
+        let queueing = min_rtt_us > 0 && rtt_us > min_rtt_us + (2 * min_rtt_us).max(4_000);
         let before = self.current;
-        if loss > 0.10 {
-            self.current = (self.current as f32 * 0.6) as u32;
+        if frames_lost > 0 || loss > 0.25 {
+            self.current = (self.current as f32 * 0.75) as u32;
             self.clean_reports = 0;
-        } else if loss > 0.03 {
-            self.current = (self.current as f32 * 0.85) as u32;
+        } else if queueing {
+            self.current = (self.current as f32 * 0.9) as u32;
             self.clean_reports = 0;
-        } else if loss < 0.005 {
+        } else {
             self.clean_reports += 1;
             if self.clean_reports >= 8 && self.last_change.elapsed() > Duration::from_secs(2) {
                 self.current = ((self.current as f32 * 1.10) as u32).min(self.ceiling);
@@ -429,12 +439,18 @@ fn input_loop(
             Event::MouseAbs { x, y } => inject(&mut input, InputEvent::MoveAbs { x, y }),
             Event::KeyframeRequest => shared.keyframe.store(true, Ordering::Relaxed),
             Event::Report(r) => {
-                if let Some(kbps) = rc.on_report(r.packets_received, r.packets_lost) {
+                let st = conn.stats();
+                if let Some(kbps) =
+                    rc.on_report(r.packets_received, r.packets_lost, r.frames_lost, st.rtt_us, st.min_rtt_us)
+                {
                     info!(
-                        "bitrate -> {:.1} Mbps (loss {}/{})",
+                        "bitrate -> {:.1} Mbps (loss {}/{}, frames lost {}, rtt {:.1}/{:.1} ms)",
                         kbps as f32 / 1000.0,
                         r.packets_lost,
-                        r.packets_received
+                        r.packets_received,
+                        r.frames_lost,
+                        st.rtt_us as f64 / 1000.0,
+                        st.min_rtt_us as f64 / 1000.0
                     );
                     shared.bitrate_kbps.store(kbps, Ordering::Relaxed);
                 }
@@ -523,14 +539,18 @@ mod tests {
     #[test]
     fn rate_control_backs_off_and_recovers() {
         let mut rc = RateControl { ceiling: 50_000, current: 50_000, last_change: Instant::now(), clean_reports: 0 };
-        assert_eq!(rc.on_report(1000, 200), Some(30_000));
-        assert_eq!(rc.on_report(1000, 50), Some(25_500));
+        // Random loss repaired by FEC: no change.
+        assert_eq!(rc.on_report(1000, 100, 0, 400, 300), None);
+        // Unrecoverable frames: back off.
+        assert_eq!(rc.on_report(1000, 100, 2, 400, 300), Some(37_500));
+        // Queueing delay: back off a little.
+        assert_eq!(rc.on_report(1000, 0, 0, 9_000, 300), Some(33_750));
         rc.last_change = Instant::now() - Duration::from_secs(5);
         let mut up = None;
         for _ in 0..8 {
-            up = rc.on_report(1000, 0).or(up);
+            up = rc.on_report(1000, 0, 0, 400, 300).or(up);
         }
-        assert_eq!(up, Some(28_050));
+        assert_eq!(up, Some(37_125));
     }
 
     #[test]

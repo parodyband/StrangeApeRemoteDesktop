@@ -118,6 +118,8 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnStats {
     pub rtt_us: u64,
+    /// Minimum RTT over the recent ping window (baseline without queueing).
+    pub min_rtt_us: u64,
     pub clock_offset_us: Option<i64>,
     pub tx_bps: f64,
     pub rx_bps: f64,
@@ -494,6 +496,7 @@ impl Conn {
         let tx = lock(&self.video_tx);
         let mut s = st.totals;
         s.rtt_us = st.srtt_us as u64;
+        s.min_rtt_us = st.clock.min_rtt_us().unwrap_or(0);
         s.clock_offset_us = st.clock.offset_us();
         s.tx_packets = self.tx_packets.load(Ordering::Relaxed);
         s.reliable_retransmits = st.reliable.retransmits;
@@ -704,6 +707,9 @@ struct Shared {
     accept_tx: Mutex<Option<Sender<Connection>>>,
     hs_cache: Mutex<HashMap<[u8; 32], HandshakeCache>>,
     last_untrusted_warn: AtomicU64,
+    /// Testing aid: drop this fraction of incoming DATA packets (`SARD_SIM_LOSS`).
+    sim_loss: f64,
+    sim_rng: Mutex<crate::rand::XorShift>,
     // Client role
     pending: Mutex<Option<PendingConnect>>,
 }
@@ -761,6 +767,8 @@ impl Shared {
             accept_tx: Mutex::new(None),
             hs_cache: Mutex::new(HashMap::new()),
             last_untrusted_warn: AtomicU64::new(0),
+            sim_loss: std::env::var("SARD_SIM_LOSS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            sim_rng: Mutex::new(crate::rand::XorShift(crate::rand::u64() | 1)),
             pending: Mutex::new(None),
         }))
     }
@@ -799,6 +807,9 @@ impl Shared {
 
     fn on_packet(self: &Arc<Self>, pkt: &[u8], from: SocketAddr) {
         if pkt.is_empty() {
+            return;
+        }
+        if self.sim_loss > 0.0 && pkt[0] == packet::DATA && lock(&self.sim_rng).chance(self.sim_loss) {
             return;
         }
         match pkt[0] {
