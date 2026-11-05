@@ -226,7 +226,7 @@ fn base_url() -> String {
 fn fetch_manifest() -> Result<Manifest> {
     let base = base_url();
     if base != DEFAULT_BASE_URL {
-        sard_core::info!("update: using {BASE_URL_ENV}={base}");
+        sard_core::info!("using {BASE_URL_ENV}={base}");
     }
     let manifest = curl(&format!("{base}/latest.txt"), MAX_MANIFEST_BYTES, None, 60)?;
     let sig = curl(&format!("{base}/latest.txt.sig"), MAX_SIG_BYTES, None, 60)?;
@@ -607,7 +607,7 @@ fn install_bundle(info: &UpdateInfo, bundle: &Path) -> Result<()> {
 
     // Atomic swap: afterwards `new_app` holds the old bundle, removed with the stage directory.
     if let Err(e) = swap_paths(&new_app, bundle) {
-        sard_core::debug!("update: RENAME_SWAP failed ({e}), replacing in two steps");
+        sard_core::debug!("RENAME_SWAP failed ({e}), replacing in two steps");
         let old = stage.0.join("old.app");
         fs::rename(bundle, &old).map_err(|e| format!("cannot move {} aside: {e}", bundle.display()))?;
         if let Err(e) = fs::rename(&new_app, bundle) {

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Sard
+GenericName=Remote Desktop
+Comment=Low-latency remote desktop between Linux and macOS
+Exec=sard
+TryExec=sard
+Icon=sard
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;stream;screen;share;vnc;
+StartupNotify=false

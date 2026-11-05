@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hardened-runtime entitlements for release builds of scripts/macos-app.sh.
+     Screen capture (ScreenCaptureKit), CGEvent injection and the system frameworks sard
+     links need none; the audio-input entitlement only takes effect together with the
+     Microphone permission and matches NSMicrophoneUsageDescription in Info.plist. -->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
