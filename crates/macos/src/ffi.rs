@@ -451,6 +451,9 @@ unsafe extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     pub fn AXIsProcessTrusted() -> Boolean;
+    /// With `{kAXTrustedCheckOptionPrompt: true}` shows the system prompt.
+    pub fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> Boolean;
+    pub static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
 }
 
 // ------------------------------------------------- Metal, QuartzCore, SCKit

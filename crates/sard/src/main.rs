@@ -69,7 +69,12 @@ ENVIRONMENT:
 
 fn main() -> ExitCode {
     sard_core::log::init();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // Launched as an app bundle with no arguments (double-click, or macOS's
+    // "Quit & Reopen" after granting a permission): act as a host.
+    if argv.is_empty() && std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
+        argv.push("host".into());
+    }
     let Some((cmd, rest)) = argv.split_first() else {
         print!("{USAGE}");
         return ExitCode::SUCCESS;

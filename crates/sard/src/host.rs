@@ -68,6 +68,12 @@ pub fn run(args: &Args) -> Result<()> {
         println!();
     }
     println!("{}", platform::describe());
+    if !args.flag("test-pattern") {
+        let missing = platform::request_host_permissions();
+        for m in &missing {
+            println!("  ! permission needed — {m}");
+        }
+    }
     println!("Waiting for a client... (Ctrl+C to stop)");
 
     // One session at a time; a new client takes over from the current one

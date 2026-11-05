@@ -30,6 +30,11 @@ pub fn create_video_sink(
     Ok(Box::new(GlVideoSink::new(display, window, width, height)?))
 }
 
+/// Nothing to pre-authorize on Linux (the portal asks when capture starts).
+pub fn request_host_permissions() -> Vec<String> {
+    Vec::new()
+}
+
 /// Decode-only video output without a window (tests/benchmarks).
 pub fn create_headless_sink() -> media::Result<Box<dyn VideoSink>> {
     Ok(Box::new(crate::headless::HeadlessSink::new()?))

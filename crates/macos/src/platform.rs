@@ -20,6 +20,29 @@ pub fn open_host(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, B
     crate::capture::open(opts)
 }
 
+/// Ask for the permissions a host needs, showing the system prompts now
+/// (rather than when the first client connects). Returns what is still missing.
+pub fn request_host_permissions() -> Vec<String> {
+    let mut missing = Vec::new();
+    // SAFETY: plain permission queries/requests; the dictionary outlives the call.
+    unsafe {
+        if !crate::ffi::CGPreflightScreenCaptureAccess() {
+            crate::ffi::CGRequestScreenCaptureAccess();
+            missing.push(
+                "Screen Recording: System Settings → Privacy & Security → Screen & System Audio Recording → \
+                 enable Sard, then restart the host"
+                    .to_string(),
+            );
+        }
+        let opts = crate::cf::Dict::new().set(crate::ffi::kAXTrustedCheckOptionPrompt, crate::cf::kCFBooleanTrue);
+        if crate::ffi::AXIsProcessTrustedWithOptions(opts.as_ptr()) == 0 {
+            missing
+                .push("Accessibility: System Settings → Privacy & Security → Accessibility → enable Sard".to_string());
+        }
+    }
+    missing
+}
+
 /// Called on the main thread right after the window is created.
 pub fn create_video_sink(
     display: RawDisplayHandle,
