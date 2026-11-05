@@ -67,6 +67,10 @@ cat > "$app/Contents/Info.plist" <<EOF
     <key>LSMinimumSystemVersion</key>        <string>13.0</string>
     <key>LSApplicationCategoryType</key>     <string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key>       <true/>
+    <!-- Background agent: the host has no window, so it must not sit in the
+         Dock bouncing. The client switches itself to a regular app (Dock icon,
+         menu) when it opens its window. -->
+    <key>LSUIElement</key>                   <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Sard streams this Mac's screen to the remote-desktop client you paired with.</string>

@@ -36,6 +36,18 @@ pub fn run(args: &Args) -> Result<()> {
     let trusted: HashMap<[u8; 32], String> = trust.peers.iter().map(|p| (p.key, p.name.clone())).collect();
     let trust = Arc::new(Mutex::new(trust));
     let trust2 = Arc::clone(&trust);
+    // Also leave the active code in a private file: when the host runs without
+    // a terminal (macOS app bundle, systemd), that's where to find it.
+    let code_file = dir.join("pairing-code.txt");
+    let _ = std::fs::remove_file(&code_file);
+    if let Some(code) = &pairing {
+        let _ = config::write_private_file(
+            &dir,
+            "pairing-code.txt",
+            &format!("{code}\n# single use, valid for 10 minutes from host start\n"),
+        );
+    }
+    let code_file2 = code_file.clone();
 
     let port: u16 = args.parse_value("port")?.unwrap_or(sard_core::DEFAULT_PORT);
     let bind: SocketAddr = format!("{}:{port}", args.value("bind").unwrap_or("0.0.0.0")).parse()?;
@@ -52,6 +64,7 @@ pub fn run(args: &Args) -> Result<()> {
                 if let Err(e) = trust2.lock().unwrap().add(key, name) {
                     error!("could not save trusted client: {e}");
                 }
+                let _ = std::fs::remove_file(&code_file2); // the code is spent
             })),
         },
     )?;

@@ -39,6 +39,11 @@ pub fn hostname() -> String {
     s.trim_end_matches(".local").to_string()
 }
 
+/// Write a file in the config directory readable only by this user.
+pub fn write_private_file(dir: &Path, name: &str, contents: &str) -> io::Result<()> {
+    write_private(&dir.join(name), contents)
+}
+
 fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
