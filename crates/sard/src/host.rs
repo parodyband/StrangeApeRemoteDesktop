@@ -70,20 +70,36 @@ pub fn run(args: &Args) -> Result<()> {
     println!("{}", platform::describe());
     println!("Waiting for a client... (Ctrl+C to stop)");
 
+    // One session at a time; a new client takes over from the current one
+    // (personal use: reconnecting from another machine should just work).
+    let mut current: Option<(Connection, std::thread::JoinHandle<()>)> = None;
     loop {
         let Some(conn) = host.accept(Duration::from_secs(3600)) else {
             continue;
         };
-        info!("session start: {} from {}", conn.peer_name(), conn.peer_addr());
-        match serve(&conn, args) {
-            Ok(()) => info!("session with {} ended", conn.peer_name()),
-            Err(e) => {
-                error!("session with {} failed: {e}", conn.peer_name());
-                conn.send_control(&Control::Status { text: format!("host error: {e}") });
-                std::thread::sleep(Duration::from_millis(200));
+        if let Some((old, handle)) = current.take() {
+            if !old.is_closed() {
+                info!("{} connected; ending the session with {}", conn.peer_name(), old.peer_name());
+                old.send_control(&Control::Status { text: format!("{} took over this host", conn.peer_name()) });
+                std::thread::sleep(Duration::from_millis(50));
+                old.close();
             }
+            let _ = handle.join();
         }
-        conn.close();
+        info!("session start: {} from {}", conn.peer_name(), conn.peer_addr());
+        let (c, a) = (conn.clone(), args.clone());
+        let handle = std::thread::Builder::new().name("sard-session".into()).spawn(move || {
+            match serve(&c, &a) {
+                Ok(()) => info!("session with {} ended", c.peer_name()),
+                Err(e) => {
+                    error!("session with {} failed: {e}", c.peer_name());
+                    c.send_control(&Control::Status { text: format!("host error: {e}") });
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            c.close();
+        })?;
+        current = Some((conn, handle));
     }
 }
 
@@ -194,7 +210,9 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
     );
     let mut opts = negotiate(&hello, args)?;
     if !opts.test_pattern {
-        conn.send_control(&Control::Status { text: "waiting for screen-share approval on the host...".into() });
+        conn.send_control(&Control::Status {
+            text: "starting screen capture (approve the share dialog on the host if one appears)...".into(),
+        });
     }
     let (mut source, input) = platform::open_host(&opts)?;
     let (w, h) = source.size();

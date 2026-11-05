@@ -160,7 +160,11 @@ impl Session {
         }
         request(&conn, SC, "SelectSources", vec![Value::Path(path.clone()), dict(o)], quick)?;
 
-        info!("portal: waiting for screen-share approval (a dialog may be shown on this machine)...");
+        if restore_token.is_some() {
+            debug!("portal: starting with saved approval");
+        } else {
+            info!("portal: waiting for screen-share approval (a dialog is shown on this machine)...");
+        }
         let started = request(
             &conn,
             iface,
