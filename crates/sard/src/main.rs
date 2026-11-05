@@ -6,6 +6,7 @@ mod clipsync;
 mod host;
 mod keymap;
 mod platform;
+mod update;
 
 use args::Args;
 use sard_core::config::{self, KnownHosts, TrustStore};
@@ -26,6 +27,7 @@ USAGE:
   sard unalias <name>            Remove an alias
   sard info                      Show identity, paired devices and GPU capabilities
   sard unpair <name>             Remove a trusted client (host side)
+  sard update [--check]          Install the latest release (--check: only report it)
 
 HOST OPTIONS:
   --pair                 Accept new pairings (prints a one-time code)
@@ -95,6 +97,7 @@ fn main() -> ExitCode {
         "alias" => alias(&args),
         "unalias" => unalias(&args),
         "selftest-capture" => selftest_capture(&args),
+        "update" | "release-sign" => update::cli(cmd, &args),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
