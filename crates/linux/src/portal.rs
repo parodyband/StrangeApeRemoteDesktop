@@ -154,7 +154,7 @@ impl Session {
             request(&conn, RD, "SelectDevices", vec![Value::Path(path.clone()), dict(o)], quick)?;
         }
         let mut o =
-            vec![("types", Value::U32(1)), ("multiple", Value::Bool(false)), ("cursor_mode", Value::U32(cursor))];
+            vec![("types", Value::U32(1)), ("multiple", Value::Bool(true)), ("cursor_mode", Value::U32(cursor))];
         if !use_rd && sc_version >= 4 {
             persist(&mut o);
         }
@@ -222,13 +222,10 @@ impl Session {
         Ok(r.fds.swap_remove(idx))
     }
 
-    pub fn input(&self) -> PortalInput {
-        PortalInput {
-            conn: Arc::clone(&self.conn),
-            session: self.path.clone(),
-            stream: self.streams[0].clone(),
-            scroll_acc: (0.0, 0.0),
-        }
+    /// Input injector that targets whichever stream `active` holds (the
+    /// capture source updates it when switching displays).
+    pub fn input(&self, active: Arc<std::sync::Mutex<StreamInfo>>) -> PortalInput {
+        PortalInput { conn: Arc::clone(&self.conn), session: self.path.clone(), stream: active, scroll_acc: (0.0, 0.0) }
     }
 }
 
@@ -242,7 +239,7 @@ impl Drop for Session {
 pub struct PortalInput {
     conn: Arc<Connection>,
     session: String,
-    stream: StreamInfo,
+    stream: Arc<std::sync::Mutex<StreamInfo>>,
     scroll_acc: (f32, f32),
 }
 
@@ -254,13 +251,11 @@ impl PortalInput {
     }
 
     pub fn move_abs(&self, x: f32, y: f32) -> Result<()> {
-        let (w, h) = self.stream.size;
+        let stream = self.stream.lock().unwrap().clone();
+        let (w, h) = stream.size;
         let px = (x.clamp(0.0, 1.0) as f64 * w as f64).min(w as f64 - 0.5);
         let py = (y.clamp(0.0, 1.0) as f64 * h as f64).min(h as f64 - 0.5);
-        self.notify(
-            "NotifyPointerMotionAbsolute",
-            vec![Value::U32(self.stream.node_id), Value::F64(px), Value::F64(py)],
-        )
+        self.notify("NotifyPointerMotionAbsolute", vec![Value::U32(stream.node_id), Value::F64(px), Value::F64(py)])
     }
 
     pub fn move_rel(&self, dx: f32, dy: f32) -> Result<()> {

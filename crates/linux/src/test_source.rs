@@ -5,7 +5,7 @@ use crate::nv::cuda::{Cuda, Mem};
 use crate::nv::nvenc::{EncoderParams, NvEncoder};
 use crate::yuv::{rgb_to_yuv709, test_pattern_nv12};
 use sard_core::clock;
-use sard_core::media::{self, EncodedFrame, InputEvent, InputSink, SourceOptions, VideoSource};
+use sard_core::media::{self, DisplayInfo, EncodedFrame, InputEvent, InputSink, SourceOptions, VideoSource};
 use sard_core::proto::Codec;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,26 +24,24 @@ pub struct TestPatternSource {
     codec: Codec,
     /// Last pointer position reported by the input sink (drawn as a marker).
     pub pointer: Arc<std::sync::Mutex<(f32, f32)>>,
+    /// Two pretend monitors (so display switching can be tested headlessly).
+    displays: Vec<DisplayInfo>,
+    current: u32,
+    opts: SourceOptions,
 }
 
 impl TestPatternSource {
     pub fn new(opts: &SourceOptions) -> media::Result<Self> {
         let cuda = Cuda::new()?;
         let (w, h) = (opts.test_size.0 & !1, opts.test_size.1 & !1);
-        let enc = NvEncoder::new(
-            Arc::clone(&cuda),
-            EncoderParams {
-                codec: opts.codec,
-                width: w,
-                height: h,
-                fps: opts.fps,
-                bitrate_kbps: opts.bitrate_kbps.max(1000),
-                yuv444: false,
-                preset: opts.preset,
-                vbv_frames: 1.0,
-            },
-        )?;
-        let (w, h) = (w as usize, h as usize);
+        let displays = vec![
+            DisplayInfo { id: 1, name: "Test Screen A".into(), width: w, height: h, x: 0, y: 0 },
+            DisplayInfo { id: 2, name: "Test Screen B".into(), width: (w * 3 / 4) & !1, height: h, x: w as i32, y: 0 },
+        ];
+        let current = if opts.display == 2 { 2 } else { 1 };
+        let d = &displays[current as usize - 1];
+        let enc = Self::encoder(&cuda, opts, d.width, d.height)?;
+        let (w, h) = (d.width as usize, d.height as usize);
         let mut background = vec![0u8; w * h * 3 / 2];
         test_pattern_nv12(w, h, w, 0, &mut background);
         Ok(TestPatternSource {
@@ -59,7 +57,27 @@ impl TestPatternSource {
             force_key: true,
             codec: opts.codec,
             pointer: Arc::new(std::sync::Mutex::new((0.5, 0.5))),
+            displays,
+            current,
+            opts: opts.clone(),
         })
+    }
+
+    fn encoder(cuda: &Arc<Cuda>, opts: &SourceOptions, w: u32, h: u32) -> media::Result<NvEncoder> {
+        NvEncoder::new(
+            Arc::clone(cuda),
+            EncoderParams {
+                codec: opts.codec,
+                width: w,
+                height: h,
+                fps: opts.fps,
+                bitrate_kbps: opts.bitrate_kbps.max(1000),
+                yuv444: false,
+                preset: opts.preset,
+                vbv_frames: 1.0,
+            },
+        )
+        .map_err(Into::into)
     }
 
     fn fill_rect(&mut self, x0: usize, y0: usize, rw: usize, rh: usize, rgb: (u8, u8, u8)) {
@@ -148,9 +166,33 @@ impl VideoSource for TestPatternSource {
     }
 
     fn set_bitrate(&mut self, kbps: u32) {
+        self.opts.bitrate_kbps = kbps;
         if let Err(e) = self.enc.set_bitrate(kbps) {
             sard_core::warn!("set_bitrate: {e}");
         }
+    }
+
+    fn displays(&self) -> Vec<DisplayInfo> {
+        self.displays.clone()
+    }
+
+    fn current_display(&self) -> Option<u32> {
+        Some(self.current)
+    }
+
+    fn select_display(&mut self, id: u32) -> media::Result<()> {
+        let d = self.displays.iter().find(|d| d.id == id).ok_or_else(|| media::err("no such display"))?.clone();
+        if (d.width as usize, d.height as usize) != (self.w, self.h) {
+            self.enc = Self::encoder(&self.cuda, &self.opts, d.width, d.height)?;
+            let (w, h) = (d.width as usize, d.height as usize);
+            self.background = vec![0u8; w * h * 3 / 2];
+            test_pattern_nv12(w, h, w, id, &mut self.background);
+            self.frame = self.background.clone();
+            (self.w, self.h) = (w, h);
+        }
+        self.current = id;
+        self.force_key = true;
+        Ok(())
     }
 
     fn codec(&self) -> Codec {

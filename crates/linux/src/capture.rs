@@ -80,6 +80,13 @@ pub struct PortalSource {
     // Field order = drop order: stream before session.
     capture: Capture,
     session: Session,
+    /// Stream (monitor) being captured; shared with the input injector.
+    active: Arc<std::sync::Mutex<portal::StreamInfo>>,
+    current: usize,
+    names: Vec<String>,
+    modifiers: Vec<u64>,
+    opts: SourceOptions,
+    bitrate_kbps: u32,
     egl: EglContext,
     cuda: Arc<Cuda>,
     csc: Option<Csc>,
@@ -126,10 +133,18 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
             warn!("could not save portal restore token: {e}");
         }
     }
-    let input: Box<dyn InputSink> =
-        if session.remote_input { Box::new(PortalSink { input: session.input() }) } else { Box::new(NullSink) };
-    let fd = session.open_pipewire_remote()?;
-    let node = session.streams[0].node_id;
+    // Initial monitor: the client's choice (1-based index), else the first.
+    let current = (opts.display as usize).saturating_sub(1).min(session.streams.len() - 1);
+    let active = Arc::new(std::sync::Mutex::new(session.streams[current].clone()));
+    let input: Box<dyn InputSink> = if session.remote_input {
+        Box::new(PortalSink { input: session.input(Arc::clone(&active)) })
+    } else {
+        Box::new(NullSink)
+    };
+    let names = monitor_names(&session.streams);
+    if session.streams.len() > 1 {
+        info!("portal granted {} displays: {}", session.streams.len(), names.join(", "));
+    }
     let egl = EglContext::new(Target::Headless, 0, 0)?;
     let modifiers = if std::env::var_os("SARD_NO_DMABUF").is_some() {
         Vec::new()
@@ -139,8 +154,7 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
         a.into_iter().filter(|m| b.contains(m)).collect::<Vec<_>>()
     };
     debug!("offering {} DMA-BUF modifiers", modifiers.len());
-    let capture = Capture::connect(fd, node, opts.fps, modifiers)?;
-    let format = capture.wait_format(Duration::from_secs(10))?;
+    let (capture, format) = connect_stream(&session, current, opts.fps, &modifiers)?;
     info!(
         "pipewire {}: {}x{} format {} ({})",
         pw::library_version().unwrap_or_default(),
@@ -152,22 +166,16 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
     let stream_size = (format.width, format.height);
     let out_size = fit(format.width, format.height, opts.max_width, opts.max_height);
     let cuda = Cuda::new()?;
-    let enc = NvEncoder::new(
-        Arc::clone(&cuda),
-        EncoderParams {
-            codec: opts.codec,
-            width: out_size.0,
-            height: out_size.1,
-            fps: opts.fps,
-            bitrate_kbps: opts.bitrate_kbps.max(1000),
-            yuv444: false,
-            preset: opts.preset,
-            vbv_frames: 1.0,
-        },
-    )?;
+    let enc = make_encoder(&cuda, opts, out_size, opts.bitrate_kbps)?;
     let src = PortalSource {
         capture,
         session,
+        active,
+        current,
+        names,
+        modifiers,
+        opts: opts.clone(),
+        bitrate_kbps: opts.bitrate_kbps.max(1000),
         egl,
         cuda,
         csc: None,
@@ -184,7 +192,106 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
     Ok((Box::new(src), input))
 }
 
+fn make_encoder(cuda: &Arc<Cuda>, opts: &SourceOptions, size: (u32, u32), kbps: u32) -> media::Result<NvEncoder> {
+    Ok(NvEncoder::new(
+        Arc::clone(cuda),
+        EncoderParams {
+            codec: opts.codec,
+            width: size.0,
+            height: size.1,
+            fps: opts.fps,
+            bitrate_kbps: kbps.max(1000),
+            yuv444: false,
+            preset: opts.preset,
+            vbv_frames: 1.0,
+        },
+    )?)
+}
+
+/// Connect a PipeWire stream to monitor `idx` of the portal session.
+fn connect_stream(
+    session: &Session,
+    idx: usize,
+    fps: u32,
+    modifiers: &[u64],
+) -> media::Result<(Capture, crate::pw::VideoFormat)> {
+    let fd = session.open_pipewire_remote()?;
+    let capture = Capture::connect(fd, session.streams[idx].node_id, fps, modifiers.to_vec())?;
+    let format = capture.wait_format(Duration::from_secs(10))?;
+    Ok((capture, format))
+}
+
+/// Best-effort monitor names (e.g. "DP-1") by matching the portal's logical
+/// geometry against KScreen's outputs; falls back to "Screen N".
+fn monitor_names(streams: &[portal::StreamInfo]) -> Vec<String> {
+    let out = std::process::Command::new("kscreen-doctor")
+        .arg("-o")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    // Strip ANSI colour codes.
+    let mut clean = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            clean.push(c);
+        }
+    }
+    let mut outputs: Vec<(String, i32, i32)> = Vec::new();
+    let mut name = String::new();
+    for line in clean.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("Output:") {
+            name = rest.split_whitespace().nth(1).unwrap_or("").to_string();
+        } else if let Some(rest) = line.strip_prefix("Geometry:") {
+            let pos = rest.split_whitespace().next().unwrap_or("");
+            if let Some((x, y)) = pos.split_once(',')
+                && let (Ok(x), Ok(y)) = (x.parse(), y.parse())
+            {
+                outputs.push((name.clone(), x, y));
+            }
+        }
+    }
+    streams
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            outputs
+                .iter()
+                .find(|(_, x, y)| (*x, *y) == s.position)
+                .map(|(n, _, _)| n.clone())
+                .filter(|n| !n.is_empty() && streams.len() > 1)
+                .unwrap_or_else(|| if streams.len() > 1 { format!("Screen {}", i + 1) } else { "Desktop".into() })
+        })
+        .collect()
+}
+
 impl PortalSource {
+    fn release_csc(&mut self) {
+        self.drop_dma_cache();
+        if let Some(c) = self.csc.take() {
+            let _g = self.cuda.push();
+            // SAFETY: resources created by us; context current on this thread.
+            unsafe {
+                (self.cuda.api.cuGraphicsUnregisterResource)(c.dst_res);
+                (c.gl.glDeleteFramebuffers)(1, &c.fbo);
+                (c.gl.glDeleteTextures)(1, &c.dst);
+                if c.src != 0 {
+                    (c.gl.glDeleteTextures)(1, &c.src);
+                }
+                (c.gl.glDeleteVertexArrays)(1, &c.vao);
+                (c.gl.glDeleteProgram)(c.program);
+            }
+        }
+    }
+
     fn ensure_gl(&mut self) -> media::Result<()> {
         if !self.gl_current {
             // The video thread owns the context from here on.
@@ -442,6 +549,7 @@ impl VideoSource for PortalSource {
     }
 
     fn set_bitrate(&mut self, kbps: u32) {
+        self.bitrate_kbps = kbps;
         if let Err(e) = self.enc.set_bitrate(kbps) {
             warn!("set_bitrate: {e}");
         }
@@ -481,6 +589,56 @@ impl VideoSource for PortalSource {
         })
     }
 
+    fn displays(&self) -> Vec<sard_core::media::DisplayInfo> {
+        self.session
+            .streams
+            .iter()
+            .zip(&self.names)
+            .map(|(s, name)| sard_core::media::DisplayInfo {
+                id: s.node_id,
+                name: name.clone(),
+                width: s.size.0.max(0) as u32,
+                height: s.size.1.max(0) as u32,
+                x: s.position.0,
+                y: s.position.1,
+            })
+            .collect()
+    }
+
+    fn current_display(&self) -> Option<u32> {
+        Some(self.session.streams[self.current].node_id)
+    }
+
+    fn select_display(&mut self, id: u32) -> media::Result<()> {
+        let idx = self
+            .session
+            .streams
+            .iter()
+            .position(|s| s.node_id == id)
+            .ok_or_else(|| media::err(format!("no display with id {id}")))?;
+        if idx == self.current {
+            self.force_key = true;
+            return Ok(());
+        }
+        // Connect the new stream first so a failure leaves the old one running.
+        let (capture, format) = connect_stream(&self.session, idx, self.opts.fps, &self.modifiers)?;
+        self.capture = capture;
+        self.drop_dma_cache();
+        self.stream_size = (format.width, format.height);
+        let out = fit(format.width, format.height, self.opts.max_width, self.opts.max_height);
+        if out != self.out_size {
+            self.release_csc();
+            self.out_size = out;
+            self.enc = make_encoder(&self.cuda, &self.opts, out, self.bitrate_kbps)?;
+            self.last_input = None;
+        }
+        self.current = idx;
+        *self.active.lock().unwrap() = self.session.streams[idx].clone();
+        self.force_key = true;
+        info!("switched to display {} ({}x{} → {}x{})", self.names[idx], format.width, format.height, out.0, out.1);
+        Ok(())
+    }
+
     fn describe(&self) -> String {
         format!(
             "screen {}x{} → {}x{} NVENC {} on {}",
@@ -496,21 +654,7 @@ impl VideoSource for PortalSource {
 
 impl Drop for PortalSource {
     fn drop(&mut self) {
-        self.drop_dma_cache();
-        if let Some(c) = self.csc.take() {
-            let _g = self.cuda.push();
-            // SAFETY: resources created by us; context current on this thread.
-            unsafe {
-                (self.cuda.api.cuGraphicsUnregisterResource)(c.dst_res);
-                (c.gl.glDeleteFramebuffers)(1, &c.fbo);
-                (c.gl.glDeleteTextures)(1, &c.dst);
-                if c.src != 0 {
-                    (c.gl.glDeleteTextures)(1, &c.src);
-                }
-                (c.gl.glDeleteVertexArrays)(1, &c.vao);
-                (c.gl.glDeleteProgram)(c.program);
-            }
-        }
+        self.release_csc();
     }
 }
 

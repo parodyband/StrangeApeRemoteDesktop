@@ -1,4 +1,4 @@
-//! Tiny Objective-C helpers on top of `objc2` (NSString, NSError).
+//! Tiny Objective-C helpers on top of `objc2` (NSString, NSError, main thread).
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::AnyObject;
@@ -46,4 +46,32 @@ pub unsafe fn error_string(e: *const AnyObject) -> String {
         let code: isize = msg_send![e, code];
         format!("{} ({} {code})", to_string(desc), to_string(domain))
     }
+}
+
+/// Run `f` on the main thread: right away when already there, otherwise
+/// asynchronously through the main dispatch queue (serviced by the main run
+/// loop, i.e. NSApplication / winit).
+pub fn run_on_main(f: impl FnOnce() + Send + 'static) {
+    if objc2::MainThreadMarker::new().is_some() {
+        f();
+    } else {
+        main_async(f);
+    }
+}
+
+/// Queue `f` on the main dispatch queue (also when called on the main thread:
+/// runs after the current event has been handled).
+pub fn main_async(f: impl FnOnce() + Send + 'static) {
+    unsafe extern "C" fn trampoline(ctx: *mut c_void) {
+        // SAFETY: `ctx` is the box leaked below, consumed exactly once.
+        let f = unsafe { Box::from_raw(ctx as *mut Box<dyn FnOnce() + Send>) };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+            sard_core::warn!("panic in main-thread task");
+        }
+    }
+    let f: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
+    // SAFETY: the main queue is immortal; the trampoline takes ownership of the box.
+    unsafe {
+        crate::ffi::dispatch_async_f(crate::ffi::dispatch_get_main_queue(), Box::into_raw(f) as *mut c_void, trampoline)
+    };
 }

@@ -7,6 +7,7 @@ use sard_core::input::key as K;
 use sard_core::media::{self, InputEvent, InputSink};
 use sard_core::proto::button;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -171,12 +172,27 @@ pub trait Bounds: Send {
     fn rect(&self) -> CGRect;
 }
 
-pub struct DisplayBounds(pub CGDirectDisplayID);
+/// The display being streamed, shared between a video source and its input
+/// sink so absolute pointer positions follow display switches.
+#[derive(Clone)]
+pub struct DisplayBounds(pub Arc<AtomicU32>);
+
+impl DisplayBounds {
+    pub fn new(id: CGDirectDisplayID) -> Self {
+        DisplayBounds(Arc::new(AtomicU32::new(id)))
+    }
+    pub fn id(&self) -> CGDirectDisplayID {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set(&self, id: CGDirectDisplayID) {
+        self.0.store(id, Ordering::Relaxed);
+    }
+}
 
 impl Bounds for DisplayBounds {
     fn rect(&self) -> CGRect {
         // SAFETY: plain query.
-        unsafe { CGDisplayBounds(self.0) }
+        unsafe { CGDisplayBounds(self.id()) }
     }
 }
 

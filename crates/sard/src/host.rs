@@ -24,80 +24,189 @@ use std::time::{Duration, Instant};
 /// StreamConfig flag: cursor is sent as metadata (client draws it).
 pub const STREAM_CURSOR_METADATA: u32 = 1;
 
+/// `sard host`: run the host service in the foreground.
 pub fn run(args: &Args) -> Result<()> {
-    let dir = config::config_dir();
-    let identity = config::load_or_create_identity(&dir)?;
-    let trust = TrustStore::load(&dir)?;
     if args.flag("reselect") {
         // Forget the saved screen-share approval so the picker is shown again.
-        let _ = std::fs::remove_file(dir.join("portal_restore_token"));
+        let _ = std::fs::remove_file(config::config_dir().join("portal_restore_token"));
     }
-    let pairing = if args.flag("pair") || trust.peers.is_empty() { Some(generate_pairing_code()) } else { None };
-    let trusted: HashMap<[u8; 32], String> = trust.peers.iter().map(|p| (p.key, p.name.clone())).collect();
-    let trust = Arc::new(Mutex::new(trust));
-    let trust2 = Arc::clone(&trust);
-    // Also leave the active code in a private file: when the host runs without
-    // a terminal (macOS app bundle, systemd), that's where to find it.
-    let code_file = dir.join("pairing-code.txt");
-    let _ = std::fs::remove_file(&code_file);
-    if let Some(code) = &pairing {
-        let _ = config::write_private_file(
-            &dir,
-            "pairing-code.txt",
-            &format!("{code}\n# single use, valid for 10 minutes from host start\n"),
-        );
+    let svc = HostService::start(args, args.flag("pair"), Box::new(|| {}))?;
+    let st = svc.status();
+    println!("sard host \"{}\" listening on port {} ({})", st.name, st.port, st.fingerprint);
+    if !st.ips.is_empty() {
+        println!("  addresses: {}", st.ips.join(", "));
     }
-    let code_file2 = code_file.clone();
-
-    let port: u16 = args.parse_value("port")?.unwrap_or(sard_core::DEFAULT_PORT);
-    let bind: SocketAddr = format!("{}:{port}", args.value("bind").unwrap_or("0.0.0.0")).parse()?;
-    let cfg = crate::net_config(args)?;
-    let name = cfg.name.clone();
-    let host = Host::bind(
-        bind,
-        identity.clone(),
-        cfg,
-        HostOptions {
-            trusted,
-            pairing_code: pairing.as_deref().and_then(normalize_pairing_code),
-            on_paired: Some(Box::new(move |key, name| {
-                if let Err(e) = trust2.lock().unwrap().add(key, name) {
-                    error!("could not save trusted client: {e}");
-                }
-                let _ = std::fs::remove_file(&code_file2); // the code is spent
-            })),
-        },
-    )?;
-
-    println!("sard host \"{name}\" listening on {} ({})", host.local_addr()?, fingerprint(&identity.public()));
-    let ips = local_ips();
-    if !ips.is_empty() {
-        println!("  addresses: {}", ips.join(", "));
-    }
-    if let Some(code) = &pairing {
+    if let Some((code, _)) = &st.pairing {
         println!();
         println!("  Pairing code:  {code}   (single use, valid for 10 minutes)");
-        println!("  On the other machine run:  sard pair {} {code}", ips.first().map_or("<this-ip>", |s| s.as_str()));
+        println!(
+            "  On the other machine run:  sard pair {} {code}",
+            st.ips.first().map_or("<this-ip>", |s| s.as_str())
+        );
         println!();
     }
     println!("{}", platform::describe());
-    if !args.flag("test-pattern") {
-        let missing = platform::request_host_permissions();
-        for m in &missing {
-            println!("  ! permission needed — {m}");
-        }
+    for m in &st.missing_permissions {
+        println!("  ! permission needed — {m}");
     }
     println!("Waiting for a client... (Ctrl+C to stop)");
+    loop {
+        std::thread::park();
+    }
+}
 
+/// What the tray shows about the host side.
+#[derive(Clone, Debug, Default)]
+pub struct HostStatus {
+    pub name: String,
+    pub port: u16,
+    pub ips: Vec<String>,
+    pub fingerprint: String,
+    /// Name of the machine currently viewing this one.
+    pub viewer: Option<String>,
+    /// Active single-use pairing code and when it stops working.
+    pub pairing: Option<(String, Instant)>,
+    /// Permissions the OS still needs granted before capture works.
+    pub missing_permissions: Vec<String>,
+}
+
+type ChangeFn = Box<dyn Fn() + Send + Sync>;
+
+struct ServiceState {
+    status: Mutex<HostStatus>,
+    stop: AtomicBool,
+    /// Current session (connection) so it can be kicked.
+    current: Mutex<Option<Connection>>,
+    on_change: ChangeFn,
+}
+
+/// The host side running inside a process: listens, pairs, and serves one
+/// viewer at a time (a new viewer takes over). Stops when dropped.
+pub struct HostService {
+    host: Arc<Host>,
+    state: Arc<ServiceState>,
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+const PAIRING_TTL: Duration = Duration::from_secs(600);
+
+impl HostService {
+    pub fn start(args: &Args, pair: bool, on_change: ChangeFn) -> Result<HostService> {
+        let dir = config::config_dir();
+        let identity = config::load_or_create_identity(&dir)?;
+        let trust = TrustStore::load(&dir)?;
+        let trusted: HashMap<[u8; 32], String> = trust.peers.iter().map(|p| (p.key, p.name.clone())).collect();
+        let pair = pair || trust.peers.is_empty();
+        let trust = Arc::new(Mutex::new(trust));
+        let port: u16 = args.parse_value("port")?.unwrap_or(sard_core::DEFAULT_PORT);
+        let bind: SocketAddr = format!("{}:{port}", args.value("bind").unwrap_or("0.0.0.0")).parse()?;
+        let cfg = crate::net_config(args)?;
+        let state = Arc::new(ServiceState {
+            status: Mutex::new(HostStatus {
+                name: cfg.name.clone(),
+                port,
+                ips: local_ips(),
+                fingerprint: fingerprint(&identity.public()),
+                ..Default::default()
+            }),
+            stop: AtomicBool::new(false),
+            current: Mutex::new(None),
+            on_change,
+        });
+        let paired_state = Arc::clone(&state);
+        let host = Host::bind(
+            bind,
+            identity,
+            cfg,
+            HostOptions {
+                trusted,
+                pairing_code: None,
+                on_paired: Some(Box::new(move |key, name| {
+                    info!("paired with {name}");
+                    if let Err(e) = trust.lock().unwrap().add(key, name) {
+                        error!("could not save trusted client: {e}");
+                    }
+                    paired_state.status.lock().unwrap().pairing = None; // the code is spent
+                    let _ = std::fs::remove_file(config::config_dir().join("pairing-code.txt"));
+                    (paired_state.on_change)();
+                })),
+            },
+        )?;
+        let host = Arc::new(host);
+        let mut svc = HostService { host: Arc::clone(&host), state: Arc::clone(&state), accept: None };
+        let _ = std::fs::remove_file(dir.join("pairing-code.txt"));
+        if pair {
+            svc.new_pairing_code();
+        }
+        let test_pattern = args.flag("test-pattern");
+        if !test_pattern {
+            state.status.lock().unwrap().missing_permissions = platform::request_host_permissions();
+        }
+        let args = args.clone();
+        svc.accept = Some(
+            std::thread::Builder::new().name("sard-accept".into()).spawn(move || accept_loop(&host, state, &args))?,
+        );
+        Ok(svc)
+    }
+
+    pub fn status(&self) -> HostStatus {
+        let mut s = self.state.status.lock().unwrap();
+        if s.pairing.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+            s.pairing = None;
+        }
+        s.clone()
+    }
+
+    /// Open a fresh 10-minute pairing window and return its code.
+    pub fn new_pairing_code(&self) -> String {
+        let code = generate_pairing_code();
+        self.host.set_pairing_code(normalize_pairing_code(&code).as_deref());
+        // Also leave it in a private file: without a terminal (app bundle,
+        // systemd), that's where to find it.
+        let _ = config::write_private_file(
+            &config::config_dir(),
+            "pairing-code.txt",
+            &format!("{code}\n# single use, valid for 10 minutes\n"),
+        );
+        self.state.status.lock().unwrap().pairing = Some((code.clone(), Instant::now() + PAIRING_TTL));
+        (self.state.on_change)();
+        code
+    }
+
+    /// End the current viewer's session.
+    pub fn disconnect_viewer(&self) {
+        if let Some(c) = self.state.current.lock().unwrap().as_ref() {
+            c.send_control(&Control::Status { text: "the host ended the session".into() });
+            std::thread::sleep(Duration::from_millis(30));
+            c.close();
+        }
+    }
+}
+
+impl Drop for HostService {
+    fn drop(&mut self) {
+        self.state.stop.store(true, Ordering::Relaxed);
+        self.disconnect_viewer();
+        if let Some(t) = self.accept.take() {
+            let _ = t.join();
+        }
+        let _ = std::fs::remove_file(config::config_dir().join("pairing-code.txt"));
+    }
+}
+
+fn accept_loop(host: &Host, state: Arc<ServiceState>, args: &Args) {
     // One session at a time; a new client takes over from the current one
     // (personal use: reconnecting from another machine should just work).
-    let mut current: Option<(Connection, std::thread::JoinHandle<()>)> = None;
-    loop {
-        let Some(conn) = host.accept(Duration::from_secs(3600)) else {
+    let mut current: Option<std::thread::JoinHandle<()>> = None;
+    while !state.stop.load(Ordering::Relaxed) {
+        let Some(conn) = host.accept(Duration::from_millis(250)) else {
             continue;
         };
-        if let Some((old, handle)) = current.take() {
-            if !old.is_closed() {
+        if let Some(handle) = current.take() {
+            let old = state.current.lock().unwrap().take();
+            if let Some(old) = old
+                && !old.is_closed()
+            {
                 info!("{} connected; ending the session with {}", conn.peer_name(), old.peer_name());
                 old.send_control(&Control::Status { text: format!("{} took over this host", conn.peer_name()) });
                 std::thread::sleep(Duration::from_millis(50));
@@ -106,22 +215,40 @@ pub fn run(args: &Args) -> Result<()> {
             let _ = handle.join();
         }
         info!("session start: {} from {}", conn.peer_name(), conn.peer_addr());
-        let (c, a) = (conn.clone(), args.clone());
-        let handle = std::thread::Builder::new().name("sard-session".into()).spawn(move || {
-            match serve(&c, &a) {
-                Ok(()) => info!("session with {} ended", c.peer_name()),
-                Err(e) => {
-                    error!("session with {} failed: {e}", c.peer_name());
-                    c.send_control(&Control::Status { text: format!("host error: {e}") });
-                    std::thread::sleep(Duration::from_millis(200));
+        *state.current.lock().unwrap() = Some(conn.clone());
+        state.status.lock().unwrap().viewer = Some(config::clean_display(conn.peer_name()));
+        (state.on_change)();
+        let (a, state) = (args.clone(), Arc::clone(&state));
+        let r = std::thread::Builder::new().name("sard-session".into()).spawn({
+            move || {
+                match serve(&conn, &a) {
+                    Ok(()) => info!("session with {} ended", conn.peer_name()),
+                    Err(e) => {
+                        error!("session with {} failed: {e}", conn.peer_name());
+                        conn.send_control(&Control::Status { text: format!("host error: {e}") });
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                conn.close();
+                // Unless a newer viewer already took over (it holds `current`).
+                if state.current.lock().unwrap().take().is_some() {
+                    state.status.lock().unwrap().viewer = None;
+                    (state.on_change)();
                 }
             }
-            c.close();
-        })?;
-        current = Some((conn, handle));
+        });
+        match r {
+            Ok(h) => current = Some(h),
+            Err(e) => error!("cannot start session thread: {e}"),
+        }
+    }
+    if let Some(c) = state.current.lock().unwrap().take() {
+        c.close();
+    }
+    if let Some(h) = current {
+        let _ = h.join();
     }
 }
-
 fn negotiate(hello: &ClientHello, args: &Args) -> Result<SourceOptions> {
     let host_enc = platform::encoders();
     let both = host_enc & hello.decoders;
@@ -213,6 +340,14 @@ struct Shared {
     stop: AtomicBool,
     keyframe: AtomicBool,
     bitrate_kbps: AtomicU32,
+    /// Display the client asked for (applied by the video thread).
+    select_display: Mutex<Option<u32>>,
+}
+
+fn displays_msg(source: &dyn VideoSource) -> Option<Control> {
+    let list = source.displays();
+    let current = source.current_display()?;
+    (!list.is_empty()).then_some(Control::Displays { current, list })
 }
 
 fn serve(conn: &Connection, args: &Args) -> Result<()> {
@@ -254,9 +389,19 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
         })
     };
     conn.send_control(&stream_cfg(w, h, ceiling));
+    if let Some(d) = displays_msg(source.as_ref()) {
+        conn.send_control(&d);
+    }
 
     // Audio: uncompressed PCM in 5 ms packets, straight from the capture callback.
-    let _audio = if hello.flags & client_flags::AUDIO != 0 && !args.flag("no-audio") {
+    // A viewer on this same machine would play our captured audio back into
+    // the output we capture: a feedback loop that gets very loud, very fast.
+    let peer_ip = conn.peer_addr().ip();
+    let same_machine = peer_ip.is_loopback() || local_ips().contains(&peer_ip.to_string());
+    if same_machine && hello.flags & client_flags::AUDIO != 0 {
+        info!("viewer is on this machine: not sending audio (it would feed back)");
+    }
+    let _audio = if hello.flags & client_flags::AUDIO != 0 && !args.flag("no-audio") && !same_machine {
         let c = conn.clone();
         let mut seq = 0u32;
         let mut stage: Vec<i16> = Vec::with_capacity(AUDIO_PACKET_FRAMES * 8);
@@ -290,6 +435,7 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
         stop: AtomicBool::new(false),
         keyframe: AtomicBool::new(true),
         bitrate_kbps: AtomicU32::new(ceiling),
+        select_display: Mutex::new(None),
     });
     let input_thread = {
         let shared = Arc::clone(&shared);
@@ -320,6 +466,20 @@ fn video_loop(
     let mut frames = 0u32;
     let mut last_log = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) && !conn.is_closed() {
+        if let Some(id) = shared.select_display.lock().unwrap().take() {
+            match source.select_display(id) {
+                Ok(()) => {
+                    // A new display may have a new size; the client resets on StreamConfig.
+                    let (w, h) = source.size();
+                    size = (w, h);
+                    conn.send_control(&stream_cfg(w, h, current_kbps));
+                    if let Some(d) = displays_msg(source) {
+                        conn.send_control(&d);
+                    }
+                }
+                Err(e) => conn.send_control(&Control::Status { text: format!("cannot switch display: {e}") }),
+            }
+        }
         if shared.keyframe.swap(false, Ordering::Relaxed) {
             source.request_keyframe();
         }
@@ -512,6 +672,9 @@ fn input_loop(
                 Control::Scroll { dx, dy, discrete } => inject(&mut input, InputEvent::Scroll { dx, dy, discrete }),
                 Control::MouseRel { dx, dy } => inject(&mut input, InputEvent::MoveRel { dx, dy }),
                 Control::ReleaseAll => release_all(&mut pressed, &mut input),
+                Control::SelectDisplay { id } => {
+                    *shared.select_display.lock().unwrap() = Some(id);
+                }
                 Control::SetBitrate { kbps } => {
                     rc.ceiling = if kbps == 0 { ceiling } else { kbps };
                     rc.current = rc.ceiling;

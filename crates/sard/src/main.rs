@@ -1,11 +1,13 @@
 //! `sard` — StrangeApeRemoteDesktop command line.
 
+mod app;
 mod args;
 mod client;
 mod clipsync;
 mod host;
 mod keymap;
 mod platform;
+mod session;
 mod update;
 
 use args::Args;
@@ -19,6 +21,7 @@ const USAGE: &str = "\
 sard — low-latency GPU remote desktop (Linux ⇄ macOS)
 
 USAGE:
+  sard app                       Menu bar / system tray app (default when launched from the desktop)
   sard host [options]            Share this machine's screen
   sard pair <host> <code>        Pair with a host (one time; code shown by `sard host --pair`)
                                  add `--alias <name>` to name it at the same time
@@ -56,6 +59,7 @@ CLIENT OPTIONS:
   --duration <secs>      Exit after this long (with --headless)
   --snapshot <file.png>  Save a decoded frame (with --headless)
   --audio                Also play audio (with --headless)
+  --cycle-displays <s>   Switch remote screens every s seconds (with --headless)
   --no-swap-modifiers    Don't map Cmd⇄Ctrl between macOS and Linux
   --no-auto-relative     Don't switch to relative mouse when the host hides its cursor
   --max-datagram <n>     UDP payload size (default 1400; use ~1200 over VPNs)
@@ -63,6 +67,7 @@ CLIENT OPTIONS:
 IN-SESSION HOTKEYS (Ctrl+Alt+Shift + key):
   F  toggle fullscreen     M  toggle relative mouse (games / 3D viewports)
   K  request keyframe      Q  disconnect
+  D  next remote display   1-9  jump to remote display N
 
 ENVIRONMENT:
   SARD_LOG=debug         More logging
@@ -72,10 +77,10 @@ ENVIRONMENT:
 fn main() -> ExitCode {
     sard_core::log::init();
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    // Launched as an app bundle with no arguments (double-click, or macOS's
-    // "Quit & Reopen" after granting a permission): act as a host.
-    if argv.is_empty() && std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
-        argv.push("host".into());
+    // No arguments on a desktop (double-clicked app bundle, autostart, or
+    // macOS's "Quit & Reopen" after granting a permission): the tray app.
+    if argv.is_empty() && has_desktop() {
+        argv.push("app".into());
     }
     let Some((cmd, rest)) = argv.split_first() else {
         print!("{USAGE}");
@@ -89,6 +94,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match cmd.as_str() {
+        "app" => app::run(&args),
         "host" | "serve" => host::run(&args),
         "connect" | "c" => client::run(&args),
         "pair" => pair(&args),
@@ -115,6 +121,36 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Started from a desktop rather than typed in a terminal (where plain `sard`
+/// should keep printing usage).
+fn has_desktop() -> bool {
+    if std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
+        return true;
+    }
+    // SAFETY: isatty on a standard descriptor.
+    let tty = unsafe { libc::isatty(0) == 1 || libc::isatty(1) == 1 };
+    let display = cfg!(target_os = "macos")
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("DISPLAY").is_some();
+    display && !tty
+}
+
+/// The winit event loop shared by `connect` and the tray app.
+pub fn event_loop() -> Result<winit::event_loop::EventLoop<session::AppEvent>> {
+    #[allow(unused_mut)]
+    let mut builder = winit::event_loop::EventLoop::<session::AppEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        // No default menu: Cmd+Q etc. must reach the remote machine.
+        builder.with_default_menu(false);
+        // Don't jump to the front at launch (login item, menu bar app);
+        // viewer windows take focus explicitly when opened.
+        builder.with_activate_ignoring_other_apps(false);
+    }
+    Ok(builder.build()?)
 }
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -150,13 +186,9 @@ fn pair(args: &Args) -> Result<()> {
     }
     let host = aliases.resolve(arg).to_string();
     let host = host.as_str();
-    let identity = config::load_or_create_identity(&dir)?;
     let cfg = net_config(args)?;
     println!("Pairing with {host} ...");
-    let (key, name, addr) = Client::pair(host, code, &identity, &cfg, Duration::from_secs(10))?;
-    let mut known = KnownHosts::load(&dir)?;
-    let stored = if addr.port() == sard_core::DEFAULT_PORT { addr.ip().to_string() } else { addr.to_string() };
-    known.add(key, &stored, &name)?;
+    let (name, key, stored) = pair_and_save(host, code, &cfg)?;
     println!("Paired with \"{name}\" ({}) at {stored}.", fingerprint(&key));
     if let Some(a) = new_alias {
         aliases.set(a, host)?;
@@ -165,6 +197,18 @@ fn pair(args: &Args) -> Result<()> {
         println!("Connect with:  sard connect {arg}");
     }
     Ok(())
+}
+
+/// Pair with `host` using its code and remember it. Returns (name, key, stored address).
+pub fn pair_and_save(host: &str, code: &str, cfg: &NetConfig) -> Result<(String, [u8; 32], String)> {
+    let dir = config::config_dir();
+    let identity = config::load_or_create_identity(&dir)?;
+    let (key, name, addr) = Client::pair(host, code, &identity, cfg, Duration::from_secs(10))?;
+    let name = config::clean_display(&name);
+    let mut known = KnownHosts::load(&dir)?;
+    let stored = if addr.port() == sard_core::DEFAULT_PORT { addr.ip().to_string() } else { addr.to_string() };
+    known.add(key, &stored, &name)?;
+    Ok((name, key, stored))
 }
 
 fn info() -> Result<()> {
