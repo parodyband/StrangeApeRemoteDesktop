@@ -257,7 +257,6 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
 
     // Audio: uncompressed PCM in 5 ms packets, straight from the capture callback.
     let _audio = if hello.flags & client_flags::AUDIO != 0 && !args.flag("no-audio") {
-        conn.send_control(&Control::AudioConfig { sample_rate: AUDIO_RATE, channels: 2 });
         let c = conn.clone();
         let mut seq = 0u32;
         let mut stage: Vec<i16> = Vec::with_capacity(AUDIO_PACKET_FRAMES * 8);
@@ -274,6 +273,8 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
         })) {
             Ok(a) => {
                 info!("audio: {}", a.describe());
+                // Only now: the client opens an output stream when told to expect audio.
+                conn.send_control(&Control::AudioConfig { sample_rate: AUDIO_RATE, channels: 2 });
                 Some(a)
             }
             Err(e) => {
