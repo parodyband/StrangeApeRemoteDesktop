@@ -57,6 +57,13 @@ pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
     Some(Box::new(c))
 }
 
+/// Host permissions still missing (none on Linux: the portal asks per session).
+pub fn missing_host_permissions() -> Vec<&'static str> {
+    Vec::new()
+}
+
+pub fn open_permission_settings(_name: &str) {}
+
 // ---- app shell (tray etc.): implemented in `tray.rs` / `shell.rs` ----
 
 pub fn create_tray(

@@ -9,7 +9,9 @@
 //! fn decoders() -> u8;
 //! fn describe() -> String;
 //! fn capabilities() -> Vec<String>;
-//! fn request_host_permissions() -> Vec<String>;
+//! fn request_host_permissions() -> Vec<String>;   // prompts; returns how-to-fix text
+//! fn missing_host_permissions() -> Vec<&'static str>;  // check only: short names
+//! fn open_permission_settings(name: &str);           // macOS: open that privacy pane
 //! fn open_audio_source(AudioCallback) -> Result<Box<dyn AudioSource>>;
 //! fn open_audio_sink() -> Result<Box<dyn AudioSink>>;
 //! fn open_clipboard() -> Option<Box<dyn Clipboard>>;

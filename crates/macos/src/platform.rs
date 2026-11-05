@@ -45,6 +45,32 @@ pub fn request_host_permissions() -> Vec<String> {
     missing
 }
 
+/// Host permissions still missing, by short name ("Screen Recording",
+/// "Accessibility"). Only checks; never shows a system prompt.
+pub fn missing_host_permissions() -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    // SAFETY: plain permission query.
+    if unsafe { !crate::ffi::CGPreflightScreenCaptureAccess() } {
+        missing.push("Screen Recording");
+    }
+    if !crate::input::accessibility_trusted() {
+        missing.push("Accessibility");
+    }
+    missing
+}
+
+/// Open System Settings at the privacy pane for a permission named by
+/// [`missing_host_permissions`].
+pub fn open_permission_settings(name: &str) {
+    let pane = match name {
+        "Screen Recording" => "Privacy_ScreenCapture",
+        "Accessibility" => "Privacy_Accessibility",
+        _ => "Privacy",
+    };
+    let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+    std::thread::spawn(move || std::process::Command::new("/usr/bin/open").arg(url).status());
+}
+
 /// Called on the main thread right after the window is created.
 pub fn create_video_sink(
     display: RawDisplayHandle,

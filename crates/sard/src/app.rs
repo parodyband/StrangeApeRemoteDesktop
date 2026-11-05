@@ -108,6 +108,8 @@ pub fn run(args: &Args) -> Result<()> {
         update_busy: false,
         // First check shortly after start, then twice a day.
         next_update_check: Instant::now() + Duration::from_secs(15),
+        missing_permissions: Vec::new(),
+        next_permission_check: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -129,6 +131,7 @@ enum Action {
     ToggleLogin,
     CheckUpdates,
     InstallUpdate,
+    OpenPermission(&'static str),
     Quit,
 }
 
@@ -156,6 +159,9 @@ struct App {
     update: Option<crate::update::UpdateInfo>,
     update_busy: bool,
     next_update_check: Instant,
+    /// Host permissions not granted yet (macOS), re-checked while any are missing.
+    missing_permissions: Vec<&'static str>,
+    next_permission_check: Option<Instant>,
 }
 
 /// (session id, label, [(display id, name)], current display)
@@ -227,6 +233,7 @@ impl App {
                 }
                 self.host = Some(h);
                 self.host_error = None;
+                self.check_permissions();
             }
             Err(e) => {
                 let msg = if e.to_string().contains("in use") {
@@ -237,6 +244,16 @@ impl App {
                 error!("cannot share this computer: {msg}");
                 self.host_error = Some(msg);
             }
+        }
+    }
+
+    /// Re-check host permissions (granted in System Settings meanwhile?).
+    fn check_permissions(&mut self) {
+        let now = if self.host.is_some() { platform::missing_host_permissions() } else { Vec::new() };
+        self.next_permission_check = (!now.is_empty()).then(|| Instant::now() + Duration::from_secs(2));
+        if now != self.missing_permissions {
+            self.missing_permissions = now;
+            self.refresh();
         }
     }
 
@@ -277,8 +294,9 @@ impl App {
                 if let Some(v) = &st.viewer {
                     m.push(Self::text(format!("{v} is viewing this computer")));
                 }
-                for p in &st.missing_permissions {
-                    m.push(Self::text(format!("⚠ {p}")));
+                for p in self.missing_permissions.clone() {
+                    let e = self.item(format!("⚠ Allow {p}…"), Action::OpenPermission(p));
+                    m.push(e);
                 }
                 if let Some((code, until)) = &st.pairing {
                     let mins = until.saturating_duration_since(Instant::now()).as_secs().div_ceil(60);
@@ -505,6 +523,7 @@ impl App {
                     self.host_error = None;
                 }
                 self.settings.save();
+                self.check_permissions();
                 self.refresh();
             }
             Action::AllowPairing => {
@@ -534,6 +553,7 @@ impl App {
                 }
                 self.refresh();
             }
+            Action::OpenPermission(p) => platform::open_permission_settings(p),
             Action::CheckUpdates => self.check_updates(true),
             Action::InstallUpdate => self.install_update(),
             Action::Quit => {
@@ -728,7 +748,13 @@ impl ApplicationHandler<AppEvent> for App {
         if Instant::now() >= self.next_update_check {
             self.check_updates(false);
         }
-        let wake = self.next_refresh.map_or(self.next_update_check, |t| t.min(self.next_update_check));
+        if self.next_permission_check.is_some_and(|t| Instant::now() >= t) {
+            self.check_permissions();
+        }
+        let mut wake = self.next_refresh.map_or(self.next_update_check, |t| t.min(self.next_update_check));
+        if let Some(t) = self.next_permission_check {
+            wake = wake.min(t);
+        }
         el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }
