@@ -31,7 +31,7 @@ jobs:
       - id: v
         run: |
           tag=$GITHUB_REF_NAME
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          version=$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)
           draft=false prerelease=false
           case "$tag" in *-test*) draft=true ;; esac
           case "$version" in *-*) prerelease=true ;; esac
@@ -54,7 +54,7 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - run: cargo --version && ldd --version | head -n1
+      - run: cargo --version && ldd --version | sed -n 1p
       - run: scripts/package-linux.sh --out dist
       - name: Smoke test the tarball
         run: |
@@ -87,7 +87,7 @@ jobs:
           name: linux
           path: dist
       - run: |
-          ldd --version | head -n1
+          ldd --version | sed -n 1p
           tar -xzf "dist/sard-$VERSION-linux-x86_64.tar.gz" -C /tmp
           HOME=/tmp/home "/tmp/sard-$VERSION-linux-x86_64/install.sh"
           out=$(/tmp/home/.local/bin/sard version 2>&1)
