@@ -23,20 +23,32 @@ Built for driving Unity, Unreal, Godot and Blender on another machine across the
 
 ## Install
 
-Download the latest release from
-[Releases](https://github.com/parodyband/StrangeApeRemoteDesktop/releases/latest).
-Sard checks for updates itself (menu → *Check for Updates…*).
-
-**macOS** (Apple Silicon, macOS 13+): unzip `sard-<version>-macos-arm64.zip`, move
-**Sard.app** to Applications and open it. Sard lives in the menu bar.
-
-**Linux** (NVIDIA GPU, PipeWire, KDE Plasma or GNOME on Wayland or X11):
+Paste this into a terminal, on Linux or macOS:
 
 ```sh
-tar xf sard-*-linux-x86_64.tar.gz && cd sard-*-linux-x86_64 && ./install.sh   # installs to ~/.local
+curl -fsSL https://raw.githubusercontent.com/parodyband/StrangeApeRemoteDesktop/main/install.sh | sh
 ```
 
-Then start **Sard** from your app launcher. It lives in the system tray.
+It downloads the latest release, checks it against the SHA-256 in the release
+manifest, installs it and starts Sard. On Linux it goes into `~/.local` (no root),
+with a launcher entry and a system tray icon. On macOS it installs **Sard.app**
+into Applications, with an icon in the menu bar. Run the same command again to
+update, or use **Check for Updates…** in the menu.
+
+<details>
+<summary>Manual install, uninstall, requirements</summary>
+
+Download from [Releases](https://github.com/parodyband/StrangeApeRemoteDesktop/releases/latest):
+
+- **macOS** (Apple Silicon, macOS 13+): unzip `sard-<version>-macos-arm64.zip`, move
+  **Sard.app** to Applications and open it.
+- **Linux** (x86-64, NVIDIA GPU, PipeWire, KDE Plasma or GNOME on Wayland or X11):
+  `tar xf sard-*-linux-x86_64.tar.gz && cd sard-*-linux-x86_64 && ./install.sh`
+
+To uninstall on Linux, run
+`curl -fsSL https://raw.githubusercontent.com/parodyband/StrangeApeRemoteDesktop/main/install.sh | sh -s -- --uninstall`.
+On macOS, quit Sard and move it to the Trash. Pairings stay in `~/.config/sard`.
+</details>
 
 ## Getting started
 
