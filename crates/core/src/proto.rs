@@ -225,6 +225,30 @@ pub enum Control {
     Status {
         text: String,
     },
+    /// Host → client: the displays that can be streamed, and which one is.
+    Displays {
+        current: u32,
+        list: Vec<DisplayInfo>,
+    },
+    /// Client → host: stream another display (`DisplayInfo::id`).
+    SelectDisplay {
+        id: u32,
+    },
+}
+
+/// A display the host can stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayInfo {
+    /// Stable within a host session; what `SelectDisplay` refers to.
+    pub id: u32,
+    /// Human-readable, e.g. "DP-1" or "Built-in Retina Display".
+    pub name: String,
+    /// Native pixel size.
+    pub width: u32,
+    pub height: u32,
+    /// Position in the host's desktop layout (logical coordinates).
+    pub x: i32,
+    pub y: i32,
 }
 
 mod tag {
@@ -240,6 +264,8 @@ mod tag {
     pub const RELEASE_ALL: u8 = 10;
     pub const AUDIO_CONFIG: u8 = 11;
     pub const STATUS: u8 = 12;
+    pub const DISPLAYS: u8 = 13;
+    pub const SELECT_DISPLAY: u8 = 14;
 }
 
 impl Control {
@@ -319,6 +345,23 @@ impl Control {
                 b.put_u8(tag::STATUS);
                 b.put_str(text);
             }
+            Control::Displays { current, list } => {
+                b.put_u8(tag::DISPLAYS);
+                b.put_u32(*current);
+                b.put_u8(list.len().min(32) as u8);
+                for d in list.iter().take(32) {
+                    b.put_u32(d.id);
+                    b.put_str(&d.name);
+                    b.put_u32(d.width);
+                    b.put_u32(d.height);
+                    b.put_i32(d.x);
+                    b.put_i32(d.y);
+                }
+            }
+            Control::SelectDisplay { id } => {
+                b.put_u8(tag::SELECT_DISPLAY);
+                b.put_u32(*id);
+            }
         }
         b
     }
@@ -366,6 +409,23 @@ impl Control {
             tag::RELEASE_ALL => Control::ReleaseAll,
             tag::AUDIO_CONFIG => Control::AudioConfig { sample_rate: r.u32()?, channels: r.u8()? },
             tag::STATUS => Control::Status { text: r.str()? },
+            tag::DISPLAYS => {
+                let current = r.u32()?;
+                let n = r.u8()? as usize;
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    list.push(DisplayInfo {
+                        id: r.u32()?,
+                        name: r.str()?,
+                        width: r.u32()?,
+                        height: r.u32()?,
+                        x: r.i32()?,
+                        y: r.i32()?,
+                    });
+                }
+                Control::Displays { current, list }
+            }
+            tag::SELECT_DISPLAY => Control::SelectDisplay { id: r.u32()? },
             _ => return Err(WireError),
         })
     }
@@ -533,6 +593,14 @@ mod tests {
             Control::ReleaseAll,
             Control::AudioConfig { sample_rate: 48000, channels: 2 },
             Control::Status { text: "ok".into() },
+            Control::Displays {
+                current: 2,
+                list: vec![
+                    DisplayInfo { id: 1, name: "DP-1".into(), width: 3840, height: 2160, x: 0, y: 0 },
+                    DisplayInfo { id: 2, name: "DP-3".into(), width: 2560, height: 1440, x: 2560, y: 0 },
+                ],
+            },
+            Control::SelectDisplay { id: 2 },
         ];
         for m in msgs {
             assert_eq!(Control::decode(&m.encode()).unwrap(), m);

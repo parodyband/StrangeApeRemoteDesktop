@@ -57,6 +57,33 @@ pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
     Some(Box::new(c))
 }
 
+// ---- app shell (tray etc.): implemented in `tray.rs` / `shell.rs` ----
+
+pub fn create_tray(
+    icons: sard_core::media::TrayIcons,
+    on_click: sard_core::media::TrayCallback,
+) -> media::Result<Box<dyn sard_core::media::Tray>> {
+    crate::tray::create(icons, on_click)
+}
+
+pub fn prompt_text(title: &str, message: &str) -> Option<String> {
+    crate::shell::prompt_text(title, message)
+}
+
+pub fn show_message(title: &str, message: &str) {
+    crate::shell::show_message(title, message)
+}
+
+pub fn set_launch_at_login(enabled: bool) -> media::Result<()> {
+    crate::shell::set_launch_at_login(enabled)
+}
+
+pub fn launch_at_login() -> bool {
+    crate::shell::launch_at_login()
+}
+
+pub fn set_dock_visible(_visible: bool) {}
+
 struct Caps {
     gpu: String,
     enc: u8,

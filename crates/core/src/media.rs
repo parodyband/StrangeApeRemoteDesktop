@@ -6,6 +6,7 @@
 //! Client side: a [`VideoSink`] (decode + present into a window).
 
 use crate::proto::Codec;
+pub use crate::proto::DisplayInfo;
 use std::time::Duration;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -119,6 +120,20 @@ pub trait VideoSource: Send {
     fn describe(&self) -> String {
         String::new()
     }
+    /// Displays this source can switch between (empty: not switchable).
+    fn displays(&self) -> Vec<DisplayInfo> {
+        Vec::new()
+    }
+    /// `DisplayInfo::id` currently being streamed.
+    fn current_display(&self) -> Option<u32> {
+        None
+    }
+    /// Switch to another display. The next frame must be a keyframe (its size
+    /// may differ). The input sink returned with this source must follow the
+    /// switch (absolute coordinates map to the new display).
+    fn select_display(&mut self, _id: u32) -> Result<()> {
+        Err(err("this source cannot switch displays"))
+    }
 }
 
 /// Input events delivered to the host. Positions are normalized to the
@@ -207,6 +222,50 @@ pub trait AudioSink: Send {
     fn describe(&self) -> String {
         String::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tray / menu-bar UI (platform-neutral description; see `platform::create_tray`).
+// ---------------------------------------------------------------------------
+
+/// One entry of the tray / menu-bar menu. `id`s are chosen by the app and
+/// reported back through the tray callback when an item is clicked.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuEntry {
+    Item { id: u32, label: String, enabled: bool, checked: Option<bool> },
+    Submenu { label: String, enabled: bool, items: Vec<MenuEntry> },
+    Separator,
+}
+
+/// Straight-alpha RGBA8 image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rgba {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Tray icon artwork. `mono` is black-with-alpha (macOS template image, KDE
+/// symbolic); `color` is the full-color variant. `*_active` are shown while a
+/// session is connected / the screen is being shared.
+#[derive(Clone, Debug)]
+pub struct TrayIcons {
+    pub mono: Rgba,
+    pub mono_active: Rgba,
+    pub color: Rgba,
+    pub color_active: Rgba,
+}
+
+/// Called (from any thread) with the `id` of the clicked menu item.
+pub type TrayCallback = Box<dyn Fn(u32) + Send + Sync>;
+
+/// A live tray / menu-bar item. All methods may be called from any thread.
+pub trait Tray: Send + Sync {
+    /// Replace the whole menu.
+    fn set_menu(&self, menu: Vec<MenuEntry>);
+    fn set_tooltip(&self, text: &str);
+    /// Show the "active" icon (connected or being viewed).
+    fn set_active(&self, active: bool);
 }
 
 /// System clipboard (plain text).

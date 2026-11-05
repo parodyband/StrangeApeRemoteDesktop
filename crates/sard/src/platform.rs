@@ -1,3 +1,4 @@
+#![allow(dead_code)] // app-shell functions are wired up incrementally
 //! Compile-time dispatch to the platform backend. Each backend crate exposes
 //! the same `platform` module API:
 //!
@@ -8,6 +9,21 @@
 //! fn decoders() -> u8;
 //! fn describe() -> String;
 //! fn capabilities() -> Vec<String>;
+//! fn request_host_permissions() -> Vec<String>;
+//! fn open_audio_source(AudioCallback) -> Result<Box<dyn AudioSource>>;
+//! fn open_audio_sink() -> Result<Box<dyn AudioSink>>;
+//! fn open_clipboard() -> Option<Box<dyn Clipboard>>;
+//! fn create_headless_sink() -> Result<Box<dyn VideoSink>>;
+//!
+//! // App shell (tray / menu bar):
+//! fn create_tray(TrayIcons, TrayCallback) -> Result<Box<dyn Tray>>;
+//!     // Must be called on the main thread after the winit event loop started
+//!     // (inside `resumed`). The callback may fire on any thread.
+//! fn prompt_text(title: &str, message: &str) -> Option<String>;  // modal text entry; None = cancelled
+//! fn show_message(title: &str, message: &str);                   // modal notice
+//! fn set_launch_at_login(enabled: bool) -> Result<()>;
+//! fn launch_at_login() -> bool;
+//! fn set_dock_visible(visible: bool);  // macOS: Dock icon while a viewer window is open (no-op on Linux)
 //! ```
 
 #[cfg(target_os = "linux")]
@@ -16,6 +32,33 @@ pub use sard_linux::platform::*;
 pub use sard_macos::platform::*;
 
 // Audio on macOS is not implemented yet; these stubs keep the build working.
+// ---- macOS app-shell stubs (replaced by sard-macos implementations) ----
+#[cfg(target_os = "macos")]
+pub fn create_tray(
+    _icons: sard_core::media::TrayIcons,
+    _on_click: sard_core::media::TrayCallback,
+) -> sard_core::media::Result<Box<dyn sard_core::media::Tray>> {
+    Err(sard_core::media::err("menu bar item not implemented on macOS yet"))
+}
+#[cfg(target_os = "macos")]
+pub fn prompt_text(_title: &str, _message: &str) -> Option<String> {
+    None
+}
+#[cfg(target_os = "macos")]
+pub fn show_message(title: &str, message: &str) {
+    eprintln!("{title}: {message}");
+}
+#[cfg(target_os = "macos")]
+pub fn set_launch_at_login(_enabled: bool) -> sard_core::media::Result<()> {
+    Err(sard_core::media::err("launch at login not implemented on macOS yet"))
+}
+#[cfg(target_os = "macos")]
+pub fn launch_at_login() -> bool {
+    false
+}
+#[cfg(target_os = "macos")]
+pub fn set_dock_visible(_visible: bool) {}
+
 #[cfg(target_os = "macos")]
 pub fn open_audio_source(
     _cb: sard_core::media::AudioCallback,
