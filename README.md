@@ -1,217 +1,198 @@
-# StrangeApeRemoteDesktop (`sard`)
+<p align="center"><img src="assets/icons/app/sard-256.png" width="128" alt="Sard icon"></p>
 
-Low-latency, GPU-accelerated remote desktop for **Linux ⇄ macOS**, written in Rust
-with a deliberately tiny dependency tree so builds stay fast (clean build ≈ 11 s,
-incremental ≈ 1 s).
+<h1 align="center">Sard</h1>
 
-Built for streaming 3D / game-engine work (Unity, Unreal, Godot, Blender) over a
-LAN at high frame rates, with hardware encode/decode on both ends and zero-copy
-GPU paths.
+<p align="center"><b>Low-latency, GPU-accelerated remote desktop for Linux ⇄ macOS.</b><br>
+Built for driving Unity, Unreal, Godot and Blender on another machine across the room.</p>
 
-## Measured (Linux host, RTX 4070 Ti SUPER, KDE Plasma Wayland)
+---
+
+- **Fast.** Hardware encode and decode on both ends with zero-copy GPU paths:
+  3–4 ms from capture to decode on a wired LAN, about 8 ms Linux → Mac over Wi-Fi,
+  up to 240 fps.
+- **Made for 3D work.** It switches to relative mouse automatically when a viewport
+  hides the cursor, and maps Cmd ⇄ Ctrl between macOS and Linux. Clipboard and
+  audio are shared.
+- **Any screen.** Pick which remote monitor you're looking at from the menu, or with
+  <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Shift</kbd>+<kbd>1</kbd>…<kbd>9</kbd>.
+- **Private.** Devices pair once with a one-time code. After that every connection
+  is mutually authenticated and end-to-end encrypted (Noise IK). There are no
+  accounts and no cloud.
+- **Small.** One Rust binary with six crates of dependencies. A clean build takes
+  about 11 s.
+
+## Install
+
+Download the latest release from
+[Releases](https://github.com/parodyband/StrangeApeRemoteDesktop/releases/latest).
+Sard checks for updates itself (menu → *Check for Updates…*).
+
+**macOS** (Apple Silicon, macOS 13+): unzip `Sard-macos.zip`, move **Sard.app** to
+Applications and open it. Sard lives in the menu bar.
+
+**Linux** (NVIDIA GPU, PipeWire, KDE Plasma or GNOME on Wayland or X11):
+
+```sh
+tar xf sard-linux-x86_64.tar.gz && cd sard-* && ./install.sh   # installs to ~/.local
+```
+
+Then start **Sard** from your app launcher. It lives in the system tray.
+
+## Getting started
+
+1. Open Sard on both computers.
+2. On the computer you want to **control**, choose **Allow a New Device to Pair…**
+   from its menu. It shows the address and a one-time code.
+3. On the computer you're **sitting at**, choose **Connect To → Pair with a New
+   Computer…** and enter that address and code.
+
+That's it. From now on the computer is listed under **Connect To**. While you're
+connected, the menu lists the remote computer's screens: click one to switch.
+
+The first time a Linux computer is viewed, the desktop asks which screens to share
+and whether to allow remote control. Select **all** monitors there to be able to
+switch between them. The answer is remembered; use **Choose Screens to Share…** to
+be asked again. On macOS, grant the permissions described [below](#macos-permissions).
+
+### Shortcuts in a viewer window
+
+| <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Shift</kbd> + | |
+|---|---|
+| <kbd>1</kbd> … <kbd>9</kbd> | show remote screen *n* |
+| <kbd>D</kbd> | next remote screen |
+| <kbd>F</kbd> | full screen |
+| <kbd>M</kbd> | relative mouse on/off (games, 3D viewports) |
+| <kbd>K</kbd> | request a fresh keyframe |
+| <kbd>Q</kbd> | disconnect |
+
+## Command line
+
+Everything in the menu also works from a terminal:
+
+```sh
+sard host --pair                         # share this computer; prints a pairing code
+sard pair 192.168.1.77 <code> --alias linux
+sard connect linux                       # open a viewer window
+sard alias 192.168.1.131 mac             # name a paired computer; `sard alias` lists them
+sard info                                # identity, paired devices, encoders/decoders
+sard update                              # install the latest release
+```
+
+Useful options: `--fps`, `--bitrate <Mbps>`, `--codec hevc|h264|av1`, `--yuv444`,
+`--display <n>`, `--fullscreen`, `--view-only`, `--no-audio`, `--max-datagram 1200`
+(VPNs). `sard help` lists them all.
+
+## Performance
+
+Linux host: RTX 4070 Ti SUPER, KDE Plasma (Wayland). Mac: M5 Pro on Wi-Fi.
 
 | Path | Result |
 |---|---|
-| Screen capture → encoded (DMA-BUF zero-copy, 5120×1440 HEVC) | **3.5 ms** p50 |
-| Capture → decoded on client (2560×1440 HEVC @ 120 fps, loopback) | **3.0–3.3 ms** p50 |
-| Real desktop → displayed in client window (3840×1080 @ 60 fps) | **3.5 ms** p50 |
-| NVENC 1440p HEVC encode (preset P1) / NVDEC decode | 1.6 ms / 1.1 ms |
-| 10 % / 25 % random packet loss (simulated) | 120 fps, 0 frames lost, 3.2–3.4 ms |
-| Input injection → visible in capture | 7–17 ms (bounded by compositor frame timing) |
+| Linux screen capture → encoded (DMA-BUF zero-copy, 5120×1440 HEVC) | **3.5 ms** p50 |
+| Linux desktop → shown in a Linux viewer window (3840×1080 @ 60) | **3.5 ms** p50 |
+| Linux → Mac, 2560×1440 HEVC @ 120 fps over Wi-Fi | **7.5 ms** p50, p95 8.3 ms |
+| Mac → Linux, 2560×1440 HEVC @ 60 fps over Wi-Fi | **9–11 ms** p50 |
+| Switching remote screens | ~50 ms |
+| 10 % / 25 % random packet loss (simulated, loopback) | 120 fps, 0 frames lost |
 
-Latency figures are capture → decode/present and exclude the display's scan-out.
+Latency is measured from capture to decoded frame, using synchronized clocks. It
+does not include the display's scan-out.
 
-## Architecture
+## How it works
 
 ```
- HOST                                                        CLIENT
+ HOST                                                        VIEWER
  ┌────────────┐   ┌──────────┐   ┌────────────┐  UDP   ┌────────────┐   ┌──────────┐   ┌─────────┐
  │  capture   │──▶│  encode  │──▶│ packetize  │══════▶│ reassemble │──▶│  decode  │──▶│ present │
  │ PipeWire / │   │ NVENC /  │   │ FEC + AEAD │◀══════│ NACK / KF  │   │ NVDEC /  │   │ GL /    │
  │ SCKit      │   │ VideoTbx │   └────────────┘ input │  requests  │   │ VideoTbx │   │ Metal   │
  └────────────┘   └──────────┘         ▲              └────────────┘   └──────────┘   └─────────┘
-                                       │ reliable channel: keys, buttons, scroll, cursor, clipboard
- ┌────────────┐                        │ unreliable: pointer position, audio (5 ms PCM)
- │  inject    │◀───────────────────────┘
+ ┌────────────┐                        │ reliable: keys, buttons, scroll, cursor, clipboard
+ │  inject    │◀───────────────────────┘ unreliable: pointer position, audio (5 ms PCM)
  │ portal /   │
  │ CGEvent    │
  └────────────┘
 ```
 
-| Layer            | Linux (NVIDIA)                                                    | macOS (Apple Silicon)                    |
-|------------------|-------------------------------------------------------------------|------------------------------------------|
-| Capture          | xdg-desktop-portal RemoteDesktop+ScreenCast → PipeWire, DMA-BUF   | ScreenCaptureKit (IOSurface)             |
-| Colour convert   | OpenGL shader, BT.709 limited, GPU downscale to client size       | ScreenCaptureKit `420v`                  |
-| Encode           | NVENC (dlopen), HEVC / H.264 / AV1, ultra-low-latency CBR         | VideoToolbox HEVC / H.264                |
-| Decode           | NVDEC (dlopen), zero display delay                                | VideoToolbox                             |
-| Present          | EGL + OpenGL via CUDA/GL interop (no CPU copies)                  | Metal (CAMetalLayer)                     |
-| Input injection  | RemoteDesktop portal (evdev codes)                                | CGEvent                                  |
-| Audio            | PipeWire monitor capture / playback                               | CoreAudio output unit (playback)         |
-| Clipboard        | Klipper over D-Bus, wl-clipboard fallback                         | NSPasteboard                             |
+| | Linux (NVIDIA) | macOS (Apple Silicon) |
+|---|---|---|
+| Capture | xdg-desktop-portal + PipeWire, DMA-BUF | ScreenCaptureKit (IOSurface) |
+| Encode / decode | NVENC / NVDEC: HEVC, H.264, AV1 | VideoToolbox: HEVC, H.264 |
+| Present | EGL + OpenGL via CUDA/GL interop | Metal (`CAMetalLayer`) |
+| Input | RemoteDesktop portal | CGEvent |
+| Audio | PipeWire | ScreenCaptureKit / CoreAudio |
+| Clipboard | Klipper (D-Bus), wl-clipboard | NSPasteboard |
+| Tray | StatusNotifierItem + dbusmenu | NSStatusItem |
 
-### Transport (`crates/core`)
+**Transport** (`crates/core`): one UDP socket and one network thread; there is no
+async runtime.
+- **Handshake:** Noise IK (X25519, ChaCha20-Poly1305, SHA-256). Pairing uses Noise
+  NNpsk0 with a single-use 10-minute code. Handshakes carry a WireGuard-style *mac1*
+  and are rate-limited.
+- **Packets:** per-packet AEAD with explicit counters and a replay window. A
+  session index routes every packet, so peers can roam and a future relay can
+  forward without decrypting.
+- **Video:** frames are split into shards protected by Reed-Solomon FEC
+  (GF(2⁸), Cauchy) and interleaved. The viewer NACKs what FEC can't repair and
+  resynchronizes on keyframes.
+- **Adaptation:** FEC follows measured loss, while bitrate follows *congestion*
+  (queueing delay, unrecoverable frames). Random Wi-Fi loss doesn't lower quality.
+- **Control:** a reliable ordered channel carries input and control messages.
+  Clock sync gives true end-to-end latency figures.
 
-* **UDP**, one socket, one network thread that also runs all timers. No async runtime.
-* **Noise IK** handshake (X25519, ChaCha20-Poly1305, SHA-256) with mutual static-key
-  authentication; **pairing** with a single-use, 10-minute, 100-bit code via Noise
-  NNpsk0. Handshake initiations carry a WireGuard-style *mac1* keyed by the host's
-  public key (known only to paired clients) and are rate-limited, so junk costs the
-  host one HMAC, not an X25519 operation.
-* Peer input is treated as hostile: shard layouts are validated against the frame
-  size, receiver state and queues are bounded, retransmit requests are deduplicated.
-* **Per-packet AEAD** with explicit counters + 4096-packet replay window
-  (WireGuard-style), so loss and reordering are harmless.
-* **Session indices** in every packet header: routing never depends on the source
-  address (peers can roam; a future relay can forward by index without decrypting).
-* **Video**: frames split into equal shards, grouped into Reed-Solomon (Cauchy,
-  GF(2⁸)) FEC blocks, interleaved across blocks. The receiver repairs with FEC,
-  NACKs what FEC can't fix, delivers frames strictly in order, and on unrecoverable
-  loss skips to the next keyframe and requests one. FEC overhead adapts to the
-  reported loss; bitrate adapts to *congestion* (unrecoverable frames, queueing
-  delay), not to random Wi-Fi loss.
-* **Reliable ordered channel** (selective acks, fragmentation) for input and control.
-* Clock-offset estimation (min-RTT, NTP style) for real end-to-end latency readouts.
+**Dependencies:** GPU and OS libraries are loaded with `dlopen` and bound by hand,
+with no bindgen, no `-sys` crates and no FFmpeg. Exact C struct layouts come from
+small generators in `tools/`, and the D-Bus client is about 800 lines of Rust. The
+crates used are `libc`, `chacha20poly1305`, `x25519-dalek`, `sha2`, `winit` and
+`raw-window-handle`, plus `objc2`/`block2` on macOS.
 
-### Dependencies
-
-Runtime GPU/OS libraries are loaded with `dlopen` and bound by hand — no bindgen,
-no `-sys` crates, no FFmpeg. Exact C struct layouts come from small generators in
-`tools/` (compiled once against NVIDIA's and PipeWire's headers, output committed),
-so nothing is hand-transcribed. The D-Bus client for the desktop portal is ~600
-lines of Rust instead of zbus. Crates: `libc`, `chacha20poly1305`, `x25519-dalek`,
-`sha2`, `winit`, `raw-window-handle`; on macOS `objc2`/`block2`.
-
-## Building
+## Building from source
 
 ```sh
-cargo build --release          # binary: target/release/sard
+cargo build --release                 # target/release/sard
+scripts/macos-app.sh                  # macOS: dist/Sard.app (needed for permissions)
+packaging/linux/install.sh            # Linux: install binary, icon and launcher entry
 ```
 
-Linux needs the NVIDIA driver (NVENC/NVDEC/CUDA), PipeWire and xdg-desktop-portal
-(KDE Plasma / GNOME). macOS needs the Xcode command line tools.
+Linux needs the NVIDIA driver (NVENC/NVDEC/CUDA), PipeWire and xdg-desktop-portal.
+macOS needs the Xcode command line tools. Releases are built by GitHub Actions; see
+[docs/RELEASING.md](docs/RELEASING.md).
 
-## Usage
+### macOS permissions
 
-```sh
-# On the machine to be controlled:
-sard host --pair            # prints a one-time pairing code
+macOS ties privacy permissions to the signed app, so run Sard as **Sard.app** (not a
+bare binary from a terminal) when sharing the Mac.
 
-# On the viewing machine (once):
-sard pair 192.168.1.77 ABCDE-FGHJK-LMNPQ-RSTUV
+| Permission | Needed for | System Settings → Privacy & Security → |
+|---|---|---|
+| Screen & System Audio Recording | sharing the screen and audio | Screen & System Audio Recording → **Sard** |
+| Accessibility | remote keyboard and mouse | Accessibility → **Sard** |
+| Local Network | all connections | Local Network → **Sard** (or accept the prompt) |
 
-# Then, any time:
-sard connect 192.168.1.77
-
-# Optional: name your machines
-sard alias 192.168.1.77 linux      # or: sard pair 192.168.1.77 <code> --alias linux
-sard connect linux
-sard alias                         # list;  sard unalias linux  to remove
-```
-
-Pairing codes are **single-use and expire after 10 minutes**; run `sard host --pair`
-again to pair another device. After pairing, `sard connect <hostname>` also works.
-
-The first connection to a Linux host shows the desktop's screen-share dialog (pick a
-monitor and allow remote control). The approval is remembered; `sard host
---reselect` asks again. To run the host at login see `scripts/sard-host.service`.
-
-In-session hotkeys (Ctrl+Alt+Shift + key): **F** fullscreen, **M** relative mouse
-(for 3D viewports / games), **K** request keyframe, **Q** disconnect. Between macOS
-and Linux, Cmd and Ctrl are swapped so shortcuts land naturally
-(`--no-swap-modifiers` to disable).
-
-Useful options: `--fps`, `--bitrate <Mbps>`, `--codec hevc|h264|av1`, `--yuv444`,
-`--view-only`, `--no-audio`, `--max-datagram 1200` (VPNs). Run `sard help` for all.
+The menu shows which permissions are still missing. A locally built app has to be
+signed with a stable identity (`scripts/macos-app.sh` uses the first one in your
+keychain); with an ad-hoc signature, macOS forgets the grants on every rebuild.
 
 ### Diagnostics
 
-* `sard info` — identity, paired devices, encoder/decoder support.
-* `sard host --test-pattern 2560x1440` — stream a synthetic pattern (no capture permission needed).
-* `sard connect <host> --headless --duration 10 --snapshot frame.png` — windowless
-  client that logs fps / latency / loss and saves a decoded frame.
-* `SARD_SIM_LOSS=0.05` — drop 5 % of incoming packets (test FEC / recovery).
-* `SARD_LOG=debug` — verbose logs, including per-stage capture timings.
-
-## macOS
-
-Apple Silicon, macOS 13 or newer. Everything runs on the media engine and GPU:
-ScreenCaptureKit delivers IOSurface NV12 buffers straight into VideoToolbox (no
-copy); on the client, VideoToolbox decodes into IOSurfaces that Metal samples
-through `CVMetalTextureCache` (no copy), converting BT.709 YUV→RGB in a shader and
-presenting on a `CAMetalLayer` with display sync off.
-
-Measured on an M5 Pro (macOS 26.5), Mac on Wi-Fi, Linux box wired:
-
-| Path | Result |
-|---|---|
-| VideoToolbox HEVC encode, 1080p / 1440p / 4K (`--preset 1`, default) | 2.6 / 4.1 / 8.3 ms |
-| same with low-latency rate control (`--preset 2`+) | 4.4 / 7.1 / 14.7 ms |
-| VideoToolbox HEVC decode, 1080p / 1440p / 4K | 1.0 / 1.2 / 1.7 ms |
-| Mac test pattern → decoded on Linux (2560×1440 HEVC @ 60) | **9–11 ms** p50, 0 frames lost |
-| Linux test pattern → decoded on Mac (2560×1440 HEVC @ 60) | **7.8–8.1 ms** p50, 0 frames lost |
-| Linux test pattern → decoded on Mac (2560×1440 HEVC @ 120) | **7.4–7.6 ms** p50, p95 8.3 ms |
-
-Wi-Fi RTT is ≈ 3 ms here; on Ethernet expect ~2–3 ms less.
-
-> **Why connected sockets:** on macOS every datagram sent or received on an
-> *unconnected* UDP socket goes through a per-packet policy check (Local Network
-> privacy / NECP). It capped the Mac at a few thousand packets/s and built 100 ms+
-> queues. sard therefore `connect()`s the client socket, and a macOS host gives each
-> session its own connected socket on the shared port (`SO_REUSEPORT`).
-
-`--preset 1` (default) uses VideoToolbox's normal rate control with
-*PrioritizeEncodingSpeedOverQuality* for HEVC, which encodes ~40 % faster than
-the low-latency rate control but spends more bits for the same quality;
-`--preset 2` and above (and H.264 always) use the low-latency rate control
-(steadier frame sizes, better quality per bit).
-
-### Permissions
-
-macOS ties privacy permissions to the signed app, so build an app bundle:
-
-```sh
-scripts/macos-app.sh            # → dist/Sard.app (release build, signed)
-```
-
-It signs with the first code-signing identity in your keychain (e.g. a free
-"Apple Development" certificate from Xcode). **With an ad-hoc signature (no
-identity, or a locked keychain over SSH) every rebuild looks like a new app and
-macOS forgets the grants below**, so use a stable identity for day-to-day use.
-
-| Permission | Needed for | Where |
-|---|---|---|
-| Screen & System Audio Recording | `sard host` (screen capture) | System Settings → Privacy & Security → Screen & System Audio Recording → enable **Sard** |
-| Accessibility | `sard host` (keyboard/mouse injection) | System Settings → Privacy & Security → Accessibility → enable **Sard** |
-| Local Network | host and client (LAN traffic) | allow the "find devices on local networks" prompt; if missed: Privacy & Security → Local Network → **Sard** |
-
-The first `sard host` run shows the system prompts (or adds Sard to the lists);
-enable the switches, then restart the host. `sard info` prints whether Screen
-Recording and Accessibility are granted. When sard is run from a terminal instead
-of through the app, macOS attributes the permissions to the terminal app.
-`sard host --test-pattern` and the client need no permissions besides Local Network
-(without it, connections fail with "No route to host").
-
-### Running
-
-```sh
-open -n dist/Sard.app --stdout /tmp/sard-host.log --stderr /tmp/sard-host.log --args host --pair
-open -n dist/Sard.app --stdout /tmp/sard.log --stderr /tmp/sard.log --args connect 192.168.1.77
-# environment variables: open --env SARD_LOG=debug --env SARD_CONFIG_DIR=... -n dist/Sard.app --args ...
-```
-
-`--display <n>` picks the display to share (0 = main display, then the others).
-The cursor is drawn into the video by ScreenCaptureKit. Clipboard sync and audio
-playback work on macOS; capturing the Mac's own audio (Mac as host) is not done yet.
+- `sard host --test-pattern 2560x1440` streams a synthetic pattern with two fake
+  screens and needs no capture permission.
+- `sard connect <host> --headless --duration 10 --snapshot frame.png` runs without a
+  window: it logs fps, latency and loss and saves a decoded frame.
+  `--cycle-displays 2` switches screens every 2 s.
+- `SARD_SIM_LOSS=0.05` drops 5 % of incoming packets; `SARD_LOG=debug` logs per-stage
+  timings.
+- `cargo run -p sard-linux --example sni_panel` is a stand-in tray panel for testing
+  the Linux tray on a private D-Bus.
 
 ## Roadmap
 
-- [x] Core transport: crypto, FEC, reliable channel, video reassembly, adaptive FEC/bitrate
-- [x] Linux host: portal + PipeWire capture (DMA-BUF zero-copy), NVENC, portal input injection
-- [x] Linux client: NVDEC + GL presentation, input capture, local cursor, relative mouse
-- [x] Audio (Linux), clipboard sync (Linux)
-- [x] macOS client: VideoToolbox + Metal (zero-copy), headless mode
-- [x] macOS host: ScreenCaptureKit + VideoToolbox + CGEvent
-- [ ] macOS AV1 decode (hardware is there on M3+), client-side cursor on macOS hosts
-- [x] macOS clipboard and audio playback
-- [ ] macOS host audio capture (ScreenCaptureKit audio)
-- [ ] NAT traversal / relay (protocol already routes by session index)
+- [x] Linux and macOS hosts and viewers, audio, clipboard, multi-monitor switching
+- [x] Menu bar / tray app, pairing from the UI, start at login, self-update
+- [ ] macOS AV1 decode (M3+ hardware), viewer-drawn cursor for macOS hosts
+- [ ] Connections beyond the LAN (NAT traversal / relay; the protocol already
+      routes by session index)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
