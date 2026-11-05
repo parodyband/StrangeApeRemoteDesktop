@@ -736,7 +736,20 @@ fn run_headless(
     let (mut n, mut bytes, mut total) = (0u32, 0usize, 0u64);
     let (mut e2e, mut dec) = (Samples::default(), Samples::default());
     let mut snapshot_armed = false;
+    // Diagnostic: hold the host pointer at a normalized position (input check).
+    let move_to: Option<(f32, f32)> = args.value("move-to").and_then(|v| {
+        let (x, y) = v.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    });
+    let mut last_move = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) && duration.is_none_or(|d| start.elapsed() < d) {
+        if let Some((x, y)) = move_to
+            && start.elapsed() > Duration::from_millis(500)
+            && last_move.elapsed() > Duration::from_millis(250)
+        {
+            conn.send_mouse_abs(x, y);
+            last_move = Instant::now();
+        }
         if !snapshot_armed
             && start.elapsed() > Duration::from_secs(2)
             && let Some(p) = &snapshot
