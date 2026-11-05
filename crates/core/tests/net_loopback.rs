@@ -58,9 +58,10 @@ fn pair_connect_stream() {
     }
     let mut got = Vec::new();
     while got.len() < 50 {
-        match sev.recv_timeout(Duration::from_secs(2)).expect("control event") {
-            Event::Control(Control::Key { code, .. }) => got.push(code),
-            _ => {}
+        if let Event::Control(Control::Key { code, .. }) =
+            sev.recv_timeout(Duration::from_secs(2)).expect("control event")
+        {
+            got.push(code);
         }
     }
     assert_eq!(got, (1..=50).collect::<Vec<_>>());

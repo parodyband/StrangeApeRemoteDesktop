@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 sard-core.workspace = true
 libc.workspace = true
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sard-linux.workspace = true

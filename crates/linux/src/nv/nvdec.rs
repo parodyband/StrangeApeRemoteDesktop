@@ -6,7 +6,7 @@
 //! the caller immediately (zero frames of decoder latency).
 
 use super::blob::{Blob, F};
-use super::cuda::{Cuda, CUdeviceptr};
+use super::cuda::{CUdeviceptr, Cuda};
 use super::layout as L;
 use crate::dylib;
 use sard_core::proto::Codec;

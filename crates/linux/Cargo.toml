@@ -8,3 +8,4 @@ publish.workspace = true
 [dependencies]
 sard-core.workspace = true
 libc.workspace = true
+raw-window-handle = "0.6"

@@ -38,7 +38,7 @@ pub fn test_pattern_nv12(w: usize, h: usize, pitch: usize, t: u32, out: &mut [u8
 fn pattern_rgb(x: usize, y: usize, w: usize, h: usize, t: u32, bar: usize) -> (u8, u8, u8) {
     if y > h * 3 / 4 {
         // "text" region: 1px stripes that scroll slowly
-        let on = ((x + y / 3 + t as usize) / 2) % 3 == 0 && (y / 12) % 2 == 0;
+        let on = ((x + y / 3 + t as usize) / 2).is_multiple_of(3) && (y / 12).is_multiple_of(2);
         return if on { (20, 20, 20) } else { (235, 235, 235) };
     }
     if x.abs_diff(bar) < 24 {

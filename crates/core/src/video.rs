@@ -60,14 +60,8 @@ impl FrameMeta {
         let codec = Codec::from_u8(r.u8()?).ok_or(WireError)?;
         let flags = r.u8()?;
         r.u8()?;
-        let meta = FrameMeta {
-            codec,
-            flags,
-            width: r.u16()?,
-            height: r.u16()?,
-            capture_us: r.u64()?,
-            send_us: r.u64()?,
-        };
+        let meta =
+            FrameMeta { codec, flags, width: r.u16()?, height: r.u16()?, capture_us: r.u64()?, send_us: r.u64()? };
         Ok((meta, r.rest()))
     }
 }
@@ -371,10 +365,6 @@ impl Partial {
             used_rtx: false,
         }
     }
-
-    fn expected_shards(&self) -> u32 {
-        self.blocks.iter().flatten().map(|b| (b.k + b.m) as u32).sum()
-    }
 }
 
 /// A fully reassembled frame (meta + bitstream).
@@ -552,12 +542,16 @@ impl VideoReceiver {
         blk.buf[idx * s..(idx + 1) * s].copy_from_slice(data);
 
         if blk.received >= blk.k {
-            let needed_fec = (0..blk.k).any(|j| !blk.present[j]);
+            // Data shards that had not arrived when the block became decodable
+            // are the real losses (parity still in flight is not a loss).
+            let missing_data = (0..blk.k).filter(|&j| !blk.present[j]).count() as u32;
+            let needed_fec = missing_data > 0;
             if needed_fec && !fec::reconstruct(blk.k, blk.m, s, &mut blk.buf, &mut blk.present) {
                 return Ok(());
             }
             if needed_fec {
                 p.used_fec = true;
+                self.counters.lost_packets += missing_data;
             }
             blk.done = true;
             let k = blk.k;
@@ -577,8 +571,6 @@ impl VideoReceiver {
                 if p.used_rtx {
                     self.counters.rtx_recovered += 1;
                 }
-                let expected = p.expected_shards();
-                self.counters.lost_packets += expected.saturating_sub(p.shards_received);
                 self.counters.assembly_us_total += now - p.first_us;
                 // Free FEC buffers early.
                 for b in p.blocks.iter_mut().flatten() {
@@ -651,7 +643,9 @@ impl VideoReceiver {
     /// Periodic work: NACK generation and give-up decisions. Call every ~1 ms.
     pub fn poll(&mut self, now: u64, rtt_us: u64) -> Vec<RecvEvent> {
         let mut out = Vec::new();
-        let Some(newest) = self.newest_seen else { return out };
+        let Some(newest) = self.newest_seen else {
+            return out;
+        };
         let nack_interval = (rtt_us * 3 / 2).max(2_000);
         let mut give_up = false;
         if self.awaiting_resync {
@@ -669,7 +663,8 @@ impl VideoReceiver {
             }
             let age = now.saturating_sub(p.first_us);
             let silent = now.saturating_sub(p.last_us);
-            if age > self.cfg.max_wait_us || (p.nacks >= self.cfg.max_nacks && now - p.last_nack_us > nack_interval * 2) {
+            if age > self.cfg.max_wait_us || (p.nacks >= self.cfg.max_nacks && now - p.last_nack_us > nack_interval * 2)
+            {
                 if !self.awaiting_resync && self.next_id.is_none_or(|n| id >= n) {
                     give_up = true;
                 }
@@ -734,6 +729,11 @@ impl VideoReceiver {
             // wait for one to complete. The caller requests a keyframe.
             let lost = self.frames.values().filter(|p| !p.complete).count() as u32;
             self.counters.frames_lost += lost.max(1);
+            for p in self.frames.values().filter(|p| !p.complete) {
+                for b in p.blocks.iter().flatten().filter(|b| !b.done) {
+                    self.counters.lost_packets += (0..b.k).filter(|&j| !b.present[j]).count() as u32;
+                }
+            }
             self.frames.retain(|_, p| p.known && Self::is_resync(p));
             self.awaiting_resync = true;
             self.next_id = Some(self.frames.keys().next().copied().unwrap_or(newest + 1));
@@ -818,6 +818,7 @@ mod tests {
             }
             let c = rx.take_counters();
             counters.packets += c.packets;
+            counters.lost_packets += c.lost_packets;
             counters.fec_recovered += c.fec_recovered;
             counters.rtx_recovered += c.rtx_recovered;
             counters.frames_lost += c.frames_lost;
@@ -827,10 +828,19 @@ mod tests {
 
     #[test]
     fn lossless_delivers_all_in_order() {
-        let (d, c) = run(0.0, 120, |i| if i % 60 == 0 { 200_000 } else { 1000 + (i as usize * 997) % 60_000 }, 1);
+        let (d, c) = run(
+            0.0,
+            120,
+            |i| {
+                if i % 60 == 0 { 200_000 } else { 1000 + (i as usize * 997) % 60_000 }
+            },
+            1,
+        );
         assert_eq!(d, 120);
         assert_eq!(c.frames_lost, 0);
         assert_eq!(c.fec_recovered, 0);
+        // Parity shards still in flight when a frame completes are not losses.
+        assert_eq!(c.lost_packets, 0);
     }
 
     #[test]

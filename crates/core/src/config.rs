@@ -58,9 +58,9 @@ pub fn load_or_create_identity(dir: &Path) -> io::Result<Keypair> {
     let path = dir.join("identity.key");
     match std::fs::read_to_string(&path) {
         Ok(s) => {
-            let bytes = unhex(&s).filter(|b| b.len() == 32).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("{} is corrupt", path.display()))
-            })?;
+            let bytes = unhex(&s)
+                .filter(|b| b.len() == 32)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{} is corrupt", path.display())))?;
             Ok(Keypair::from_secret(bytes.try_into().unwrap()))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -153,7 +153,9 @@ impl KnownHosts {
             Ok(s) => {
                 for line in s.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
                     let mut it = line.splitn(3, ' ');
-                    let (Some(k), Some(addr)) = (it.next(), it.next()) else { continue };
+                    let (Some(k), Some(addr)) = (it.next(), it.next()) else {
+                        continue;
+                    };
                     let name = it.next().unwrap_or("").trim().to_string();
                     if let Some(key) = unhex(k).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
                         hosts.push(KnownHost { key, addr: addr.to_string(), name });

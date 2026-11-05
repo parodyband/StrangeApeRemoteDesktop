@@ -17,7 +17,8 @@ fn roundtrip(codec: Codec, w: u32, h: u32) {
         }
     };
     let preset = std::env::var("SARD_PRESET").ok().and_then(|p| p.parse().ok()).unwrap_or(1);
-    let params = EncoderParams { codec, width: w, height: h, fps: 60, bitrate_kbps: 40_000, preset, ..Default::default() };
+    let params =
+        EncoderParams { codec, width: w, height: h, fps: 60, bitrate_kbps: 40_000, preset, ..Default::default() };
     let mut enc = NvEncoder::new(cuda.clone(), params).expect("encoder");
     let mut dec = NvDecoder::new(cuda.clone(), codec).expect("decoder");
     let (wu, hu) = (w as usize, h as usize);
@@ -33,7 +34,8 @@ fn roundtrip(codec: Codec, w: u32, h: u32) {
         let (idx, dptr, pitch) = enc.next_input();
         {
             let _g = cuda.push();
-            cuda.copy_2d(Mem::Host(src.as_ptr()), wu, Mem::Device(dptr), pitch, wu, hu * 3 / 2, std::ptr::null_mut()).unwrap();
+            cuda.copy_2d(Mem::Host(src.as_ptr()), wu, Mem::Device(dptr), pitch, wu, hu * 3 / 2, std::ptr::null_mut())
+                .unwrap();
         }
         let mut bits = Vec::new();
         let t0 = Instant::now();
@@ -48,7 +50,16 @@ fn roundtrip(codec: Codec, w: u32, h: u32) {
             assert_eq!((f.width, f.height), (w, h));
             assert_eq!(f.timestamp, t as i64);
             let _g = cuda.push();
-            cuda.copy_2d(Mem::Device(f.dptr), f.pitch, Mem::HostMut(got.as_mut_ptr()), wu, wu, hu, std::ptr::null_mut()).unwrap();
+            cuda.copy_2d(
+                Mem::Device(f.dptr),
+                f.pitch,
+                Mem::HostMut(got.as_mut_ptr()),
+                wu,
+                wu,
+                hu,
+                std::ptr::null_mut(),
+            )
+            .unwrap();
         })
         .expect("decode");
         dec_us.push(t1.elapsed().as_micros());

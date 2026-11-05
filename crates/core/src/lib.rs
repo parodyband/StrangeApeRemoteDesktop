@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod fec;
 pub mod input;
 pub mod log;
+pub mod media;
 pub mod net;
 pub mod proto;
 pub mod rand;

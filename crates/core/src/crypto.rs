@@ -155,7 +155,9 @@ impl CipherState {
     }
 
     fn decrypt_with_ad(&mut self, ad: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
-        let Some(c) = &self.k else { return Ok(ct.to_vec()) };
+        let Some(c) = &self.k else {
+            return Ok(ct.to_vec());
+        };
         if ct.len() < TAG_LEN {
             return Err(CryptoError::BadLength);
         }
@@ -432,10 +434,7 @@ impl TransportCipher {
     /// Encrypt `buf` in place; returns the tag to append.
     #[inline]
     pub fn seal(&self, counter: u64, ad: &[u8], buf: &mut [u8]) -> [u8; TAG_LEN] {
-        let tag = self
-            .0
-            .encrypt_inout_detached(&nonce(counter), ad, buf.into())
-            .expect("encrypt cannot fail");
+        let tag = self.0.encrypt_inout_detached(&nonce(counter), ad, buf.into()).expect("encrypt cannot fail");
         let mut t = [0u8; TAG_LEN];
         t.copy_from_slice(&tag);
         t
@@ -445,9 +444,7 @@ impl TransportCipher {
     #[inline]
     pub fn open(&self, counter: u64, ad: &[u8], buf: &mut [u8], tag: &[u8]) -> Result<()> {
         let tag = Tag::try_from(tag).map_err(|_| CryptoError::BadLength)?;
-        self.0
-            .decrypt_inout_detached(&nonce(counter), ad, buf.into(), &tag)
-            .map_err(|_| CryptoError::Decrypt)
+        self.0.decrypt_inout_detached(&nonce(counter), ad, buf.into(), &tag).map_err(|_| CryptoError::Decrypt)
     }
 }
 
@@ -530,11 +527,7 @@ pub fn generate_pairing_code() -> String {
 
 /// Normalize user input (case, dashes, spaces). `None` if invalid.
 pub fn normalize_pairing_code(input: &str) -> Option<String> {
-    let s: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
+    let s: String = input.chars().filter(|c| !c.is_whitespace() && *c != '-').map(|c| c.to_ascii_uppercase()).collect();
     if s.len() != 20 || !s.bytes().all(|b| CODE_ALPHABET.contains(&b)) {
         return None;
     }
@@ -580,10 +573,7 @@ mod tests {
         assert_eq!(hex(&a.public()), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
         let b_pub: [u8; 32] =
             unhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f").unwrap().try_into().unwrap();
-        assert_eq!(
-            hex(&a.dh(&b_pub).unwrap()),
-            "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
-        );
+        assert_eq!(hex(&a.dh(&b_pub).unwrap()), "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
     }
 
     #[test]

@@ -25,17 +25,15 @@ fn tables() -> &'static Tables {
         let mut exp = [0u8; 512];
         let mut log = [0u8; 256];
         let mut x: u16 = 1;
-        for i in 0..255 {
-            exp[i] = x as u8;
+        for (i, e) in exp.iter_mut().enumerate().take(255) {
+            *e = x as u8;
             log[x as usize] = i as u8;
             x <<= 1;
             if x & 0x100 != 0 {
                 x ^= POLY;
             }
         }
-        for i in 255..512 {
-            exp[i] = exp[i - 255];
-        }
+        exp.copy_within(0..257, 255);
         let mut mul: Box<[[u8; 256]; 256]> = vec![[0u8; 256]; 256].into_boxed_slice().try_into().unwrap();
         for a in 1..256 {
             for b in 1..256 {
@@ -122,7 +120,9 @@ fn invert(n: usize, a: &mut [u8]) -> bool {
         inv[i * n + i] = 1;
     }
     for col in 0..n {
-        let Some(pivot) = (col..n).find(|&r| a[r * n + col] != 0) else { return false };
+        let Some(pivot) = (col..n).find(|&r| a[r * n + col] != 0) else {
+            return false;
+        };
         if pivot != col {
             for c in 0..n {
                 a.swap(pivot * n + c, col * n + c);

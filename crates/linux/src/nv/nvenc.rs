@@ -6,7 +6,7 @@
 //! written by our own colour conversion into CUDA buffers we own.
 
 use super::blob::{Blob, F, Guid};
-use super::cuda::{Cuda, CUdeviceptr};
+use super::cuda::{CUdeviceptr, Cuda};
 use super::layout as L;
 use crate::dylib;
 use sard_core::proto::Codec;
@@ -244,7 +244,8 @@ impl NvEncoder {
     fn err(&self, r: u32, what: &str) -> String {
         // SAFETY: returns a static/encoder-owned C string.
         let s = unsafe { (self.api.last_error)(self.enc) };
-        let detail = if s.is_null() { String::new() } else { unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned() };
+        let detail =
+            if s.is_null() { String::new() } else { unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned() };
         format!("{what} failed ({r}): {detail}")
     }
 
@@ -307,7 +308,10 @@ impl NvEncoder {
                 }
             }
             Codec::H264 => {
-                c.set_guid(L::CFG_PROFILE_GUID, if p.yuv444 { &L::H264_PROFILE_HIGH_444 } else { &L::H264_PROFILE_HIGH });
+                c.set_guid(
+                    L::CFG_PROFILE_GUID,
+                    if p.yuv444 { &L::H264_PROFILE_HIGH_444 } else { &L::H264_PROFILE_HIGH },
+                );
                 c.set(L::H264_IDR_PERIOD, L::INFINITE_GOPLENGTH as u64);
                 c.set_bits(L::H264_REPEAT_SPSPPS, 1);
                 c.set(L::H264_CHROMA_FORMAT_IDC, chroma as u64);

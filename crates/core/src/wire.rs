@@ -179,7 +179,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Hex decode; `None` on any invalid character or odd length.
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let val = |c: u8| match c {

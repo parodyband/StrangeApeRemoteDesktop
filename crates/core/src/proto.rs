@@ -176,24 +176,55 @@ pub enum Control {
     ClientHello(ClientHello),
     StreamConfig(StreamConfig),
     /// Key press/release; `code` is a Linux evdev key code (see `input`).
-    Key { code: u16, down: bool },
+    Key {
+        code: u16,
+        down: bool,
+    },
     /// Button press/release at a normalized position (0..1 of the video frame).
-    MouseButton { button: u8, down: bool, x: f32, y: f32 },
+    MouseButton {
+        button: u8,
+        down: bool,
+        x: f32,
+        y: f32,
+    },
     /// Scroll. If `discrete`, units are wheel notches (fractions allowed for
     /// hi-res wheels); otherwise logical pixels (trackpads).
-    Scroll { dx: f32, dy: f32, discrete: bool },
+    Scroll {
+        dx: f32,
+        dy: f32,
+        discrete: bool,
+    },
     /// Relative pointer motion in client logical pixels (pointer-lock mode).
-    MouseRel { dx: f32, dy: f32 },
+    MouseRel {
+        dx: f32,
+        dy: f32,
+    },
     /// Cursor image (RGBA8, premultiplied=false).
-    CursorShape { serial: u32, hot_x: u16, hot_y: u16, width: u16, height: u16, rgba: Vec<u8> },
-    Clipboard { text: String },
+    CursorShape {
+        serial: u32,
+        hot_x: u16,
+        hot_y: u16,
+        width: u16,
+        height: u16,
+        rgba: Vec<u8>,
+    },
+    Clipboard {
+        text: String,
+    },
     /// Client asks for a different bitrate (0 = automatic).
-    SetBitrate { kbps: u32 },
+    SetBitrate {
+        kbps: u32,
+    },
     /// Release every pressed key/button (focus lost).
     ReleaseAll,
-    AudioConfig { sample_rate: u32, channels: u8 },
+    AudioConfig {
+        sample_rate: u32,
+        channels: u8,
+    },
     /// Free-form status text from the host (e.g. "waiting for screen share approval").
-    Status { text: String },
+    Status {
+        text: String,
+    },
 }
 
 mod tag {
@@ -328,9 +359,9 @@ impl Control {
                 height: r.u16()?,
                 rgba: r.blob32()?.to_vec(),
             },
-            tag::CLIPBOARD => Control::Clipboard {
-                text: String::from_utf8(r.blob32()?.to_vec()).map_err(|_| WireError)?,
-            },
+            tag::CLIPBOARD => {
+                Control::Clipboard { text: String::from_utf8(r.blob32()?.to_vec()).map_err(|_| WireError)? }
+            }
             tag::SET_BITRATE => Control::SetBitrate { kbps: r.u32()? },
             tag::RELEASE_ALL => Control::ReleaseAll,
             tag::AUDIO_CONFIG => Control::AudioConfig { sample_rate: r.u32()?, channels: r.u8()? },
@@ -459,7 +490,14 @@ mod tests {
             Control::MouseButton { button: button::RIGHT, down: false, x: 0.25, y: 0.75 },
             Control::Scroll { dx: 0.0, dy: -1.5, discrete: true },
             Control::MouseRel { dx: 3.0, dy: -2.0 },
-            Control::CursorShape { serial: 9, hot_x: 1, hot_y: 2, width: 2, height: 1, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] },
+            Control::CursorShape {
+                serial: 9,
+                hot_x: 1,
+                hot_y: 2,
+                width: 2,
+                height: 1,
+                rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            },
             Control::Clipboard { text: "copy ✂".into() },
             Control::SetBitrate { kbps: 1 },
             Control::ReleaseAll,

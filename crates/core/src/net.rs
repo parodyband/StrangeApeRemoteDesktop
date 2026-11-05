@@ -96,9 +96,16 @@ impl NetConfig {
 pub enum Event {
     Control(Control),
     /// Absolute pointer position (normalized 0..1), latest wins.
-    MouseAbs { x: f32, y: f32 },
+    MouseAbs {
+        x: f32,
+        y: f32,
+    },
     /// Host cursor position (normalized) and visibility.
-    CursorPos { x: f32, y: f32, visible: bool },
+    CursorPos {
+        x: f32,
+        y: f32,
+        visible: bool,
+    },
     /// Remote decoder needs a keyframe.
     KeyframeRequest,
     /// Receiver statistics from the peer.
@@ -760,10 +767,7 @@ impl Shared {
 
     fn spawn(self: &Arc<Self>) {
         let me = Arc::clone(self);
-        std::thread::Builder::new()
-            .name("sard-net".into())
-            .spawn(move || me.run())
-            .expect("spawn net thread");
+        std::thread::Builder::new().name("sard-net".into()).spawn(move || me.run()).expect("spawn net thread");
     }
 
     fn run(self: Arc<Self>) {
@@ -820,7 +824,9 @@ impl Shared {
         }
         let idx = u32::from_le_bytes(pkt[1..5].try_into().unwrap());
         let counter = u64::from_le_bytes(pkt[5..13].try_into().unwrap());
-        let Some(conn) = lock(&self.sessions).get(&idx).cloned() else { return };
+        let Some(conn) = lock(&self.sessions).get(&idx).cloned() else {
+            return;
+        };
         if !lock(&conn.replay).check(counter) {
             return;
         }
@@ -901,7 +907,8 @@ impl Shared {
         }
 
         let local_index = self.new_index();
-        let reply = HelloPayload { version: PROTOCOL_VERSION, timestamp: clock::unix_ns(), name: self.cfg.name.clone() };
+        let reply =
+            HelloPayload { version: PROTOCOL_VERSION, timestamp: clock::unix_ns(), name: self.cfg.name.clone() };
         let (msg2, out) = resp.write_message2(&reply.encode())?;
         let mut response = Vec::with_capacity(9 + msg2.len());
         response.put_u8(packet::HANDSHAKE_RESP);
@@ -954,7 +961,9 @@ impl Shared {
         if p.local_index != receiver_index {
             return;
         }
-        let Some(ini) = p.initiator.take() else { return };
+        let Some(ini) = p.initiator.take() else {
+            return;
+        };
         let result = match ini.read_message2(&pkt[9..]) {
             Ok((out, payload)) => {
                 let hello = HelloPayload::decode(&payload).unwrap_or(HelloPayload {
@@ -997,7 +1006,8 @@ impl Shared {
         let sender_index = u32::from_le_bytes(pkt[1..5].try_into().unwrap());
         let (resp, payload) = PairResponder::read_message1(&psk, PAIR_PROLOGUE, &pkt[5..])?;
         let pp = PairPayload::decode(&payload).map_err(|_| NetError::Rejected("bad pairing payload".into()))?;
-        let reply = PairPayload { version: PROTOCOL_VERSION, static_key: self.identity.public(), name: self.cfg.name.clone() };
+        let reply =
+            PairPayload { version: PROTOCOL_VERSION, static_key: self.identity.public(), name: self.cfg.name.clone() };
         let msg2 = resp.write_message2(&reply.encode())?;
         let mut out = Vec::new();
         out.put_u8(packet::PAIR_RESP);
@@ -1081,7 +1091,10 @@ impl Drop for Host {
 pub struct Client;
 
 fn resolve(addr: &str) -> io::Result<SocketAddr> {
-    let with_port = if addr.parse::<SocketAddr>().is_ok() || addr.rsplit_once(':').is_some_and(|(h, p)| !h.contains(':') && p.parse::<u16>().is_ok()) || addr.starts_with('[') {
+    let with_port = if addr.parse::<SocketAddr>().is_ok()
+        || addr.rsplit_once(':').is_some_and(|(h, p)| !h.contains(':') && p.parse::<u16>().is_ok())
+        || addr.starts_with('[')
+    {
         addr.to_string()
     } else {
         format!("{addr}:{}", crate::DEFAULT_PORT)
