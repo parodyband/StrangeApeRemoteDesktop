@@ -20,7 +20,10 @@ sard — low-latency GPU remote desktop (Linux ⇄ macOS)
 USAGE:
   sard host [options]            Share this machine's screen
   sard pair <host> <code>        Pair with a host (one time; code shown by `sard host --pair`)
+                                 add `--alias <name>` to name it at the same time
   sard connect <host> [options]  View and control a paired host
+  sard alias <address> <name>    Name a host: then `sard connect <name>` (`sard alias` lists)
+  sard unalias <name>            Remove an alias
   sard info                      Show identity, paired devices and GPU capabilities
   sard unpair <name>             Remove a trusted client (host side)
 
@@ -84,6 +87,8 @@ fn main() -> ExitCode {
         "pair" => pair(&args),
         "info" => info(),
         "unpair" => unpair(&args),
+        "alias" => alias(&args),
+        "unalias" => unalias(&args),
         "selftest-capture" => selftest_capture(&args),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
@@ -124,10 +129,19 @@ pub fn net_config(args: &Args) -> Result<NetConfig> {
 }
 
 fn pair(args: &Args) -> Result<()> {
-    let (Some(host), Some(code)) = (args.positional(0), args.positional(1)) else {
-        return Err("usage: sard pair <host> <code>".into());
+    let (Some(arg), Some(code)) = (args.positional(0), args.positional(1)) else {
+        return Err("usage: sard pair <host | alias> <code> [--alias <name>]".into());
     };
     let dir = config::config_dir();
+    let mut aliases = config::Aliases::load(&dir)?;
+    let new_alias = args.value("alias");
+    if let Some(a) = new_alias
+        && !config::Aliases::valid_name(a)
+    {
+        return Err(format!("invalid alias '{a}' (letters, digits, '.', '_', '-'; must start with a letter)").into());
+    }
+    let host = aliases.resolve(arg).to_string();
+    let host = host.as_str();
     let identity = config::load_or_create_identity(&dir)?;
     let cfg = net_config(args)?;
     println!("Pairing with {host} ...");
@@ -136,7 +150,12 @@ fn pair(args: &Args) -> Result<()> {
     let stored = if addr.port() == sard_core::DEFAULT_PORT { addr.ip().to_string() } else { addr.to_string() };
     known.add(key, &stored, &name)?;
     println!("Paired with \"{name}\" ({}) at {stored}.", fingerprint(&key));
-    println!("Connect with:  sard connect {host}");
+    if let Some(a) = new_alias {
+        aliases.set(a, host)?;
+        println!("Connect with:  sard connect {a}");
+    } else {
+        println!("Connect with:  sard connect {arg}");
+    }
     Ok(())
 }
 
@@ -161,6 +180,13 @@ fn info() -> Result<()> {
     }
     for h in &known.hosts {
         println!("  {:<24} {:<22} {}", h.name, h.addr, fingerprint(&h.key));
+    }
+    let aliases = config::Aliases::load(&dir)?;
+    if !aliases.entries.is_empty() {
+        println!("\naliases:");
+        for (a, addr) in &aliases.entries {
+            println!("  {a:<24} {addr}");
+        }
     }
     println!("\nvideo:");
     for line in platform::capabilities() {
@@ -269,6 +295,61 @@ fn input_roundtrip(
     lat.sort_by(f64::total_cmp);
     println!("input→cursor metadata latency: median {:.2} ms, max {:.2} ms", lat[lat.len() / 2], lat[lat.len() - 1]);
     Ok(())
+}
+
+fn looks_like_address(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
+        || s.parse::<std::net::SocketAddr>().is_ok()
+        || s.contains('.')
+        || s.contains(':')
+}
+
+/// `sard alias` lists; `sard alias <address> <name>` sets.
+fn alias(args: &Args) -> Result<()> {
+    let dir = config::config_dir();
+    let mut aliases = config::Aliases::load(&dir)?;
+    match (args.positional(0), args.positional(1)) {
+        (None, _) => {
+            if aliases.entries.is_empty() {
+                println!("No aliases. Add one with:  sard alias <address> <name>");
+            }
+            let known = KnownHosts::load(&dir)?;
+            for (a, addr) in &aliases.entries {
+                let paired = known.find(addr).map_or("not paired".to_string(), |h| format!("paired with {}", h.name));
+                println!("  {a:<16} {addr:<24} ({paired})");
+            }
+            Ok(())
+        }
+        (Some(_), None) => Err("usage: sard alias <address> <name>   (or `sard alias` to list)".into()),
+        (Some(x), Some(y)) => {
+            // Accept either order: the address is the one that looks like one.
+            let (addr, name) = if looks_like_address(y) && !looks_like_address(x) { (y, x) } else { (x, y) };
+            if !config::Aliases::valid_name(name) {
+                return Err(format!(
+                    "invalid alias '{name}': use letters, digits, '.', '_' or '-', starting with a letter"
+                )
+                .into());
+            }
+            aliases.set(name, addr)?;
+            println!("{name} → {addr}");
+            if KnownHosts::load(&dir)?.find(addr).is_none() {
+                println!("Not paired yet: run `sard host --pair` on {addr}, then `sard pair {name} <code>`.");
+            } else {
+                println!("Connect with:  sard connect {name}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn unalias(args: &Args) -> Result<()> {
+    let Some(name) = args.positional(0) else { return Err("usage: sard unalias <name>".into()) };
+    if config::Aliases::load(&config::config_dir())?.remove(name)? {
+        println!("Removed alias {name}.");
+        Ok(())
+    } else {
+        Err(format!("no alias named {name}").into())
+    }
 }
 
 fn unpair(args: &Args) -> Result<()> {

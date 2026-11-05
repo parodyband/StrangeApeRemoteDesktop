@@ -63,7 +63,7 @@ pub fn run(args: &Args) -> Result<()> {
     }
     if let Some(code) = &pairing {
         println!();
-        println!("  Pairing code:  {code}");
+        println!("  Pairing code:  {code}   (single use, valid for 10 minutes)");
         println!("  On the other machine run:  sard pair {} {code}", ips.first().map_or("<this-ip>", |s| s.as_str()));
         println!();
     }

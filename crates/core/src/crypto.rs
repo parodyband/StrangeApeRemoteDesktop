@@ -128,6 +128,7 @@ fn nonce(n: u64) -> Nonce {
     Nonce::from(b)
 }
 
+#[derive(Clone)]
 struct CipherState {
     k: Option<ChaCha20Poly1305>,
     n: u64,
@@ -171,6 +172,7 @@ impl CipherState {
     }
 }
 
+#[derive(Clone)]
 struct Symmetric {
     ck: [u8; 32],
     h: [u8; 32],
@@ -245,6 +247,7 @@ fn take32(b: &[u8]) -> [u8; 32] {
 }
 
 /// IK initiator (client side of a connection).
+#[derive(Clone)]
 pub struct IkInitiator {
     sym: Symmetric,
     s: Keypair,
@@ -353,6 +356,7 @@ impl IkResponder {
 }
 
 /// NNpsk0 initiator (client side of pairing).
+#[derive(Clone)]
 pub struct PairInitiator {
     sym: Symmetric,
     e: Keypair,
@@ -504,6 +508,28 @@ impl ReplayWindow {
         let (w, m) = Self::bit(counter);
         self.bits[w] |= m;
     }
+}
+
+// ---------------------------------------------------------------------------
+// mac1: cheap pre-authentication of handshake initiations (WireGuard style).
+// Keyed by the host's *public* key, which only paired clients know, so the
+// host can drop junk with one HMAC instead of an X25519 operation.
+// ---------------------------------------------------------------------------
+
+pub const MAC1_LEN: usize = 16;
+
+pub fn mac1_key(host_public: &[u8; 32]) -> [u8; 32] {
+    sha256(&[b"sard-mac1-v1", host_public])
+}
+
+pub fn mac1(key: &[u8; 32], data: &[u8]) -> [u8; MAC1_LEN] {
+    let full = hmac_sha256(key, &[data]);
+    full[..MAC1_LEN].try_into().unwrap()
+}
+
+/// Constant-time equality.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ---------------------------------------------------------------------------

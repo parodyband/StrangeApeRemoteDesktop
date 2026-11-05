@@ -16,6 +16,11 @@ use crate::wire::{Put, Reader, Result, WireError};
 use std::collections::{BTreeMap, VecDeque};
 
 pub const SHARD_HEADER_LEN: usize = 16;
+/// Largest frame accepted from a peer (a 4K keyframe is a few MB at most).
+pub const MAX_FRAME_LEN: usize = 16 << 20;
+/// Bounds on receiver state a (paired but misbehaving) peer can make us hold.
+const MAX_TRACKED_FRAMES: usize = 1024;
+const MAX_BUFFERED_BYTES: usize = 256 << 20;
 pub const FRAME_META_LEN: usize = 24;
 
 pub mod frame_flags {
@@ -104,12 +109,26 @@ impl ShardHeader {
             shard_size: r.u16()?,
             frame_len: r.u32()?,
         };
+        let k = h.data_shards as usize;
+        let m = h.parity_shards as usize;
         if h.block_count == 0
             || h.block >= h.block_count
-            || h.data_shards == 0
+            || k == 0
             || h.shard_size == 0
-            || (h.index as usize) >= h.data_shards as usize + h.parity_shards as usize
+            || k + m > fec::MAX_SHARDS
+            || (h.index as usize) >= k + m
+            || h.frame_len as usize > MAX_FRAME_LEN
         {
+            return Err(WireError);
+        }
+        // The block layout is a deterministic function of the frame length and
+        // shard size; anything else is malformed (and could overrun buffers).
+        let n_total = (h.frame_len as usize).max(1).div_ceil(h.shard_size as usize);
+        let nb = h.block_count as usize;
+        if nb > n_total {
+            return Err(WireError);
+        }
+        if k != n_total / nb + usize::from((h.block as usize) < n_total % nb) {
             return Err(WireError);
         }
         Ok(h)
@@ -282,7 +301,18 @@ impl VideoSender {
         let Some(f) = self.history.iter().find(|f| f.frame_id == frame_id) else {
             return Ok(()); // too old; receiver will give up and request a keyframe
         };
+        // Each shard is resent at most once per NACK, however the request is
+        // phrased (bounds the work a peer can trigger with one small packet).
+        let mut sent: Vec<Vec<bool>> = f.blocks.iter().map(|b| vec![false; b.k + b.m]).collect();
         let mut buf = Vec::new();
+        let mut resend = |b: usize, idx: usize, stats: &mut u64, emit: &mut dyn FnMut(&[u8])| {
+            if idx < sent[b].len() && !sent[b][idx] {
+                sent[b][idx] = true;
+                Self::build(f, b, idx, frame_flags::RETRANSMIT, &mut buf);
+                emit(&buf);
+                *stats += 1;
+            }
+        };
         for _ in 0..n {
             let block = r.u8()?;
             let count = r.u8()? as usize;
@@ -294,17 +324,11 @@ impl VideoSender {
                 }
                 if count == 0 {
                     for idx in 0..f.blocks[b].k {
-                        Self::build(f, b, idx, frame_flags::RETRANSMIT, &mut buf);
-                        emit(&buf);
-                        self.stats_retransmitted += 1;
+                        resend(b, idx, &mut self.stats_retransmitted, &mut emit);
                     }
                 } else {
                     for &idx in indices {
-                        if (idx as usize) < f.blocks[b].k + f.blocks[b].m {
-                            Self::build(f, b, idx as usize, frame_flags::RETRANSMIT, &mut buf);
-                            emit(&buf);
-                            self.stats_retransmitted += 1;
-                        }
+                        resend(b, idx as usize, &mut self.stats_retransmitted, &mut emit);
                     }
                 }
             }
@@ -453,6 +477,13 @@ impl VideoReceiver {
         self.ready.pop_front()
     }
 
+    /// Drop all pending state and wait for the next keyframe/recovery frame.
+    pub fn resync(&mut self) {
+        self.frames.clear();
+        self.awaiting_resync = true;
+        self.next_id = self.newest_seen.map(|n| n.wrapping_add(1));
+    }
+
     pub fn is_awaiting_resync(&self) -> bool {
         self.awaiting_resync
     }
@@ -492,7 +523,7 @@ impl VideoReceiver {
         match self.newest_seen {
             Some(n) if id > n => {
                 if !self.awaiting_resync || follows_resync {
-                    let from = n + 1;
+                    let from = n.wrapping_add(1);
                     let lo = self.next_id.map_or(from, |x| x.max(from));
                     for missing in lo..id {
                         if self.frames.len() > 512 {
@@ -507,6 +538,21 @@ impl VideoReceiver {
             _ => {}
         }
 
+        if !self.frames.contains_key(&id) && self.frames.len() >= MAX_TRACKED_FRAMES {
+            return Err(WireError);
+        }
+        let needs_alloc = self.frames.get(&id).is_none_or(|p| !p.known);
+        if needs_alloc {
+            let n_total = (h.frame_len as usize).max(1).div_ceil(h.shard_size as usize);
+            let buffered: usize = self
+                .frames
+                .values()
+                .map(|p| p.data.len() + p.blocks.iter().flatten().map(|b| b.buf.len()).sum::<usize>())
+                .sum();
+            if buffered + 2 * n_total * h.shard_size as usize > MAX_BUFFERED_BYTES {
+                return Err(WireError);
+            }
+        }
         let p = self.frames.entry(id).or_insert_with(|| Partial::unknown(now));
         if p.complete {
             return Ok(());
@@ -519,7 +565,10 @@ impl VideoReceiver {
             p.blocks = (0..h.block_count).map(|_| None).collect();
             let total_data_bytes = (h.frame_len as usize).div_ceil(h.shard_size as usize) * h.shard_size as usize;
             p.data = vec![0u8; total_data_bytes.max(h.shard_size as usize)];
-        } else if p.shard_size != h.shard_size as usize || p.blocks.len() != h.block_count as usize {
+        } else if p.shard_size != h.shard_size as usize
+            || p.blocks.len() != h.block_count as usize
+            || p.frame_len != h.frame_len as usize
+        {
             return Err(WireError);
         }
         p.last_us = now;
@@ -563,7 +612,10 @@ impl VideoReceiver {
             // sender's even split (computable even if earlier blocks are unseen).
             let block_start = split_offset(p.frame_len, s, p.blocks.len(), h.block as usize);
             let blk = p.blocks[h.block as usize].as_ref().unwrap();
-            p.data[block_start * s..(block_start + k) * s].copy_from_slice(&blk.buf[..k * s]);
+            let Some(dst) = p.data.get_mut(block_start * s..(block_start + k) * s) else {
+                return Err(WireError);
+            };
+            dst.copy_from_slice(&blk.buf[..k * s]);
             p.blocks_done += 1;
             if p.blocks_done == p.blocks.len() {
                 p.complete = true;
@@ -621,7 +673,7 @@ impl VideoReceiver {
                     complete_us: p.last_us,
                 });
                 self.last_delivered = Some(next);
-                self.next_id = Some(next + 1);
+                self.next_id = Some(next.wrapping_add(1));
                 continue;
             }
             self.next_id = Some(next);
@@ -722,7 +774,7 @@ impl VideoReceiver {
                         }
                         _ => {}
                     }
-                    if m.len() > 1000 || entries == 255 {
+                    if m.len() > 480 || entries == 255 {
                         break;
                     }
                 }
@@ -751,7 +803,7 @@ impl VideoReceiver {
             }
             self.frames.retain(|_, p| p.known && Self::is_resync(p));
             self.awaiting_resync = true;
-            self.next_id = Some(self.frames.keys().next().copied().unwrap_or(newest + 1));
+            self.next_id = Some(self.frames.keys().next().copied().unwrap_or(newest.wrapping_add(1)));
             out.push(RecvEvent::NeedKeyframe { last_delivered: self.last_delivered });
             self.try_deliver(now);
         }
@@ -921,6 +973,67 @@ mod tests {
             }
         }
         assert_eq!(delivered, vec![0, 1, 2, 3, 4]);
+    }
+
+    fn shard(h: ShardHeader, data_len: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        h.write(&mut b);
+        b.extend(std::iter::repeat_n(0xAB, data_len));
+        b
+    }
+
+    /// Hostile-but-authenticated shards must be rejected, never panic or
+    /// allocate unboundedly (review findings #3/#4).
+    #[test]
+    fn malformed_shards_are_rejected() {
+        let mut rx = VideoReceiver::new();
+        let h = ShardHeader {
+            frame_id: 0,
+            block: 0,
+            block_count: 1,
+            index: 0,
+            data_shards: 2, // inconsistent: 100 bytes / 100-byte shards = 1 shard
+            parity_shards: 0,
+            flags: frame_flags::KEYFRAME,
+            shard_size: 100,
+            frame_len: 100,
+        };
+        assert!(rx.on_shard(&shard(h, 100), 1).is_err());
+        assert!(rx.on_shard(&shard(ShardHeader { index: 1, ..h }, 100), 2).is_err());
+        // 4 GiB frame from a 32-byte shard.
+        let huge = ShardHeader { frame_len: u32::MAX, shard_size: 32, data_shards: 1, ..h };
+        assert!(rx.on_shard(&shard(huge, 32), 3).is_err());
+        // k + m beyond the field size.
+        let wide =
+            ShardHeader { frame_len: 255 * 4, shard_size: 4, data_shards: 255, parity_shards: 255, index: 44, ..h };
+        assert!(rx.on_shard(&shard(wide, 4), 4).is_err());
+        // Frame id at the top of the range must not overflow.
+        let top = ShardHeader { frame_id: u32::MAX, frame_len: 10, shard_size: 10, data_shards: 1, ..h };
+        assert!(rx.on_shard(&shard(top, 10), 5).is_ok());
+        assert!(rx.pop_ready().is_some());
+        // A frame whose length changes between shards is rejected.
+        let a = ShardHeader { frame_id: 7, frame_len: 20, shard_size: 10, data_shards: 2, ..h };
+        let _ = rx.on_shard(&shard(a, 10), 6);
+        assert!(rx.on_shard(&shard(ShardHeader { index: 1, frame_len: 19, ..a }, 10), 7).is_err());
+    }
+
+    /// One NACK can resend each shard at most once (review finding #7).
+    #[test]
+    fn nack_amplification_is_bounded() {
+        let mut tx = VideoSender::new(1371);
+        let f = make_frame(0, 200_000, true);
+        let mut first = 0;
+        tx.send_frame(&f, frame_flags::KEYFRAME, |_| first += 1);
+        let mut nack = Vec::new();
+        nack.put_u32(0);
+        nack.put_u8(255);
+        for _ in 0..255 {
+            nack.put_u8(0xFF);
+            nack.put_u8(0);
+        }
+        let mut resent = 0;
+        tx.on_nack(&nack, |_| resent += 1).unwrap();
+        assert!(resent <= first, "resent {resent} > {first} originally sent");
     }
 
     #[test]

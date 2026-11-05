@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -176,9 +176,11 @@ struct Conn {
     replay: Mutex<ReplayWindow>,
     state: Mutex<ConnState>,
     video_tx: Mutex<VideoSender>,
-    events_tx: Sender<Event>,
+    events_tx: SyncSender<Event>,
     events_rx: Mutex<Option<Receiver<Event>>>,
-    frames_tx: Sender<CompleteFrame>,
+    frames_tx: SyncSender<CompleteFrame>,
+    /// The application consumes video (`take_video`); otherwise VIDEO is ignored.
+    video_taken: AtomicBool,
     frames_rx: Mutex<Option<Receiver<CompleteFrame>>>,
     closed: AtomicBool,
     last_recv_us: AtomicU64,
@@ -207,8 +209,9 @@ impl Conn {
         recv: TransportCipher,
         cfg: &NetConfig,
     ) -> Arc<Self> {
-        let (events_tx, events_rx) = mpsc::channel();
-        let (frames_tx, frames_rx) = mpsc::channel();
+        // Bounded: a peer must not be able to grow our memory without limit.
+        let (events_tx, events_rx) = mpsc::sync_channel(4096);
+        let (frames_tx, frames_rx) = mpsc::sync_channel(64);
         let now = clock::now_us();
         let mp = cfg.max_payload();
         Arc::new(Conn {
@@ -244,6 +247,7 @@ impl Conn {
             events_rx: Mutex::new(Some(events_rx)),
             frames_tx,
             frames_rx: Mutex::new(Some(frames_rx)),
+            video_taken: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             last_recv_us: AtomicU64::new(now),
             last_send_us: AtomicU64::new(now),
@@ -294,13 +298,23 @@ impl Conn {
         let body = &p[1..];
         match p[0] {
             msg::VIDEO => {
+                if !self.video_taken.load(Ordering::Relaxed) {
+                    return; // this side doesn't receive video
+                }
                 let mut st = lock(&self.state);
                 st.seen_video = true;
                 if let Err(e) = st.video_rx.on_shard(body, now) {
                     debug!("bad video shard: {e}");
                 }
                 while let Some(f) = st.video_rx.pop_ready() {
-                    let _ = self.frames_tx.send(f);
+                    if self.frames_tx.try_send(f).is_err() {
+                        // Decoder is not keeping up: later frames would reference
+                        // the dropped one, so resynchronize on a keyframe.
+                        warn!("video queue full; dropping frames until the next keyframe");
+                        st.video_rx.resync();
+                        st.last_kf_req_us = 0;
+                        break;
+                    }
                 }
             }
             msg::RELIABLE => {
@@ -317,7 +331,7 @@ impl Conn {
                         for m in msgs {
                             match Control::decode(&m) {
                                 Ok(c) => {
-                                    let _ = self.events_tx.send(Event::Control(c));
+                                    let _ = self.events_tx.try_send(Event::Control(c));
                                 }
                                 Err(_) => debug!("unknown control message type {:?}", m.first()),
                             }
@@ -353,6 +367,10 @@ impl Conn {
                 let mut r = Reader::new(body);
                 if let (Ok(t0), Ok(t1), Ok(t2)) = (r.u64(), r.u64(), r.u64()) {
                     let mut st = lock(&self.state);
+                    // Only answers to the ping we actually sent count.
+                    if t0 != st.last_ping_us || now < t0 || t2 < t1 {
+                        return;
+                    }
                     st.clock.add(t0, t1, t2, now);
                     let rtt = (now.saturating_sub(t0)).saturating_sub(t2.saturating_sub(t1));
                     st.srtt_us = st.srtt_us * 0.875 + rtt as f64 * 0.125;
@@ -363,7 +381,7 @@ impl Conn {
                 if let (Ok(seq), Ok(x), Ok(y)) = (r.u32(), r.f32(), r.f32()) {
                     let mut st = lock(&self.state);
                     if newer(seq, &mut st.mouse_seq_rx) {
-                        let _ = self.events_tx.send(Event::MouseAbs { x, y });
+                        let _ = self.events_tx.try_send(Event::MouseAbs { x, y });
                     }
                 }
             }
@@ -372,7 +390,7 @@ impl Conn {
                 if let (Ok(seq), Ok(x), Ok(y), Ok(v)) = (r.u32(), r.f32(), r.f32(), r.u8()) {
                     let mut st = lock(&self.state);
                     if newer(seq, &mut st.cursor_seq_rx) {
-                        let _ = self.events_tx.send(Event::CursorPos { x, y, visible: v != 0 });
+                        let _ = self.events_tx.try_send(Event::CursorPos { x, y, visible: v != 0 });
                     }
                 }
             }
@@ -382,7 +400,7 @@ impl Conn {
                     let mut st = lock(&self.state);
                     if st.last_kf_req_rx != Some(id) {
                         st.last_kf_req_rx = Some(id);
-                        let _ = self.events_tx.send(Event::KeyframeRequest);
+                        let _ = self.events_tx.try_send(Event::KeyframeRequest);
                     }
                 }
             }
@@ -390,16 +408,16 @@ impl Conn {
                 let mut r = Reader::new(body);
                 if let Ok(rep) = Report::decode(&mut r) {
                     self.adapt_fec(&rep);
-                    let _ = self.events_tx.send(Event::Report(rep));
+                    let _ = self.events_tx.try_send(Event::Report(rep));
                 }
             }
             msg::AUDIO => {
-                let _ = self.events_tx.send(Event::Audio(body.to_vec()));
+                let _ = self.events_tx.try_send(Event::Audio(body.to_vec()));
             }
             msg::KEEPALIVE => {}
             msg::DISCONNECT => {
                 if !self.closed.swap(true, Ordering::Relaxed) {
-                    let _ = self.events_tx.send(Event::Disconnected("peer disconnected".into()));
+                    let _ = self.events_tx.try_send(Event::Disconnected("peer disconnected".into()));
                 }
             }
             t => debug!("unknown message type {t}"),
@@ -413,12 +431,16 @@ impl Conn {
             return;
         }
         let loss = rep.packets_lost as f32 / total as f32;
-        let mut tx = lock(&self.video_tx);
         // Enough parity to absorb ~3x the observed loss, at least 5%, at most 50%.
         let target = (loss * 3.0 + 0.05).clamp(0.05, 0.5);
-        let cur = tx.fec.ratio;
-        tx.fec.ratio = if target > cur { target } else { cur * 0.9 + target * 0.1 };
-        lock(&self.state).totals.fec_ratio = tx.fec.ratio;
+        // Lock order: never hold `video_tx` and `state` at the same time.
+        let ratio = {
+            let mut tx = lock(&self.video_tx);
+            let cur = tx.fec.ratio;
+            tx.fec.ratio = if target > cur { target } else { cur * 0.9 + target * 0.1 };
+            tx.fec.ratio
+        };
+        lock(&self.state).totals.fec_ratio = ratio;
     }
 
     fn tick(&self, now: u64) {
@@ -498,22 +520,26 @@ impl Conn {
         }
         let last_recv = self.last_recv_us.load(Ordering::Relaxed);
         if now.saturating_sub(last_recv) > TIMEOUT_US && !self.closed.swap(true, Ordering::Relaxed) {
-            let _ = self.events_tx.send(Event::Disconnected("connection timed out".into()));
+            let _ = self.events_tx.try_send(Event::Disconnected("connection timed out".into()));
         }
     }
 
     fn stats(&self) -> ConnStats {
         let now = clock::now_us();
+        // Lock order: copy what we need from `video_tx` first, then `state`.
+        let (video_retransmits, fec_ratio) = {
+            let tx = lock(&self.video_tx);
+            (tx.stats_retransmitted, tx.fec.ratio)
+        };
         let mut st = lock(&self.state);
-        let tx = lock(&self.video_tx);
         let mut s = st.totals;
         s.rtt_us = st.srtt_us as u64;
         s.min_rtt_us = st.clock.min_rtt_us().unwrap_or(0);
         s.clock_offset_us = st.clock.offset_us();
         s.tx_packets = self.tx_packets.load(Ordering::Relaxed);
         s.reliable_retransmits = st.reliable.retransmits;
-        s.video_retransmits = tx.stats_retransmitted;
-        s.fec_ratio = tx.fec.ratio;
+        s.video_retransmits = video_retransmits;
+        s.fec_ratio = fec_ratio;
         let dt = now.saturating_sub(st.rate_since_us);
         if dt >= 500_000 {
             let txb = self.tx_bytes.load(Ordering::Relaxed);
@@ -581,6 +607,7 @@ impl Connection {
 
     /// Take the receiver of reassembled video frames (once).
     pub fn take_video(&self) -> Option<Receiver<CompleteFrame>> {
+        self.conn.video_taken.store(true, Ordering::Relaxed);
         lock(&self.conn.frames_rx).take()
     }
 
@@ -706,6 +733,38 @@ struct HandshakeCache {
     response: Vec<u8>,
 }
 
+/// How long a pairing code stays valid.
+pub const PAIRING_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy)]
+struct PairingWindow {
+    psk: [u8; 32],
+    expires_us: u64,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    last_us: u64,
+    rate: f64,
+    burst: f64,
+}
+
+impl TokenBucket {
+    fn new(rate: f64, burst: f64) -> Self {
+        Self { tokens: burst, last_us: clock::now_us(), rate, burst }
+    }
+    fn take(&mut self, now: u64) -> bool {
+        self.tokens = (self.tokens + now.saturating_sub(self.last_us) as f64 * self.rate / 1e6).min(self.burst);
+        self.last_us = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct Shared {
     socket: Arc<UdpSocket>,
     /// Client role: the socket is `connect()`ed to the host.
@@ -716,7 +775,17 @@ struct Shared {
     stop: AtomicBool,
     // Host role
     trusted: Mutex<HashMap<[u8; 32], String>>,
-    pairing_psk: Mutex<Option<[u8; 32]>>,
+    /// Active pairing window (single use, expires).
+    pairing: Mutex<Option<PairingWindow>>,
+    /// Last pairing reply, for retransmitted PAIR_INITs after the code was used.
+    pair_cache: Mutex<Option<([u8; 32], Vec<u8>)>>,
+    /// Our mac1 key (hash of our public key): only paired clients can compute it.
+    mac1_key: [u8; 32],
+    /// Recent handshake responses by request hash (retransmits skip the DH).
+    recent_handshakes: Mutex<std::collections::VecDeque<([u8; 32], Vec<u8>)>>,
+    /// Rate limit for expensive handshake/pairing work.
+    handshake_bucket: Mutex<TokenBucket>,
+    last_pair_warn: AtomicU64,
     on_paired: Mutex<Option<PairedFn>>,
     accept_tx: Mutex<Option<Sender<Connection>>>,
     hs_cache: Mutex<HashMap<[u8; 32], HandshakeCache>>,
@@ -767,6 +836,7 @@ fn configure_socket(sock: &UdpSocket, buf: usize) {
 
 impl Shared {
     fn new(socket: UdpSocket, identity: Keypair, cfg: NetConfig, connected: bool) -> io::Result<Arc<Self>> {
+        let identity_public = identity.public();
         configure_socket(&socket, cfg.socket_buffer);
         socket.set_read_timeout(Some(Duration::from_millis(1)))?;
         Ok(Arc::new(Shared {
@@ -777,7 +847,12 @@ impl Shared {
             sessions: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
             trusted: Mutex::new(HashMap::new()),
-            pairing_psk: Mutex::new(None),
+            pairing: Mutex::new(None),
+            pair_cache: Mutex::new(None),
+            mac1_key: crate::crypto::mac1_key(&identity_public),
+            recent_handshakes: Mutex::new(std::collections::VecDeque::new()),
+            handshake_bucket: Mutex::new(TokenBucket::new(50.0, 20.0)),
+            last_pair_warn: AtomicU64::new(0),
             on_paired: Mutex::new(None),
             accept_tx: Mutex::new(None),
             hs_cache: Mutex::new(HashMap::new()),
@@ -888,7 +963,7 @@ impl Shared {
             packet::HANDSHAKE_RESP => self.on_handshake_resp(pkt, from),
             packet::PAIR_INIT => {
                 if let Err(e) = self.on_pair_init(pkt, from) {
-                    warn!("pairing attempt from {from} failed: {e}");
+                    debug!("pairing attempt from {from} failed: {e}");
                 }
             }
             _ => {}
@@ -948,12 +1023,26 @@ impl Shared {
     }
 
     fn on_handshake_init(self: &Arc<Self>, pkt: &[u8], from: SocketAddr) -> Result<(), NetError> {
-        if lock(&self.accept_tx).is_none() || pkt.len() < 5 {
+        if lock(&self.accept_tx).is_none() || pkt.len() < 5 + crate::crypto::MAC1_LEN {
             return Ok(()); // not a host
         }
-        let sender_index = u32::from_le_bytes(pkt[1..5].try_into().unwrap());
-        let msg1 = &pkt[5..];
-        let msg1_hash = crate::crypto::sha256(&[msg1]);
+        // Cheap checks first: mac1 (only paired clients know our public key),
+        // retransmit cache, then a global rate limit before any X25519 work.
+        let (body, mac) = pkt.split_at(pkt.len() - crate::crypto::MAC1_LEN);
+        if !crate::crypto::ct_eq(&crate::crypto::mac1(&self.mac1_key, body), mac) {
+            return Ok(());
+        }
+        let msg1_hash = crate::crypto::sha256(&[body]);
+        if let Some((_, resp)) = lock(&self.recent_handshakes).iter().find(|(h, _)| *h == msg1_hash) {
+            let _ = self.socket.send_to(resp, from);
+            return Ok(());
+        }
+        if !lock(&self.handshake_bucket).take(clock::now_us()) {
+            debug!("handshake rate limit hit ({from})");
+            return Ok(());
+        }
+        let sender_index = u32::from_le_bytes(body[1..5].try_into().unwrap());
+        let msg1 = &body[5..];
         let (resp, rs, payload) = IkResponder::read_message1(&self.identity, IK_PROLOGUE, msg1)?;
 
         let Some(peer_name) = lock(&self.trusted).get(&rs).cloned() else {
@@ -967,7 +1056,8 @@ impl Shared {
             }
             return Ok(());
         };
-        let hello = HelloPayload::decode(&payload).map_err(|_| NetError::Rejected("bad hello".into()))?;
+        let mut hello = HelloPayload::decode(&payload).map_err(|_| NetError::Rejected("bad hello".into()))?;
+        hello.name = crate::config::clean_display(&hello.name);
         if hello.version != PROTOCOL_VERSION {
             warn!("{peer_name} speaks protocol v{} (we speak v{PROTOCOL_VERSION})", hello.version);
             return Ok(());
@@ -1007,7 +1097,7 @@ impl Shared {
                     // Tell the old endpoint (if it is still alive) before dropping it.
                     c.send_payload(&[msg::DISCONNECT]);
                     if !c.closed.swap(true, Ordering::Relaxed) {
-                        let _ = c.events_tx.send(Event::Disconnected("replaced by new connection".into()));
+                        let _ = c.events_tx.try_send(Event::Disconnected("replaced by new connection".into()));
                     }
                 }
             }
@@ -1024,6 +1114,13 @@ impl Shared {
             self.spawn_session_reader(s, Arc::clone(&conn));
         }
         let _ = self.socket.send_to(&response, from);
+        {
+            let mut recent = lock(&self.recent_handshakes);
+            recent.push_back((msg1_hash, response.clone()));
+            if recent.len() > 32 {
+                recent.pop_front();
+            }
+        }
         lock(&self.hs_cache).insert(rs, HandshakeCache { timestamp: hello.timestamp, msg1_hash, response });
         info!("{} connected from {from}", conn.remote_name);
         if let Some(tx) = lock(&self.accept_tx).as_ref() {
@@ -1043,50 +1140,79 @@ impl Shared {
         if p.local_index != receiver_index {
             return;
         }
-        let Some(ini) = p.initiator.take() else {
+        let Some(ini) = p.initiator.as_ref() else {
             return;
         };
-        let result = match ini.read_message2(&pkt[9..]) {
-            Ok((out, payload)) => {
-                let hello = HelloPayload::decode(&payload).unwrap_or(HelloPayload {
-                    version: 0,
-                    timestamp: 0,
-                    name: String::new(),
-                });
-                if hello.version != PROTOCOL_VERSION {
-                    Err(NetError::Rejected(format!("host speaks protocol v{}", hello.version)))
-                } else {
-                    let conn = Conn::new(
-                        ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: self.connected },
-                        receiver_index,
-                        sender_index,
-                        out.remote_static,
-                        hello.name,
-                        out.send,
-                        out.recv,
-                        &self.cfg,
-                    );
-                    lock(&self.sessions).insert(receiver_index, Arc::clone(&conn));
-                    Ok(conn)
-                }
+        // Authenticate on a copy: a forged/garbled response (the receiver index
+        // is visible on the wire) must not consume the handshake state.
+        let (out, payload) = match ini.clone().read_message2(&pkt[9..]) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("ignoring invalid handshake response from {from}: {e}");
+                return;
             }
-            Err(e) => Err(e.into()),
+        };
+        p.initiator = None;
+        let mut hello =
+            HelloPayload::decode(&payload).unwrap_or(HelloPayload { version: 0, timestamp: 0, name: String::new() });
+        hello.name = crate::config::clean_display(&hello.name);
+        let result = if hello.version != PROTOCOL_VERSION {
+            Err(NetError::Rejected(format!("host speaks protocol v{}", hello.version)))
+        } else {
+            let conn = Conn::new(
+                ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: self.connected },
+                receiver_index,
+                sender_index,
+                out.remote_static,
+                hello.name,
+                out.send,
+                out.recv,
+                &self.cfg,
+            );
+            lock(&self.sessions).insert(receiver_index, Arc::clone(&conn));
+            Ok(conn)
         };
         let _ = p.result.send(result);
         *pending = None;
     }
 
     fn on_pair_init(&self, pkt: &[u8], from: SocketAddr) -> Result<(), NetError> {
-        let Some(psk) = *lock(&self.pairing_psk) else {
-            debug!("pairing request from {from} but pairing is not enabled");
-            return Ok(());
-        };
         if pkt.len() < 5 {
             return Ok(());
         }
+        let hash = crate::crypto::sha256(&[pkt]);
+        if let Some((h, resp)) = lock(&self.pair_cache).as_ref()
+            && *h == hash
+        {
+            let _ = self.socket.send_to(resp, from); // retransmit of the request we answered
+            return Ok(());
+        }
+        let now = clock::now_us();
+        let Some(window) = *lock(&self.pairing) else {
+            debug!("pairing request from {from} but pairing is not enabled");
+            return Ok(());
+        };
+        if now > window.expires_us {
+            *lock(&self.pairing) = None;
+            info!("pairing code expired; restart with `sard host --pair` for a new one");
+            return Ok(());
+        }
+        if !lock(&self.handshake_bucket).take(now) {
+            return Ok(());
+        }
         let sender_index = u32::from_le_bytes(pkt[1..5].try_into().unwrap());
-        let (resp, payload) = PairResponder::read_message1(&psk, PAIR_PROLOGUE, &pkt[5..])?;
-        let pp = PairPayload::decode(&payload).map_err(|_| NetError::Rejected("bad pairing payload".into()))?;
+        let (resp, payload) = match PairResponder::read_message1(&window.psk, PAIR_PROLOGUE, &pkt[5..]) {
+            Ok(v) => v,
+            Err(e) => {
+                if now.saturating_sub(self.last_pair_warn.load(Ordering::Relaxed)) > 5_000_000 {
+                    self.last_pair_warn.store(now, Ordering::Relaxed);
+                    warn!("pairing attempt from {from} failed ({e}): wrong code?");
+                }
+                return Ok(());
+            }
+        };
+        let mut pp = PairPayload::decode(&payload).map_err(|_| NetError::Rejected("bad pairing payload".into()))?;
+        pp.name = crate::config::clean_display(&pp.name);
         let reply =
             PairPayload { version: PROTOCOL_VERSION, static_key: self.identity.public(), name: self.cfg.name.clone() };
         let msg2 = resp.write_message2(&reply.encode())?;
@@ -1095,9 +1221,16 @@ impl Shared {
         out.put_u32(0);
         out.put_u32(sender_index);
         out.put_bytes(&msg2);
+        // Single use: the code is spent once a device has paired with it.
+        *lock(&self.pairing) = None;
+        *lock(&self.pair_cache) = Some((hash, out.clone()));
         let newly = lock(&self.trusted).insert(pp.static_key, pp.name.clone()).is_none();
         if newly {
-            info!("paired with {} ({}) at {from}", pp.name, crate::crypto::fingerprint(&pp.static_key));
+            info!(
+                "paired with {} ({}) at {from}; the pairing code is now used up",
+                pp.name,
+                crate::crypto::fingerprint(&pp.static_key)
+            );
             if let Some(f) = lock(&self.on_paired).as_ref() {
                 f(pp.static_key, &pp.name);
             }
@@ -1143,7 +1276,10 @@ impl Host {
         let socket = UdpSocket::bind(addr)?;
         let shared = Shared::new(socket, identity, cfg, false)?;
         *lock(&shared.trusted) = opts.trusted;
-        *lock(&shared.pairing_psk) = opts.pairing_code.as_deref().map(crate::crypto::pairing_psk);
+        *lock(&shared.pairing) = opts.pairing_code.as_deref().map(|c| PairingWindow {
+            psk: crate::crypto::pairing_psk(c),
+            expires_us: clock::now_us() + PAIRING_TTL.as_micros() as u64,
+        });
         *lock(&shared.on_paired) = opts.on_paired;
         let (tx, rx) = mpsc::channel::<Connection>();
         *lock(&shared.accept_tx) = Some(tx);
@@ -1156,7 +1292,10 @@ impl Host {
     }
 
     pub fn set_pairing_code(&self, code: Option<&str>) {
-        *lock(&self.shared.pairing_psk) = code.map(crate::crypto::pairing_psk);
+        *lock(&self.shared.pairing) = code.map(|c| PairingWindow {
+            psk: crate::crypto::pairing_psk(c),
+            expires_us: clock::now_us() + PAIRING_TTL.as_micros() as u64,
+        });
     }
 
     /// Wait for the next client connection.
@@ -1267,6 +1406,8 @@ impl Client {
         pkt.put_u8(packet::HANDSHAKE_INIT);
         pkt.put_u32(local_index);
         pkt.put_bytes(&msg1);
+        let mac = crate::crypto::mac1(&crate::crypto::mac1_key(&host_key), &pkt);
+        pkt.put_bytes(&mac);
         let (tx, rx) = mpsc::channel();
         *lock(&shared.pending) = Some(PendingConnect { local_index, initiator: Some(ini), result: tx });
         shared.spawn();
@@ -1332,19 +1473,23 @@ impl Client {
                         if ri != local_index {
                             continue;
                         }
-                        let ini = std::mem::replace(&mut ini, PairInitiator::new(&psk, PAIR_PROLOGUE));
-                        let reply = ini.read_message2(&buf[9..n]).map_err(|_| {
-                            NetError::Rejected("wrong pairing code (or host restarted with a new code)".into())
-                        })?;
-                        let hp = PairPayload::decode(&reply).map_err(|_| NetError::Rejected("bad reply".into()))?;
+                        // Authenticate on a copy so a forged reply can't end pairing.
+                        let Ok(reply) = ini.clone().read_message2(&buf[9..n]) else { continue };
+                        let mut hp = PairPayload::decode(&reply).map_err(|_| NetError::Rejected("bad reply".into()))?;
+                        hp.name = crate::config::clean_display(&hp.name);
                         return Ok((hp.static_key, hp.name, from));
                     }
                     Ok(_) => {}
                     Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
                     Err(e) => return Err(e.into()),
                 }
             }
         }
-        Err(NetError::Timeout)
+        Err(NetError::Rejected(
+            "no valid reply: check the code and that the host runs `sard host --pair` \
+             (codes are single-use and expire after 10 minutes)"
+                .into(),
+        ))
     }
 }

@@ -53,7 +53,12 @@ Latency figures are capture → decode/present and exclude the display's scan-ou
 
 * **UDP**, one socket, one network thread that also runs all timers. No async runtime.
 * **Noise IK** handshake (X25519, ChaCha20-Poly1305, SHA-256) with mutual static-key
-  authentication; one-time **pairing** with a 100-bit code via Noise NNpsk0.
+  authentication; **pairing** with a single-use, 10-minute, 100-bit code via Noise
+  NNpsk0. Handshake initiations carry a WireGuard-style *mac1* keyed by the host's
+  public key (known only to paired clients) and are rate-limited, so junk costs the
+  host one HMAC, not an X25519 operation.
+* Peer input is treated as hostile: shard layouts are validated against the frame
+  size, receiver state and queues are bounded, retransmit requests are deduplicated.
 * **Per-packet AEAD** with explicit counters + 4096-packet replay window
   (WireGuard-style), so loss and reordering are harmless.
 * **Session indices** in every packet header: routing never depends on the source
@@ -96,7 +101,15 @@ sard pair 192.168.1.77 ABCDE-FGHJK-LMNPQ-RSTUV
 
 # Then, any time:
 sard connect 192.168.1.77
+
+# Optional: name your machines
+sard alias 192.168.1.77 linux      # or: sard pair 192.168.1.77 <code> --alias linux
+sard connect linux
+sard alias                         # list;  sard unalias linux  to remove
 ```
+
+Pairing codes are **single-use and expire after 10 minutes**; run `sard host --pair`
+again to pair another device. After pairing, `sard connect <hostname>` also works.
 
 The first connection to a Linux host shows the desktop's screen-share dialog (pick a
 monitor and allow remote control). The approval is remembered; `sard host

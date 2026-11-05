@@ -40,6 +40,12 @@ fn pair_connect_stream() {
     assert_eq!(hname, "test-host");
     assert_eq!(paired.lock().unwrap().as_slice(), ["test-client"]);
 
+    // The code is single-use: another device can't pair with it afterwards.
+    let other = Keypair::generate();
+    assert!(Client::pair(&addr, &code, &other, &ccfg, Duration::from_millis(800)).is_err());
+    // ...but a retransmit of the original pairing request still gets its answer
+    // (exercised implicitly by Client::pair's resend loop above).
+
     // Unpaired client must not get in.
     let stranger = Keypair::generate();
     assert!(Client::connect(&addr, hk, stranger, ccfg.clone(), Duration::from_millis(700)).is_err());
@@ -66,32 +72,40 @@ fn pair_connect_stream() {
     }
     assert_eq!(got, (1..=50).collect::<Vec<_>>());
 
-    // Video: host -> client.
+    // Video: host -> client, consumed concurrently like a real decoder.
     let n = 120u32;
-    let mut sent = Vec::new();
-    for i in 0..n {
-        let key = i % 60 == 0;
-        let mut f = Vec::new();
-        FrameMeta {
-            codec: Codec::Hevc,
-            flags: if key { frame_flags::KEYFRAME } else { 0 },
-            width: 2560,
-            height: 1440,
-            capture_us: i as u64,
-            send_us: 0,
+    let frames: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            let key = i % 60 == 0;
+            let mut f = Vec::new();
+            FrameMeta {
+                codec: Codec::Hevc,
+                flags: if key { frame_flags::KEYFRAME } else { 0 },
+                width: 2560,
+                height: 1440,
+                capture_us: i as u64,
+                send_us: 0,
+            }
+            .write(&mut f);
+            let len = if key { 250_000 } else { 40_000 + (i as usize * 131) % 20_000 };
+            f.extend((0..len).map(|j| (j as u32).wrapping_mul(i + 7) as u8));
+            f
+        })
+        .collect();
+    let expected = frames.clone();
+    let reader = std::thread::spawn(move || {
+        for i in 0..n {
+            let cf = cvid.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| panic!("frame {i} not received"));
+            assert_eq!(cf.frame_id, i);
+            assert_eq!(cf.data, expected[i as usize], "frame {i} corrupt");
         }
-        .write(&mut f);
-        let len = if key { 250_000 } else { 40_000 + (i as usize * 131) % 20_000 };
-        f.extend((0..len).map(|j| (j as u32).wrapping_mul(i + 7) as u8));
-        server.send_video_frame(&f, if key { frame_flags::KEYFRAME } else { 0 });
-        sent.push(f);
+    });
+    for (i, f) in frames.iter().enumerate() {
+        let key = i % 60 == 0;
+        server.send_video_frame(f, if key { frame_flags::KEYFRAME } else { 0 });
         std::thread::sleep(Duration::from_millis(2));
     }
-    for i in 0..n {
-        let cf = cvid.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| panic!("frame {i} not received"));
-        assert_eq!(cf.frame_id, i);
-        assert_eq!(cf.data, sent[i as usize], "frame {i} corrupt");
-    }
+    reader.join().expect("all frames received intact and in order");
     std::thread::sleep(Duration::from_millis(300));
     let st = client.stats();
     assert!(st.rtt_us < 50_000, "rtt {}", st.rtt_us);

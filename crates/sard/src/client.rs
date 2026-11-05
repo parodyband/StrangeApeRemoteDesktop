@@ -41,16 +41,21 @@ enum UserEvent {
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    let Some(target) = args.positional(0) else {
-        return Err("usage: sard connect <host>".into());
+    let Some(arg) = args.positional(0) else {
+        return Err("usage: sard connect <host | alias>".into());
     };
     let dir = config::config_dir();
     let identity = config::load_or_create_identity(&dir)?;
+    let aliases = config::Aliases::load(&dir)?;
+    let target = aliases.resolve(arg);
+    if target != arg {
+        info!("{arg} → {target}");
+    }
     let known = KnownHosts::load(&dir)?;
     let host = known
         .find(target)
         .ok_or_else(|| {
-            format!("not paired with {target}; run `sard host --pair` there, then `sard pair {target} <code>` here")
+            format!("not paired with {target}; run `sard host --pair` there, then `sard pair {arg} <code>` here")
         })?
         .clone();
     // Prefer an explicit address typed by the user (may have changed since pairing).
@@ -351,7 +356,8 @@ impl App {
 
     fn on_control(&mut self, el: &ActiveEventLoop, c: Control) {
         match c {
-            Control::StreamConfig(s) => {
+            Control::StreamConfig(mut s) => {
+                s.host_name = sard_core::config::clean_display(&s.host_name);
                 info!(
                     "stream: {} {}x{} @ {} fps, {:.0} Mbps from {} ({:?})",
                     s.codec.name(),
@@ -405,6 +411,7 @@ impl App {
                 }
             }
             Control::Status { text } => {
+                let text = sard_core::config::clean_display(&text);
                 info!("host: {text}");
                 if let Some(w) = &self.window
                     && self.stream.is_none()
@@ -708,7 +715,9 @@ fn run_headless(
                             s.host_name
                         )
                     }
-                    Event::Control(Control::Status { text }) => info!("host: {text}"),
+                    Event::Control(Control::Status { text }) => {
+                        info!("host: {}", sard_core::config::clean_display(&text))
+                    }
                     Event::Disconnected(r) => {
                         info!("disconnected: {r}");
                         break;

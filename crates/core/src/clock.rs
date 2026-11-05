@@ -56,11 +56,13 @@ impl ClockSync {
 
     /// `t0` local send, `t1` remote receive, `t2` remote send, `t3` local receive.
     pub fn add(&mut self, t0: u64, t1: u64, t2: u64, t3: u64) {
-        let rtt = (t3 as i64 - t0 as i64) - (t2 as i64 - t1 as i64);
-        if rtt < 0 {
+        // i128: timestamps come from the peer and must not overflow.
+        let (t0, t1, t2, t3) = (t0 as i128, t1 as i128, t2 as i128, t3 as i128);
+        let rtt = (t3 - t0) - (t2 - t1);
+        if !(0..=60_000_000).contains(&rtt) {
             return;
         }
-        let offset = ((t1 as i64 - t0 as i64) + (t2 as i64 - t3 as i64)) / 2;
+        let Ok(offset) = i64::try_from(((t1 - t0) + (t2 - t3)) / 2) else { return };
         if self.samples.len() == Self::WINDOW {
             self.samples.pop_front();
         }

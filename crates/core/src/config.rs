@@ -193,6 +193,74 @@ impl KnownHosts {
     }
 }
 
+/// User-defined short names for host addresses (`aliases.txt`: `<alias> <address>`).
+pub struct Aliases {
+    path: PathBuf,
+    pub entries: Vec<(String, String)>,
+}
+
+impl Aliases {
+    pub fn load(dir: &Path) -> io::Result<Self> {
+        let path = dir.join("aliases.txt");
+        let mut entries = Vec::new();
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                for line in s.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+                    if let Some((a, addr)) = line.split_once(char::is_whitespace) {
+                        entries.push((a.to_string(), addr.trim().to_string()));
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(Self { path, entries })
+    }
+
+    /// Valid alias: 1–32 of `[A-Za-z0-9._-]`, starting with a letter, and not
+    /// something that could be mistaken for an address.
+    pub fn valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 32
+            && name.starts_with(|c: char| c.is_ascii_alphabetic())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            && name.parse::<std::net::IpAddr>().is_err()
+    }
+
+    pub fn get(&self, alias: &str) -> Option<&str> {
+        self.entries.iter().find(|(a, _)| a.eq_ignore_ascii_case(alias)).map(|(_, addr)| addr.as_str())
+    }
+
+    /// Replace `target` with the address it aliases, if it is an alias.
+    pub fn resolve<'a>(&'a self, target: &'a str) -> &'a str {
+        self.get(target).unwrap_or(target)
+    }
+
+    pub fn set(&mut self, alias: &str, addr: &str) -> io::Result<()> {
+        self.entries.retain(|(a, _)| !a.eq_ignore_ascii_case(alias));
+        self.entries.push((alias.to_string(), addr.to_string()));
+        self.save()
+    }
+
+    pub fn remove(&mut self, alias: &str) -> io::Result<bool> {
+        let before = self.entries.len();
+        self.entries.retain(|(a, _)| !a.eq_ignore_ascii_case(alias));
+        let changed = self.entries.len() != before;
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
+    fn save(&self) -> io::Result<()> {
+        let mut s = String::from("# sard host aliases: <alias> <address>\n");
+        for (a, addr) in &self.entries {
+            s += &format!("{a} {addr}\n");
+        }
+        write_private(&self.path, &s)
+    }
+}
+
 fn strip_port(a: &str) -> &str {
     if a.starts_with('[') {
         return a.split(']').next().unwrap_or(a).trim_start_matches('[');
@@ -201,6 +269,12 @@ fn strip_port(a: &str) -> &str {
         Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok() => h,
         _ => a,
     }
+}
+
+/// Peer-supplied text made safe for logs and window titles: no control
+/// characters (terminal escape sequences), at most 64 characters.
+pub fn clean_display(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(64).collect::<String>().trim().to_string()
 }
 
 fn sanitize(name: &str) -> String {
@@ -225,6 +299,24 @@ mod tests {
         let a = load_or_create_identity(&d).unwrap();
         let b = load_or_create_identity(&d).unwrap();
         assert_eq!(a.public(), b.public());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn aliases() {
+        let d = tmpdir("alias");
+        let mut a = Aliases::load(&d).unwrap();
+        a.set("mac", "192.168.1.131").unwrap();
+        a.set("linux", "192.168.1.77:47801").unwrap();
+        a.set("Mac", "192.168.1.132").unwrap(); // case-insensitive replace
+        let b = Aliases::load(&d).unwrap();
+        assert_eq!(b.resolve("mac"), "192.168.1.132");
+        assert_eq!(b.resolve("LINUX"), "192.168.1.77:47801");
+        assert_eq!(b.resolve("10.0.0.1"), "10.0.0.1");
+        assert!(Aliases::valid_name("my-mac.lan") && !Aliases::valid_name("10.0.0.1") && !Aliases::valid_name("a b"));
+        assert!(!Aliases::valid_name("1mac"));
+        let mut c = Aliases::load(&d).unwrap();
+        assert!(c.remove("mac").unwrap() && !c.remove("mac").unwrap());
         std::fs::remove_dir_all(d).unwrap();
     }
 

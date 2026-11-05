@@ -7,7 +7,7 @@
 //! Traffic on this channel is tiny compared to video, so simplicity wins.
 
 use crate::proto::msg;
-use crate::wire::{Put, Reader, Result, WireError};
+use crate::wire::{Put, Reader, Result};
 use std::collections::{BTreeMap, VecDeque};
 
 const FIRST: u8 = 1;
@@ -33,6 +33,8 @@ pub struct ReliableChannel {
     max_segment: usize,
     ack_pending: bool,
     pub retransmits: u64,
+    /// Malformed segments received (dropped).
+    pub violations: u64,
 }
 
 impl ReliableChannel {
@@ -48,6 +50,7 @@ impl ReliableChannel {
             max_segment: max_payload - 1 - 4 - 1,
             ack_pending: false,
             retransmits: 0,
+            violations: 0,
         }
     }
 
@@ -93,39 +96,45 @@ impl ReliableChannel {
             return Ok(Vec::new()); // duplicate
         }
         if diff > 0 {
-            if diff < 65_536 {
+            if diff < 4_096 {
                 self.out_of_order.entry(seq).or_insert_with(|| (flags, data.to_vec()));
             }
             return Ok(Vec::new());
         }
+        // A malformed segment only discards the message it belongs to; the
+        // drain continues so the channel never stalls on buffered segments.
         let mut done = Vec::new();
-        self.accept(flags, data, &mut done)?;
+        let mut ok = self.accept(flags, data, &mut done);
         while let Some((f, d)) = self.out_of_order.remove(&self.next_expected) {
-            self.accept(f, &d, &mut done)?;
+            ok &= self.accept(f, &d, &mut done);
+        }
+        if !ok {
+            self.violations += 1;
         }
         Ok(done)
     }
 
-    fn accept(&mut self, flags: u8, data: &[u8], done: &mut Vec<Vec<u8>>) -> Result<()> {
+    /// Consume the segment at `next_expected`. Returns false if it was malformed.
+    fn accept(&mut self, flags: u8, data: &[u8], done: &mut Vec<Vec<u8>>) -> bool {
         self.next_expected = self.next_expected.wrapping_add(1);
         if flags & FIRST != 0 {
             self.partial.clear();
             self.in_message = true;
         }
         if !self.in_message {
-            return Err(WireError);
+            return false; // continuation without a start: drop
         }
         if self.partial.len() + data.len() > MAX_MESSAGE {
             self.in_message = false;
             self.partial.clear();
-            return Err(WireError);
+            return false;
         }
         self.partial.extend_from_slice(data);
         if flags & LAST != 0 {
             self.in_message = false;
             done.push(std::mem::take(&mut self.partial));
         }
-        Ok(())
+        true
     }
 
     /// Build an ACK payload if anything was received since the last one.
@@ -232,6 +241,26 @@ mod tests {
         }
         assert_eq!(got, msgs);
         assert_eq!(a.unacked_len(), 0);
+    }
+
+    /// A bad segment must not stall later messages (review finding #8).
+    #[test]
+    fn bad_segment_does_not_stall() {
+        let mut b = ReliableChannel::new(1200);
+        let seg = |seq: u32, flags: u8, data: &[u8]| {
+            let mut p = Vec::new();
+            p.put_u32(seq);
+            p.put_u8(flags);
+            p.put_bytes(data);
+            p
+        };
+        // seq 1 (complete message) arrives early and is buffered.
+        assert!(b.on_segment(&seg(1, FIRST | LAST, b"good")).unwrap().is_empty());
+        // seq 0 is a continuation without a start: malformed.
+        let got = b.on_segment(&seg(0, 0, b"junk")).unwrap();
+        assert_eq!(got, vec![b"good".to_vec()]);
+        assert_eq!(b.violations, 1);
+        assert_eq!(b.on_segment(&seg(2, FIRST | LAST, b"next")).unwrap(), vec![b"next".to_vec()]);
     }
 
     #[test]
