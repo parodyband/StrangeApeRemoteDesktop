@@ -441,7 +441,7 @@ impl AudioPacket {
         let capture_us = r.u64()?;
         let frames = r.u16()? as usize;
         let raw = r.bytes(frames * 4)?;
-        let samples = raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let samples = raw.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
         Ok(Self { seq, capture_us, samples })
     }
 }
