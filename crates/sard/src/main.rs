@@ -74,6 +74,7 @@ fn main() -> ExitCode {
         "pair" => pair(&args),
         "info" => info(),
         "unpair" => unpair(&args),
+        "selftest-capture" => selftest_capture(&args),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -155,6 +156,48 @@ fn info() -> Result<()> {
     for line in platform::capabilities() {
         println!("  {line}");
     }
+    Ok(())
+}
+
+/// Hidden diagnostic: open the real screen capture and encode for a while.
+fn selftest_capture(args: &Args) -> Result<()> {
+    use sard_core::media::{CursorMode, SourceOptions};
+    use std::time::Instant;
+    let secs: u64 = args.positional(0).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let opts = SourceOptions {
+        fps: args.parse_value("fps")?.unwrap_or(60),
+        bitrate_kbps: 30_000,
+        cursor: CursorMode::Metadata,
+        test_pattern: args.flag("test-pattern"),
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let (mut src, _input) = platform::open_host(&opts)?;
+    println!("opened in {:.1}s: {}", t0.elapsed().as_secs_f64(), src.describe());
+    let start = Instant::now();
+    let (mut frames, mut bytes, mut keys, mut cursors) = (0u64, 0usize, 0u32, 0u32);
+    let mut lat = sard_core::stats::Samples::default();
+    while start.elapsed().as_secs() < secs {
+        if let Some(f) = src.next_frame(std::time::Duration::from_millis(100))? {
+            frames += 1;
+            bytes += f.data.len();
+            keys += f.keyframe as u32;
+            lat.add((sard_core::clock::now_us() - f.capture_us) as u32);
+        }
+        if src.take_cursor().is_some() {
+            cursors += 1;
+        }
+    }
+    let l = lat.take();
+    let dt = start.elapsed().as_secs_f64();
+    println!(
+        "{frames} frames in {dt:.1}s ({:.1} fps), {:.1} KB/frame, {keys} keyframes, {cursors} cursor updates, capture->encoded p50 {:.2} ms p95 {:.2} ms max {:.2} ms",
+        frames as f64 / dt,
+        bytes as f64 / frames.max(1) as f64 / 1024.0,
+        l.p50 as f64 / 1000.0,
+        l.p95 as f64 / 1000.0,
+        l.max as f64 / 1000.0
+    );
     Ok(())
 }
 
