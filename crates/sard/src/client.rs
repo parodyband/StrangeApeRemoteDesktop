@@ -12,7 +12,7 @@ use sard_core::clock;
 use sard_core::config::{self, KnownHosts};
 use sard_core::media::{VideoSink, letterbox};
 use sard_core::net::{Client, Connection, Event};
-use sard_core::proto::{ClientHello, Codec, Control, Platform, StreamConfig, button, client_flags};
+use sard_core::proto::{AudioPacket, ClientHello, Codec, Control, Platform, StreamConfig, button, client_flags};
 use sard_core::stats::Samples;
 use sard_core::video::{CompleteFrame, FrameMeta, frame_flags};
 use sard_core::{error, info, warn};
@@ -78,7 +78,11 @@ pub fn run(args: &Args) -> Result<()> {
     // Forward network events to the UI thread.
     {
         let proxy = proxy.clone();
-        std::thread::Builder::new().name("sard-events".into()).spawn(move || forward_events(events, proxy))?;
+        let audio = !args.flag("no-audio");
+        let c = conn.clone();
+        std::thread::Builder::new()
+            .name("sard-events".into())
+            .spawn(move || forward_events(events, proxy, audio, c))?;
     }
 
     let mut app = App {
@@ -89,6 +93,7 @@ pub fn run(args: &Args) -> Result<()> {
         args_display: args.parse_value("display")?.unwrap_or(0),
         fullscreen: args.flag("fullscreen"),
         view_only: args.flag("view-only"),
+        audio: !args.flag("no-audio"),
         swap_mods_allowed: !args.flag("no-swap-modifiers"),
         host_name: host.name.clone(),
         frames: Some(frames),
@@ -114,9 +119,58 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn forward_events(events: Receiver<Event>, proxy: EventLoopProxy<UserEvent>) {
+fn forward_events(events: Receiver<Event>, proxy: EventLoopProxy<UserEvent>, audio_enabled: bool, conn: Connection) {
+    let clip = crate::clipsync::ClipSync::start(conn);
+    let mut audio: Option<Box<dyn sard_core::media::AudioSink>> = None;
+    // Diagnostics: count audio packets without playing them (avoids feedback
+    // when host and client share a machine).
+    let dry = std::env::var_os("SARD_AUDIO_DRY").is_some();
+    let (mut dry_n, mut dry_gaps, mut dry_last, mut dry_t) = (0u64, 0u64, None::<u32>, Instant::now());
     for ev in events {
         let ue = match ev {
+            Event::Control(Control::AudioConfig { sample_rate, channels }) => {
+                if audio_enabled && audio.is_none() && !dry {
+                    match platform::open_audio_sink() {
+                        Ok(s) => {
+                            info!("audio: {sample_rate} Hz x{channels} → {}", s.describe());
+                            audio = Some(s);
+                        }
+                        Err(e) => warn!("audio playback unavailable: {e}"),
+                    }
+                }
+                continue;
+            }
+            Event::Control(Control::Clipboard { text }) => {
+                if let Some(c) = &clip {
+                    c.on_remote(text);
+                }
+                continue;
+            }
+            Event::Audio(bytes) => {
+                if dry {
+                    if let Ok(p) = AudioPacket::decode(&bytes) {
+                        dry_n += 1;
+                        if let Some(l) = dry_last
+                            && p.seq != l.wrapping_add(1)
+                        {
+                            dry_gaps += 1;
+                        }
+                        dry_last = Some(p.seq);
+                        if dry_t.elapsed() >= Duration::from_secs(2) {
+                            info!(
+                                "audio (dry): {:.0} packets/s ({} frames each), {dry_gaps} gaps",
+                                dry_n as f64 / dry_t.elapsed().as_secs_f64(),
+                                p.samples.len() / 2
+                            );
+                            dry_n = 0;
+                            dry_t = Instant::now();
+                        }
+                    }
+                } else if let (Some(a), Ok(p)) = (&audio, AudioPacket::decode(&bytes)) {
+                    a.push(p.seq, &p.samples);
+                }
+                continue;
+            }
             Event::Control(c) => UserEvent::Control(c),
             Event::CursorPos { visible, .. } => UserEvent::CursorPos { visible },
             Event::Disconnected(r) => {
@@ -139,6 +193,7 @@ struct App {
     args_display: u8,
     fullscreen: bool,
     view_only: bool,
+    audio: bool,
     swap_mods_allowed: bool,
     host_name: String,
     frames: Option<Receiver<CompleteFrame>>,
@@ -198,7 +253,7 @@ impl App {
             max_height: mh.max(720) as u16,
             max_fps,
             bitrate_kbps: self.args_bitrate.unwrap_or(0),
-            flags: client_flags::LOCAL_CURSOR,
+            flags: client_flags::LOCAL_CURSOR | if self.audio { client_flags::AUDIO } else { 0 },
             display: self.args_display,
         };
         info!(

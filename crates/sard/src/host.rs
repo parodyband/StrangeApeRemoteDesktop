@@ -6,9 +6,11 @@ use sard_core::clock;
 use sard_core::config::{self, TrustStore};
 use sard_core::crypto::{fingerprint, generate_pairing_code, normalize_pairing_code};
 use sard_core::input::PressedSet;
-use sard_core::media::{CursorMode, InputEvent, InputSink, SourceOptions, VideoSource};
+use sard_core::media::{
+    AUDIO_PACKET_FRAMES, AUDIO_RATE, CursorMode, InputEvent, InputSink, SourceOptions, VideoSource,
+};
 use sard_core::net::{Connection, Event, Host, HostOptions};
-use sard_core::proto::{ClientHello, Codec, Control, Platform, StreamConfig, client_flags};
+use sard_core::proto::{AudioPacket, ClientHello, Codec, Control, Platform, StreamConfig, client_flags};
 use sard_core::stats::{Ema, Samples};
 use sard_core::video::{FRAME_META_LEN, FrameMeta, frame_flags};
 use sard_core::{error, info, warn};
@@ -216,6 +218,36 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
     };
     conn.send_control(&stream_cfg(w, h, ceiling));
 
+    // Audio: uncompressed PCM in 5 ms packets, straight from the capture callback.
+    let _audio = if hello.flags & client_flags::AUDIO != 0 && !args.flag("no-audio") {
+        conn.send_control(&Control::AudioConfig { sample_rate: AUDIO_RATE, channels: 2 });
+        let c = conn.clone();
+        let mut seq = 0u32;
+        let mut stage: Vec<i16> = Vec::with_capacity(AUDIO_PACKET_FRAMES * 8);
+        let per_packet = AUDIO_PACKET_FRAMES * 2;
+        match platform::open_audio_source(Box::new(move |s: &[i16]| {
+            stage.extend_from_slice(s);
+            let mut off = 0;
+            while stage.len() - off >= per_packet {
+                c.send_audio(&AudioPacket::encode(seq, clock::now_us(), &stage[off..off + per_packet]));
+                seq = seq.wrapping_add(1);
+                off += per_packet;
+            }
+            stage.drain(..off);
+        })) {
+            Ok(a) => {
+                info!("audio: {}", a.describe());
+                Some(a)
+            }
+            Err(e) => {
+                warn!("audio capture unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         keyframe: AtomicBool::new(true),
@@ -363,6 +395,7 @@ fn input_loop(
     conn: &Connection,
     ceiling: u32,
 ) {
+    let clip = crate::clipsync::ClipSync::start(conn.clone());
     let mut pressed = PressedSet::default();
     let mut pending: Option<Event> = None;
     let mut rc = RateControl { ceiling, current: ceiling, last_change: Instant::now(), clean_reports: 0 };
@@ -430,7 +463,11 @@ fn input_loop(
                     rc.current = rc.ceiling;
                     shared.bitrate_kbps.store(rc.ceiling, Ordering::Relaxed);
                 }
-                Control::Clipboard { .. } => {}
+                Control::Clipboard { text } => {
+                    if let Some(c) = &clip {
+                        c.on_remote(text);
+                    }
+                }
                 other => sard_core::debug!("ignoring control message {other:?}"),
             },
             Event::CursorPos { .. } | Event::Audio(_) => {}

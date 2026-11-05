@@ -14,3 +14,21 @@
 pub use sard_linux::platform::*;
 #[cfg(target_os = "macos")]
 pub use sard_macos::platform::*;
+
+// Audio on macOS is not implemented yet; these stubs keep the build working.
+#[cfg(target_os = "macos")]
+pub fn open_audio_source(
+    _cb: sard_core::media::AudioCallback,
+) -> sard_core::media::Result<Box<dyn sard_core::media::AudioSource>> {
+    Err(sard_core::media::err("audio capture is not implemented on macOS yet"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_audio_sink() -> sard_core::media::Result<Box<dyn sard_core::media::AudioSink>> {
+    Err(sard_core::media::err("audio playback is not implemented on macOS yet"))
+}

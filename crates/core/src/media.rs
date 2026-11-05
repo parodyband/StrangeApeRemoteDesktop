@@ -178,6 +178,110 @@ pub trait VideoSink: Send {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Audio: uncompressed 48 kHz stereo s16 (1.5 Mbit/s, negligible on a LAN and
+// zero codec latency). Packets carry 5 ms.
+// ---------------------------------------------------------------------------
+
+pub const AUDIO_RATE: u32 = 48_000;
+pub const AUDIO_CHANNELS: usize = 2;
+pub const AUDIO_PACKET_FRAMES: usize = 240;
+
+/// Receives captured interleaved stereo samples (any number of frames).
+pub type AudioCallback = Box<dyn FnMut(&[i16]) + Send>;
+
+/// A running host audio capture; dropping it stops capture.
+pub trait AudioSource: Send {
+    fn describe(&self) -> String {
+        String::new()
+    }
+}
+
+/// Client audio output fed from the network.
+pub trait AudioSink: Send {
+    fn push(&self, seq: u32, samples: &[i16]);
+    fn describe(&self) -> String {
+        String::new()
+    }
+}
+
+/// System clipboard (plain text).
+pub trait Clipboard: Send {
+    fn get(&mut self) -> Option<String>;
+    fn set(&mut self, text: &str);
+}
+
+/// Small adaptive jitter buffer for interleaved stereo s16.
+pub struct JitterBuffer {
+    buf: std::collections::VecDeque<i16>,
+    expected: Option<u32>,
+    /// Frames to accumulate before (re)starting playback.
+    pub target_frames: usize,
+    /// Above this many buffered frames, drop the oldest down to target.
+    pub max_frames: usize,
+    primed: bool,
+    pub underruns: u64,
+    pub dropped_frames: u64,
+}
+
+impl Default for JitterBuffer {
+    fn default() -> Self {
+        Self {
+            buf: std::collections::VecDeque::with_capacity(48_000),
+            expected: None,
+            target_frames: AUDIO_RATE as usize * 15 / 1000,
+            max_frames: AUDIO_RATE as usize * 60 / 1000,
+            primed: false,
+            underruns: 0,
+            dropped_frames: 0,
+        }
+    }
+}
+
+impl JitterBuffer {
+    pub fn frames(&self) -> usize {
+        self.buf.len() / AUDIO_CHANNELS
+    }
+
+    pub fn push(&mut self, seq: u32, samples: &[i16]) {
+        if let Some(e) = self.expected {
+            let d = seq.wrapping_sub(e) as i32;
+            if d < 0 {
+                return; // late duplicate / reordered: already played past it
+            }
+            // Fill short gaps (lost packets) with silence to keep timing.
+            for _ in 0..(d as usize).min(4) {
+                self.buf.extend(std::iter::repeat_n(0, AUDIO_PACKET_FRAMES * AUDIO_CHANNELS));
+            }
+        }
+        self.expected = Some(seq.wrapping_add(1));
+        self.buf.extend(samples.iter().copied());
+        if self.frames() > self.max_frames {
+            let drop = (self.frames() - self.target_frames) * AUDIO_CHANNELS;
+            self.buf.drain(..drop);
+            self.dropped_frames += (drop / AUDIO_CHANNELS) as u64;
+        }
+    }
+
+    /// Fill `out` (interleaved) for playback; silence when not enough data.
+    pub fn pull(&mut self, out: &mut [i16]) {
+        if !self.primed && self.frames() < self.target_frames {
+            out.fill(0);
+            return;
+        }
+        self.primed = true;
+        let n = out.len().min(self.buf.len());
+        for (o, s) in out[..n].iter_mut().zip(self.buf.drain(..n)) {
+            *o = s;
+        }
+        if n < out.len() {
+            out[n..].fill(0);
+            self.primed = false;
+            self.underruns += 1;
+        }
+    }
+}
+
 /// Where the video rectangle sits inside a window, preserving aspect ratio.
 /// Returns (x, y, w, h) in window pixels.
 pub fn letterbox(win_w: u32, win_h: u32, vid_w: u32, vid_h: u32) -> (f32, f32, f32, f32) {
@@ -192,7 +296,28 @@ pub fn letterbox(win_w: u32, win_h: u32, vid_w: u32, vid_h: u32) -> (f32, f32, f
 
 #[cfg(test)]
 mod tests {
-    use super::letterbox;
+    use super::{AUDIO_PACKET_FRAMES, JitterBuffer, letterbox};
+
+    #[test]
+    fn jitter_buffer_primes_fills_gaps_and_caps() {
+        let mut j = JitterBuffer::default();
+        let pkt = vec![1i16; AUDIO_PACKET_FRAMES * 2];
+        let mut out = vec![9i16; 480];
+        j.push(0, &pkt);
+        j.pull(&mut out);
+        assert!(out.iter().all(|&s| s == 0), "not primed yet");
+        j.push(1, &pkt);
+        j.push(3, &pkt); // seq 2 lost -> silence inserted
+        assert_eq!(j.frames(), AUDIO_PACKET_FRAMES * 4);
+        j.pull(&mut out);
+        assert!(out.iter().all(|&s| s == 1));
+        j.push(2, &pkt); // late: ignored
+        assert_eq!(j.frames(), AUDIO_PACKET_FRAMES * 4 - 240);
+        for s in 4..40 {
+            j.push(s, &pkt);
+        }
+        assert!(j.frames() <= j.max_frames);
+    }
 
     #[test]
     fn letterbox_fits() {

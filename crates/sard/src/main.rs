@@ -2,6 +2,7 @@
 
 mod args;
 mod client;
+mod clipsync;
 mod host;
 mod keymap;
 mod platform;
@@ -36,6 +37,7 @@ HOST OPTIONS:
   --yuv444               Full chroma 4:4:4 (sharper text, needs client support)
   --cursor <mode>        metadata (client draws cursor, default) | embedded
   --test-pattern [WxH]   Stream a synthetic pattern instead of the screen
+  --no-audio             Don't stream audio
 
 CLIENT OPTIONS:
   --fps <n>              Request a frame rate
@@ -44,6 +46,7 @@ CLIENT OPTIONS:
   --display <n>          Ask for a specific host display
   --fullscreen           Start fullscreen
   --view-only            Watch without sending keyboard/mouse input
+  --no-audio             Don't play the host's audio
   --no-swap-modifiers    Don't map Cmd⇄Ctrl between macOS and Linux
   --max-datagram <n>     UDP payload size (default 1400; use ~1200 over VPNs)
 

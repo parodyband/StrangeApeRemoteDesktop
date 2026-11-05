@@ -5,6 +5,7 @@
 //! works on the freshest image. Cursor metadata is extracted from every
 //! buffer, including cursor-only updates that carry no new pixels.
 
+pub mod audio;
 pub mod layout;
 pub mod pod;
 
@@ -34,6 +35,7 @@ dylib! {
         fn pw_context_new(*mut c_void, *mut c_void, usize) -> *mut c_void;
         fn pw_context_destroy(*mut c_void);
         fn pw_context_connect_fd(*mut c_void, i32, *mut c_void, usize) -> *mut c_void;
+        fn pw_context_connect(*mut c_void, *mut c_void, usize) -> *mut c_void;
         fn pw_core_disconnect(*mut c_void) -> i32;
         fn pw_properties_new_string(*const c_char) -> *mut c_void;
         fn pw_stream_new(*mut c_void, *const c_char, *mut c_void) -> *mut c_void;
@@ -47,7 +49,7 @@ dylib! {
     }
 }
 
-fn api() -> Result<&'static PwApi> {
+pub(crate) fn api() -> Result<&'static PwApi> {
     static API: OnceLock<std::result::Result<PwApi, String>> = OnceLock::new();
     API.get_or_init(|| {
         let a = PwApi::load()?;

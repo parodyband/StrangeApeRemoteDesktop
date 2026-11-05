@@ -48,6 +48,8 @@ pub const MB_FORMAT: usize = 0;
 pub const MB_SIZE: usize = 4;
 pub const MB_STRIDE: usize = 12;
 pub const MB_OFFSET: usize = 16;
+pub const PWBUF_SIZE: usize = 16;
+pub const PWBUF_REQUESTED: usize = 24;
 
 // ---- enums ----
 pub const STATE_ERROR: i32 = -1;
@@ -113,6 +115,18 @@ pub const META_HEADER: u32 = 1;
 pub const META_VIDEO_DAMAGE: u32 = 3;
 pub const META_CURSOR: u32 = 5;
 pub const META_HEADER_FLAG_CORRUPTED: u32 = 2;
+pub const MEDIA_TYPE_AUDIO: u32 = 1;
+pub const FORMAT_AUDIO_FORMAT: u32 = 65537;
+pub const FORMAT_AUDIO_RATE: u32 = 65539;
+pub const FORMAT_AUDIO_CHANNELS: u32 = 65540;
+pub const FORMAT_AUDIO_POSITION: u32 = 65541;
+pub const AUDIO_FORMAT_S16_LE: u32 = 259;
+pub const AUDIO_FORMAT_F32_LE: u32 = 283;
+pub const AUDIO_CHANNEL_FL: u32 = 3;
+pub const AUDIO_CHANNEL_FR: u32 = 4;
+pub const DIRECTION_OUTPUT: u32 = 1;
+pub const ID_ANY: u32 = 4294967295;
+pub const FLAG_RT_PROCESS: u32 = 16;
 pub const DATA_MEMPTR: u32 = 1;
 pub const DATA_MEMFD: u32 = 2;
 pub const DATA_DMABUF: u32 = 3;

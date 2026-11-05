@@ -86,6 +86,17 @@ pub fn pair(a: u32, b: u32) -> Vec<u8> {
     v
 }
 
+/// Array pod of fixed-size elements.
+pub fn array(child_ty: u32, elems: &[Vec<u8>]) -> Vec<u8> {
+    let size = elems.first().map_or(0, |e| e.len()) as u32;
+    let mut b = size.to_le_bytes().to_vec();
+    b.extend_from_slice(&child_ty.to_le_bytes());
+    for e in elems {
+        b.extend_from_slice(e);
+    }
+    pod(L::T_ARRAY, &b)
+}
+
 pub fn prop(key: u32, flags: u32, value: Vec<u8>) -> Vec<u8> {
     let mut v = key.to_le_bytes().to_vec();
     v.extend_from_slice(&flags.to_le_bytes());

@@ -13,6 +13,7 @@
 #include <spa/param/format.h>
 #include <spa/param/param.h>
 #include <spa/param/video/raw.h>
+#include <spa/param/audio/raw.h>
 #include <spa/pod/pod.h>
 
 #define SZ(T, NAME) printf("pub const %s: usize = %zu;\n", NAME, sizeof(T))
@@ -70,6 +71,9 @@ int main(void) {
     OFF(struct spa_meta_bitmap, size, "MB_SIZE");
     OFF(struct spa_meta_bitmap, stride, "MB_STRIDE");
     OFF(struct spa_meta_bitmap, offset, "MB_OFFSET");
+
+    OFF(struct pw_buffer, size, "PWBUF_SIZE");
+    OFF(struct pw_buffer, requested, "PWBUF_REQUESTED");
 
     printf("\n// ---- enums ----\n");
     VI(PW_STREAM_STATE_ERROR, "STATE_ERROR");
@@ -135,6 +139,18 @@ int main(void) {
     V(SPA_META_VideoDamage, "META_VIDEO_DAMAGE");
     V(SPA_META_Cursor, "META_CURSOR");
     V(SPA_META_HEADER_FLAG_CORRUPTED, "META_HEADER_FLAG_CORRUPTED");
+    V(SPA_MEDIA_TYPE_audio, "MEDIA_TYPE_AUDIO");
+    V(SPA_FORMAT_AUDIO_format, "FORMAT_AUDIO_FORMAT");
+    V(SPA_FORMAT_AUDIO_rate, "FORMAT_AUDIO_RATE");
+    V(SPA_FORMAT_AUDIO_channels, "FORMAT_AUDIO_CHANNELS");
+    V(SPA_FORMAT_AUDIO_position, "FORMAT_AUDIO_POSITION");
+    V(SPA_AUDIO_FORMAT_S16_LE, "AUDIO_FORMAT_S16_LE");
+    V(SPA_AUDIO_FORMAT_F32_LE, "AUDIO_FORMAT_F32_LE");
+    V(SPA_AUDIO_CHANNEL_FL, "AUDIO_CHANNEL_FL");
+    V(SPA_AUDIO_CHANNEL_FR, "AUDIO_CHANNEL_FR");
+    V(PW_DIRECTION_OUTPUT, "DIRECTION_OUTPUT");
+    V(PW_ID_ANY, "ID_ANY");
+    V(PW_STREAM_FLAG_RT_PROCESS, "FLAG_RT_PROCESS");
     V(SPA_DATA_MemPtr, "DATA_MEMPTR");
     V(SPA_DATA_MemFd, "DATA_MEMFD");
     V(SPA_DATA_DmaBuf, "DATA_DMABUF");
