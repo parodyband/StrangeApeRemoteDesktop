@@ -46,8 +46,8 @@ Latency figures are capture → decode/present and exclude the display's scan-ou
 | Decode           | NVDEC (dlopen), zero display delay                                | VideoToolbox                             |
 | Present          | EGL + OpenGL via CUDA/GL interop (no CPU copies)                  | Metal (CAMetalLayer)                     |
 | Input injection  | RemoteDesktop portal (evdev codes)                                | CGEvent                                  |
-| Audio            | PipeWire monitor capture / playback                               | (in progress)                            |
-| Clipboard        | Klipper over D-Bus, wl-clipboard fallback                         | (in progress)                            |
+| Audio            | PipeWire monitor capture / playback                               | (not yet)                                |
+| Clipboard        | Klipper over D-Bus, wl-clipboard fallback                         | (not yet)                                |
 
 ### Transport (`crates/core`)
 
