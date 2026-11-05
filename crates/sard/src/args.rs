@@ -15,6 +15,7 @@ const BOOL_FLAGS: &[&str] = &[
     "reselect",
     "headless",
     "audio",
+    "no-auto-relative",
 ];
 /// Flags whose value is optional (`--test-pattern` or `--test-pattern 1920x1080`).
 const OPTIONAL_VALUE: &[&str] = &["test-pattern"];

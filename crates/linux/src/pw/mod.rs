@@ -88,6 +88,19 @@ pub struct Cursor {
     pub dirty: bool,
     serial: u32,
     shape_hash: u64,
+    /// The current cursor image is fully transparent (app hid the cursor).
+    transparent: bool,
+    on_screen: bool,
+}
+
+impl Cursor {
+    fn update_visible(&mut self) {
+        let v = self.on_screen && !self.transparent;
+        if v != self.visible {
+            self.visible = v;
+            self.dirty = true;
+        }
+    }
 }
 
 pub enum FrameData {
@@ -282,19 +295,17 @@ unsafe fn read_cursor(spa: *const u8, c: &mut Cursor) {
         }
         let cid = unsafe { rd_u32(d, L::MC_ID) };
         if cid == 0 {
-            if c.visible {
-                c.visible = false;
-                c.dirty = true;
-            }
+            c.on_screen = false;
+            c.update_visible();
             return;
         }
         let (x, y) = unsafe { (rd_i32(d, L::MC_POSITION), rd_i32(d, L::MC_POSITION + 4)) };
-        if (x, y) != (c.x, c.y) || !c.visible {
+        if (x, y) != (c.x, c.y) {
             c.x = x;
             c.y = y;
-            c.visible = true;
             c.dirty = true;
         }
+        c.on_screen = true;
         let boff = unsafe { rd_u32(d, L::MC_BITMAP_OFFSET) } as usize;
         if boff >= L::META_CURSOR_SIZE && boff + L::META_BITMAP_SIZE <= msize {
             let b = unsafe { d.add(boff) };
@@ -344,12 +355,16 @@ unsafe fn read_cursor(spa: *const u8, c: &mut Cursor) {
                 }
                 if hash != c.shape_hash {
                     c.shape_hash = hash;
-                    c.serial = c.serial.wrapping_add(1);
-                    c.shape = Some((c.serial, hot.0, hot.1, w, h, rgba));
+                    c.transparent = rgba.iter().skip(3).step_by(4).all(|&a| a == 0);
+                    if !c.transparent {
+                        c.serial = c.serial.wrapping_add(1);
+                        c.shape = Some((c.serial, hot.0, hot.1, w, h, rgba));
+                    }
                     c.dirty = true;
                 }
             }
         }
+        c.update_visible();
         return;
     }
 }

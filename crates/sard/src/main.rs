@@ -52,6 +52,7 @@ CLIENT OPTIONS:
   --snapshot <file.png>  Save a decoded frame (with --headless)
   --audio                Also play audio (with --headless)
   --no-swap-modifiers    Don't map Cmd⇄Ctrl between macOS and Linux
+  --no-auto-relative     Don't switch to relative mouse when the host hides its cursor
   --max-datagram <n>     UDP payload size (default 1400; use ~1200 over VPNs)
 
 IN-SESSION HOTKEYS (Ctrl+Alt+Shift + key):

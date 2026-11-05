@@ -110,6 +110,9 @@ pub fn run(args: &Args) -> Result<()> {
         modifiers: ModifiersState::empty(),
         swap_mods: false,
         relative: false,
+        auto_relative: false,
+        auto_relative_allowed: !args.flag("no-auto-relative"),
+        focused: true,
         cursors: HashMap::new(),
         remote_cursor_visible: true,
         exit_reason: None,
@@ -210,6 +213,10 @@ struct App {
     modifiers: ModifiersState,
     swap_mods: bool,
     relative: bool,
+    /// Relative mode was switched on automatically because the host hid its cursor.
+    auto_relative: bool,
+    auto_relative_allowed: bool,
+    focused: bool,
     cursors: HashMap<u32, CustomCursor>,
     remote_cursor_visible: bool,
     exit_reason: Option<String>,
@@ -313,7 +320,10 @@ impl App {
                 let fs = w.fullscreen().is_some();
                 w.set_fullscreen(if fs { None } else { Some(Fullscreen::Borderless(None)) });
             }
-            KeyCode::KeyM => self.set_relative(!self.relative),
+            KeyCode::KeyM => {
+                self.auto_relative = false;
+                self.set_relative(!self.relative);
+            }
             KeyCode::KeyK => self.conn.request_keyframe(),
             _ => return false,
         }
@@ -435,11 +445,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.win_size.store(pack(s.width, s.height), Ordering::Relaxed);
             }
             WindowEvent::Focused(false) => {
+                self.focused = false;
                 self.conn.send_control(&Control::ReleaseAll);
                 if self.relative {
                     self.set_relative(false);
                 }
+                self.auto_relative = false;
             }
+            WindowEvent::Focused(true) => self.focused = true,
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
                 if is_synthetic || event.repeat {
@@ -512,6 +525,18 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::CursorPos { visible } => {
                 if visible != self.remote_cursor_visible {
                     self.remote_cursor_visible = visible;
+                    let metadata = self.stream.as_ref().is_some_and(|s| s.flags & STREAM_CURSOR_METADATA != 0);
+                    // 3D viewports / games hide the cursor and read relative
+                    // motion: follow the host automatically.
+                    if metadata && self.auto_relative_allowed && !self.view_only {
+                        if !visible && !self.relative && self.focused {
+                            self.set_relative(true);
+                            self.auto_relative = self.relative;
+                        } else if visible && self.auto_relative {
+                            self.auto_relative = false;
+                            self.set_relative(false);
+                        }
+                    }
                     if let Some(w) = &self.window
                         && !self.relative
                     {
