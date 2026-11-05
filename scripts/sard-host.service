@@ -1,0 +1,21 @@
+# systemd user unit: run the sard host in your graphical session.
+#
+#   cargo build --release && install -m755 target/release/sard ~/.local/bin/sard
+#   cp scripts/sard-host.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now sard-host
+#
+# The first time a client connects, KDE/GNOME shows a screen-share dialog;
+# approve it once and the choice is remembered (restore token).
+[Unit]
+Description=sard remote desktop host
+After=graphical-session.target pipewire.service xdg-desktop-portal.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/sard host
+Restart=on-failure
+RestartSec=3
+Environment=SARD_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
