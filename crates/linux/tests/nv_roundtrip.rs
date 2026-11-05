@@ -1,6 +1,8 @@
 //! GPU round trip: synthetic NV12 -> NVENC -> NVDEC -> compare. Skips (passes)
 //! when no NVIDIA GPU/driver is available.
 
+#![cfg(target_os = "linux")]
+
 use sard_core::proto::Codec;
 use sard_linux::nv::cuda::{Cuda, Mem};
 use sard_linux::nv::nvdec::NvDecoder;

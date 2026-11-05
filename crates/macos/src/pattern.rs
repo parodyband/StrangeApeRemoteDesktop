@@ -110,6 +110,23 @@ impl Pattern {
     }
 }
 
+/// BT.709 limited-range NV12 → packed RGB8 (CPU; snapshots only).
+pub fn nv12_to_rgb(y: &[u8], uv: &[u8], w: usize, h: usize, y_pitch: usize, uv_pitch: usize, out: &mut [u8]) {
+    let c = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    for row in 0..h {
+        for col in 0..w {
+            let yy = (y[row * y_pitch + col] as f32 - 16.0) * (255.0 / 219.0);
+            let i = (row / 2) * uv_pitch + (col / 2) * 2;
+            let cb = (uv[i] as f32 - 128.0) * (255.0 / 224.0);
+            let cr = (uv[i + 1] as f32 - 128.0) * (255.0 / 224.0);
+            let o = (row * w + col) * 3;
+            out[o] = c(yy + 1.5748 * cr);
+            out[o + 1] = c(yy - 0.1873 * cb - 0.4681 * cr);
+            out[o + 2] = c(yy + 1.8556 * cb);
+        }
+    }
+}
+
 /// PSNR (dB) between two 8-bit planes.
 pub fn psnr(a: &[u8], b: &[u8], w: usize, h: usize, pitch_a: usize, pitch_b: usize) -> f64 {
     let mut se = 0f64;

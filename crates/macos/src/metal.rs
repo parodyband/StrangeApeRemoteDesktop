@@ -198,7 +198,11 @@ impl Renderer {
     /// # Safety
     /// `target` must be a valid BGRA8 render-target `id<MTLTexture>`; call
     /// inside an autorelease pool.
-    pub unsafe fn encode_draw(&self, target: *mut AnyObject, frame: Option<&FrameTextures>) -> Result<Retained<AnyObject>> {
+    pub unsafe fn encode_draw(
+        &self,
+        target: *mut AnyObject,
+        frame: Option<&FrameTextures>,
+    ) -> Result<Retained<AnyObject>> {
         // SAFETY: valid Metal objects; standard render pass encoding.
         unsafe {
             let tw: usize = msg_send![target, width];

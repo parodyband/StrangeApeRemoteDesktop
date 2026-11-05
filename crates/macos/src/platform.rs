@@ -1,7 +1,7 @@
 //! macOS implementation of the sard platform API (see `sard/src/platform.rs`).
 
 use crate::input::LogInput;
-use crate::sink::MetalVideoSink;
+use crate::sink::{HeadlessSink, MetalVideoSink};
 use crate::test_source::TestPatternSource;
 use crate::vt::{self, EncoderConfig, RateControl, VtEncoder};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -28,6 +28,11 @@ pub fn create_video_sink(
     height: u32,
 ) -> media::Result<Box<dyn VideoSink>> {
     Ok(Box::new(MetalVideoSink::new(display, window, width, height)?))
+}
+
+/// Decode-only client sink (`sard connect --headless`).
+pub fn create_headless_sink() -> media::Result<Box<dyn VideoSink>> {
+    Ok(Box::new(HeadlessSink::default()))
 }
 
 struct Caps {
