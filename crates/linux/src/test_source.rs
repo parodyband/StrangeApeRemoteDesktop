@@ -161,6 +161,11 @@ impl VideoSource for TestPatternSource {
         (self.w as u32, self.h as u32)
     }
 
+    /// No cursor in the pattern: let the client keep its local pointer visible.
+    fn cursor_mode(&self) -> sard_core::media::CursorMode {
+        sard_core::media::CursorMode::Metadata
+    }
+
     fn describe(&self) -> String {
         format!("test pattern {}x{} → NVENC {} on {}", self.w, self.h, self.codec.name(), self.cuda.device_name)
     }

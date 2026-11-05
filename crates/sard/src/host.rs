@@ -197,6 +197,7 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
     source.set_bitrate(ceiling);
     info!("streaming: {} ({} fps, {} Mbps cap)", source.describe(), opts.fps, ceiling / 1000);
 
+    let cursor_meta = source.cursor_mode() == CursorMode::Metadata;
     let stream_cfg = |w: u32, h: u32, kbps: u32| {
         Control::StreamConfig(StreamConfig {
             codec: opts.codec,
@@ -204,7 +205,7 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
             height: h as u16,
             fps: opts.fps as u16,
             bitrate_kbps: kbps,
-            flags: if opts.cursor == CursorMode::Metadata { STREAM_CURSOR_METADATA } else { 0 },
+            flags: if cursor_meta { STREAM_CURSOR_METADATA } else { 0 },
             host_platform: Platform::current(),
             host_name: config::hostname(),
         })

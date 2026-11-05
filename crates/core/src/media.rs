@@ -106,6 +106,11 @@ pub trait VideoSource: Send {
     fn codec(&self) -> Codec;
     /// Current encoded size.
     fn size(&self) -> (u32, u32);
+    /// How the cursor is actually delivered (may differ from what was asked,
+    /// e.g. a capture API that can only embed the cursor).
+    fn cursor_mode(&self) -> CursorMode {
+        CursorMode::Embedded
+    }
     /// Pending cursor change, if the source tracks the cursor separately.
     fn take_cursor(&mut self) -> Option<CursorUpdate> {
         None
