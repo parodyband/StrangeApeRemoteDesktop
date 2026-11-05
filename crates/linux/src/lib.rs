@@ -6,10 +6,15 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod capture;
+pub mod clipboard;
+pub mod dbus;
 pub mod dl;
 pub mod gl;
+pub mod headless;
 pub mod nv;
 pub mod platform;
+pub mod portal;
+pub mod pw;
 pub mod sink;
 pub mod test_source;
 pub mod yuv;

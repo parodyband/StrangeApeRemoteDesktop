@@ -2,6 +2,7 @@
 
 mod args;
 mod client;
+mod clipsync;
 mod host;
 mod keymap;
 mod platform;
@@ -25,6 +26,7 @@ USAGE:
 
 HOST OPTIONS:
   --pair                 Accept new pairings (prints a one-time code)
+  --reselect             Ask again which screen to share (Linux: forget saved approval)
   --port <n>             UDP port (default 47800)
   --bind <addr>          Listen address (default 0.0.0.0)
   --codec <c>            Force hevc | h264 | av1
@@ -35,6 +37,7 @@ HOST OPTIONS:
   --yuv444               Full chroma 4:4:4 (sharper text, needs client support)
   --cursor <mode>        metadata (client draws cursor, default) | embedded
   --test-pattern [WxH]   Stream a synthetic pattern instead of the screen
+  --no-audio             Don't stream audio
 
 CLIENT OPTIONS:
   --fps <n>              Request a frame rate
@@ -42,6 +45,11 @@ CLIENT OPTIONS:
   --codec <c>            Prefer hevc | h264 | av1
   --display <n>          Ask for a specific host display
   --fullscreen           Start fullscreen
+  --view-only            Watch without sending keyboard/mouse input
+  --no-audio             Don't play the host's audio
+  --headless             No window: decode only and log stats (testing)
+  --duration <secs>      Exit after this long (with --headless)
+  --snapshot <file.png>  Save a decoded frame (with --headless)
   --no-swap-modifiers    Don't map Cmd⇄Ctrl between macOS and Linux
   --max-datagram <n>     UDP payload size (default 1400; use ~1200 over VPNs)
 
@@ -74,6 +82,7 @@ fn main() -> ExitCode {
         "pair" => pair(&args),
         "info" => info(),
         "unpair" => unpair(&args),
+        "selftest-capture" => selftest_capture(&args),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -155,6 +164,108 @@ fn info() -> Result<()> {
     for line in platform::capabilities() {
         println!("  {line}");
     }
+    Ok(())
+}
+
+/// Hidden diagnostic: open the real screen capture and encode for a while.
+fn selftest_capture(args: &Args) -> Result<()> {
+    use sard_core::media::{CursorMode, SourceOptions};
+    use std::time::Instant;
+    let secs: u64 = args.positional(0).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let opts = SourceOptions {
+        fps: args.parse_value("fps")?.unwrap_or(60),
+        bitrate_kbps: 30_000,
+        cursor: CursorMode::Metadata,
+        test_pattern: args.flag("test-pattern"),
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let (mut src, mut input) = platform::open_host(&opts)?;
+    println!("opened in {:.1}s: {}", t0.elapsed().as_secs_f64(), src.describe());
+    if args.flag("input-test") {
+        input_roundtrip(src.as_mut(), input.as_mut())?;
+    }
+    let start = Instant::now();
+    let (mut frames, mut bytes, mut keys, mut cursors) = (0u64, 0usize, 0u32, 0u32);
+    let mut lat = sard_core::stats::Samples::default();
+    while start.elapsed().as_secs() < secs {
+        if let Some(f) = src.next_frame(std::time::Duration::from_millis(100))? {
+            frames += 1;
+            bytes += f.data.len();
+            keys += f.keyframe as u32;
+            lat.add((sard_core::clock::now_us() - f.capture_us) as u32);
+        }
+        if src.take_cursor().is_some() {
+            cursors += 1;
+        }
+    }
+    let l = lat.take();
+    let dt = start.elapsed().as_secs_f64();
+    println!(
+        "{frames} frames in {dt:.1}s ({:.1} fps), {:.1} KB/frame, {keys} keyframes, {cursors} cursor updates, capture->encoded p50 {:.2} ms p95 {:.2} ms max {:.2} ms",
+        frames as f64 / dt,
+        bytes as f64 / frames.max(1) as f64 / 1024.0,
+        l.p50 as f64 / 1000.0,
+        l.p95 as f64 / 1000.0,
+        l.max as f64 / 1000.0
+    );
+    Ok(())
+}
+
+/// Inject absolute pointer moves and observe them in the capture's cursor
+/// metadata: verifies coordinate mapping and measures input→screen latency.
+fn input_roundtrip(
+    src: &mut dyn sard_core::media::VideoSource,
+    input: &mut dyn sard_core::media::InputSink,
+) -> Result<()> {
+    use sard_core::media::{InputEvent, VideoSource};
+    use std::time::{Duration, Instant};
+    fn wait_cursor(
+        src: &mut dyn VideoSource,
+        pred: &dyn Fn(f32, f32) -> bool,
+        limit: Duration,
+    ) -> Result<Option<(f32, f32)>> {
+        let t = Instant::now();
+        while t.elapsed() < limit {
+            let _ = src.next_frame(Duration::from_millis(5))?;
+            if let Some(c) = src.take_cursor()
+                && c.visible
+                && pred(c.x, c.y)
+            {
+                return Ok(Some((c.x, c.y)));
+            }
+        }
+        Ok(None)
+    }
+    // Nudge to learn the current position, then restore it at the end.
+    input.inject(&InputEvent::MoveRel { dx: 1.0, dy: 0.0 })?;
+    let orig = wait_cursor(src, &|_, _| true, Duration::from_secs(2))?;
+    println!("cursor at start: {orig:?}");
+    let mut lat = Vec::new();
+    for &(x, y) in &[(0.25f32, 0.5f32), (0.75, 0.25), (0.5, 0.75), (0.1, 0.1)] {
+        let t = Instant::now();
+        input.inject(&InputEvent::MoveAbs { x, y })?;
+        match wait_cursor(src, &|cx, cy| (cx - x).abs() < 0.01 && (cy - y).abs() < 0.01, Duration::from_secs(1))? {
+            Some(p) => {
+                lat.push(t.elapsed().as_secs_f64() * 1000.0);
+                println!(
+                    "  move to ({x:.2},{y:.2}) -> cursor ({:.3},{:.3}) in {:.2} ms",
+                    p.0,
+                    p.1,
+                    lat.last().unwrap()
+                );
+            }
+            None => println!("  move to ({x:.2},{y:.2}) -> NOT observed within 1 s"),
+        }
+    }
+    if let Some((x, y)) = orig {
+        input.inject(&InputEvent::MoveAbs { x, y })?;
+    }
+    if lat.len() < 4 {
+        return Err("input round trip failed".into());
+    }
+    lat.sort_by(f64::total_cmp);
+    println!("input→cursor metadata latency: median {:.2} ms, max {:.2} ms", lat[lat.len() / 2], lat[lat.len() - 1]);
     Ok(())
 }
 

@@ -12,7 +12,7 @@ use sard_core::clock;
 use sard_core::config::{self, KnownHosts};
 use sard_core::media::{VideoSink, letterbox};
 use sard_core::net::{Client, Connection, Event};
-use sard_core::proto::{ClientHello, Codec, Control, Platform, StreamConfig, button, client_flags};
+use sard_core::proto::{AudioPacket, ClientHello, Codec, Control, Platform, StreamConfig, button, client_flags};
 use sard_core::stats::Samples;
 use sard_core::video::{CompleteFrame, FrameMeta, frame_flags};
 use sard_core::{error, info, warn};
@@ -64,6 +64,9 @@ pub fn run(args: &Args) -> Result<()> {
     let conn = Client::connect(&addr, host.key, identity, cfg, Duration::from_secs(8))?;
     let events = conn.take_events().ok_or("events taken")?;
     let frames = conn.take_video().ok_or("video taken")?;
+    if args.flag("headless") {
+        return run_headless(conn, events, frames, args, &host.name);
+    }
 
     let mut builder = EventLoop::<UserEvent>::with_user_event();
     #[cfg(target_os = "macos")]
@@ -78,7 +81,11 @@ pub fn run(args: &Args) -> Result<()> {
     // Forward network events to the UI thread.
     {
         let proxy = proxy.clone();
-        std::thread::Builder::new().name("sard-events".into()).spawn(move || forward_events(events, proxy))?;
+        let audio = !args.flag("no-audio");
+        let c = conn.clone();
+        std::thread::Builder::new()
+            .name("sard-events".into())
+            .spawn(move || forward_events(events, proxy, audio, c))?;
     }
 
     let mut app = App {
@@ -88,6 +95,8 @@ pub fn run(args: &Args) -> Result<()> {
         args_codec: args.value("codec").and_then(Codec::parse),
         args_display: args.parse_value("display")?.unwrap_or(0),
         fullscreen: args.flag("fullscreen"),
+        view_only: args.flag("view-only"),
+        audio: !args.flag("no-audio"),
         swap_mods_allowed: !args.flag("no-swap-modifiers"),
         host_name: host.name.clone(),
         frames: Some(frames),
@@ -113,9 +122,58 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn forward_events(events: Receiver<Event>, proxy: EventLoopProxy<UserEvent>) {
+fn forward_events(events: Receiver<Event>, proxy: EventLoopProxy<UserEvent>, audio_enabled: bool, conn: Connection) {
+    let clip = crate::clipsync::ClipSync::start(conn);
+    let mut audio: Option<Box<dyn sard_core::media::AudioSink>> = None;
+    // Diagnostics: count audio packets without playing them (avoids feedback
+    // when host and client share a machine).
+    let dry = std::env::var_os("SARD_AUDIO_DRY").is_some();
+    let (mut dry_n, mut dry_gaps, mut dry_last, mut dry_t) = (0u64, 0u64, None::<u32>, Instant::now());
     for ev in events {
         let ue = match ev {
+            Event::Control(Control::AudioConfig { sample_rate, channels }) => {
+                if audio_enabled && audio.is_none() && !dry {
+                    match platform::open_audio_sink() {
+                        Ok(s) => {
+                            info!("audio: {sample_rate} Hz x{channels} → {}", s.describe());
+                            audio = Some(s);
+                        }
+                        Err(e) => warn!("audio playback unavailable: {e}"),
+                    }
+                }
+                continue;
+            }
+            Event::Control(Control::Clipboard { text }) => {
+                if let Some(c) = &clip {
+                    c.on_remote(text);
+                }
+                continue;
+            }
+            Event::Audio(bytes) => {
+                if dry {
+                    if let Ok(p) = AudioPacket::decode(&bytes) {
+                        dry_n += 1;
+                        if let Some(l) = dry_last
+                            && p.seq != l.wrapping_add(1)
+                        {
+                            dry_gaps += 1;
+                        }
+                        dry_last = Some(p.seq);
+                        if dry_t.elapsed() >= Duration::from_secs(2) {
+                            info!(
+                                "audio (dry): {:.0} packets/s ({} frames each), {dry_gaps} gaps",
+                                dry_n as f64 / dry_t.elapsed().as_secs_f64(),
+                                p.samples.len() / 2
+                            );
+                            dry_n = 0;
+                            dry_t = Instant::now();
+                        }
+                    }
+                } else if let (Some(a), Ok(p)) = (&audio, AudioPacket::decode(&bytes)) {
+                    a.push(p.seq, &p.samples);
+                }
+                continue;
+            }
             Event::Control(c) => UserEvent::Control(c),
             Event::CursorPos { visible, .. } => UserEvent::CursorPos { visible },
             Event::Disconnected(r) => {
@@ -137,6 +195,8 @@ struct App {
     args_codec: Option<Codec>,
     args_display: u8,
     fullscreen: bool,
+    view_only: bool,
+    audio: bool,
     swap_mods_allowed: bool,
     host_name: String,
     frames: Option<Receiver<CompleteFrame>>,
@@ -196,7 +256,7 @@ impl App {
             max_height: mh.max(720) as u16,
             max_fps,
             bitrate_kbps: self.args_bitrate.unwrap_or(0),
-            flags: client_flags::LOCAL_CURSOR,
+            flags: client_flags::LOCAL_CURSOR | if self.audio { client_flags::AUDIO } else { 0 },
             display: self.args_display,
         };
         info!(
@@ -309,7 +369,13 @@ impl App {
                 let cursor = if let Some(c) = self.cursors.get(&serial) {
                     c.clone()
                 } else {
-                    match CustomCursor::from_rgba(rgba, width, height, hot_x, hot_y) {
+                    match CustomCursor::from_rgba(
+                        rgba,
+                        width,
+                        height,
+                        hot_x.min(width.saturating_sub(1)),
+                        hot_y.min(height.saturating_sub(1)),
+                    ) {
                         Ok(src) => {
                             let c = el.create_custom_cursor(src);
                             if self.cursors.len() > 64 {
@@ -386,6 +452,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if down && self.hotkey() && self.handle_hotkey(el, code) {
                     return;
                 }
+                if self.view_only {
+                    return;
+                }
                 if let Some(mut k) = keymap::to_evdev(code) {
                     if self.swap_mods {
                         k = keymap::swap_ctrl_meta(k);
@@ -393,6 +462,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.conn.send_control(&Control::Key { code: k, down });
                 }
             }
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+                if self.view_only => {}
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
                 if !self.relative
@@ -478,6 +549,7 @@ fn render_loop(
     let mut last = Instant::now();
     let mut meta_last: Option<FrameMeta> = None;
     let mut errors = 0u32;
+    let mut log_n = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let s = win_size.load(Ordering::Relaxed);
         if s != size {
@@ -534,10 +606,126 @@ fn render_loop(
                 ),
                 None => format!("sard — {host_name} — waiting for video…"),
             };
+            if log_n.is_multiple_of(5) {
+                info!("{title}");
+            }
+            log_n += 1;
             let _ = proxy.send_event(UserEvent::Stats(title));
             n = 0;
             bytes = 0;
             last = Instant::now();
         }
     }
+}
+
+/// Windowless client for tests: decode with the platform decoder, log stats,
+/// optionally save one decoded frame. Never opens a window.
+fn run_headless(
+    conn: Connection,
+    events: Receiver<Event>,
+    frames: Receiver<CompleteFrame>,
+    args: &Args,
+    host_name: &str,
+) -> Result<()> {
+    let duration = args.parse_value::<u64>("duration")?.map(Duration::from_secs);
+    let snapshot: Option<std::path::PathBuf> = args.value("snapshot").map(Into::into);
+    let mut sink = platform::create_headless_sink()?;
+    info!("headless client: {}", sink.describe());
+    let hello = ClientHello {
+        platform: Platform::current(),
+        decoders: platform::decoders(),
+        codec_pref: args.value("codec").and_then(Codec::parse).map_or(0, |c| c as u8),
+        max_width: args.parse_value("max-width")?.unwrap_or(3840),
+        max_height: args.parse_value("max-height")?.unwrap_or(2160),
+        max_fps: args.parse_value("fps")?.unwrap_or(60),
+        bitrate_kbps: args.parse_value::<f32>("bitrate")?.map_or(0, |m| (m * 1000.0) as u32),
+        flags: client_flags::LOCAL_CURSOR,
+        display: args.parse_value("display")?.unwrap_or(0),
+    };
+    conn.send_control(&Control::ClientHello(hello));
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new().name("sard-events".into()).spawn(move || {
+            for ev in events {
+                match ev {
+                    Event::Control(Control::StreamConfig(s)) => {
+                        info!(
+                            "stream: {} {}x{} @ {} fps from {}",
+                            s.codec.name(),
+                            s.width,
+                            s.height,
+                            s.fps,
+                            s.host_name
+                        )
+                    }
+                    Event::Control(Control::Status { text }) => info!("host: {text}"),
+                    Event::Disconnected(r) => {
+                        info!("disconnected: {r}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        })?;
+    }
+    let start = Instant::now();
+    let mut last = Instant::now();
+    let (mut n, mut bytes, mut total) = (0u32, 0usize, 0u64);
+    let (mut e2e, mut dec) = (Samples::default(), Samples::default());
+    let mut snapshot_armed = false;
+    while !stop.load(Ordering::Relaxed) && duration.is_none_or(|d| start.elapsed() < d) {
+        if !snapshot_armed
+            && start.elapsed() > Duration::from_secs(2)
+            && let Some(p) = &snapshot
+        {
+            sink.snapshot_next(p)?;
+            snapshot_armed = true;
+        }
+        match frames.recv_timeout(Duration::from_millis(50)) {
+            Ok(f) => {
+                let Ok((meta, bits)) = FrameMeta::read(&f.data) else { continue };
+                match sink.present(meta.codec, bits, meta.flags & frame_flags::KEYFRAME != 0) {
+                    Ok(ps) => {
+                        if let Some(cap) = conn.remote_to_local_us(meta.capture_us) {
+                            e2e.add(clock::now_us().saturating_sub(cap) as u32);
+                        }
+                        dec.add(ps.decode_us);
+                        n += 1;
+                        total += 1;
+                        bytes += bits.len();
+                    }
+                    Err(e) => {
+                        warn!("decode failed: {e}; requesting keyframe");
+                        conn.request_keyframe();
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+        if last.elapsed() >= Duration::from_secs(5) {
+            let (l, d, st) = (e2e.take(), dec.take(), conn.stats());
+            let dt = last.elapsed().as_secs_f64();
+            info!(
+                "{host_name}: {:.0} fps | capture→decoded p50 {:.1} ms p95 {:.1} ms | decode {:.1} ms | {:.1} Mbps | rtt {:.2} ms | frames lost {} | fec-repaired {} | rtx-repaired {}",
+                n as f64 / dt,
+                l.p50 as f64 / 1000.0,
+                l.p95 as f64 / 1000.0,
+                d.p50 as f64 / 1000.0,
+                bytes as f64 * 8.0 / dt / 1e6,
+                st.rtt_us as f64 / 1000.0,
+                st.video_frames_lost,
+                st.video_fec_recovered,
+                st.video_rtx_recovered
+            );
+            n = 0;
+            bytes = 0;
+            last = Instant::now();
+        }
+    }
+    info!("headless client done: {total} frames in {:.1}s", start.elapsed().as_secs_f64());
+    conn.close();
+    Ok(())
 }

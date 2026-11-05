@@ -6,7 +6,7 @@ use crate::nv::nvenc::{EncoderParams, NvEncoder};
 use crate::sink::GlVideoSink;
 use crate::test_source::{LogInput, TestPatternSource};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use sard_core::media::{self, InputSink, SourceOptions, VideoSink, VideoSource};
+use sard_core::media::{self, AudioCallback, AudioSink, AudioSource, InputSink, SourceOptions, VideoSink, VideoSource};
 use sard_core::proto::Codec;
 use std::sync::{Arc, OnceLock};
 
@@ -28,6 +28,28 @@ pub fn create_video_sink(
     height: u32,
 ) -> media::Result<Box<dyn VideoSink>> {
     Ok(Box::new(GlVideoSink::new(display, window, width, height)?))
+}
+
+/// Decode-only video output without a window (tests/benchmarks).
+pub fn create_headless_sink() -> media::Result<Box<dyn VideoSink>> {
+    Ok(Box::new(crate::headless::HeadlessSink::new()?))
+}
+
+/// Capture what this machine is playing (host side).
+pub fn open_audio_source(cb: AudioCallback) -> media::Result<Box<dyn AudioSource>> {
+    crate::pw::audio::open_source(cb)
+}
+
+/// Play remote audio (client side).
+pub fn open_audio_sink() -> media::Result<Box<dyn AudioSink>> {
+    crate::pw::audio::open_sink()
+}
+
+/// The desktop's text clipboard, if reachable.
+pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
+    let c = crate::clipboard::LinuxClipboard::open()?;
+    sard_core::debug!("clipboard via {}", c.backend_name());
+    Some(Box::new(c))
 }
 
 struct Caps {

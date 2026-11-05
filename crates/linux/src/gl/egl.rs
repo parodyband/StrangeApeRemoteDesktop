@@ -283,6 +283,83 @@ impl EglContext {
     }
 }
 
+/// DRM fourcc codes for the 32-bit RGB formats PipeWire screencasts use.
+pub mod fourcc {
+    const fn fc(s: &[u8; 4]) -> u32 {
+        s[0] as u32 | (s[1] as u32) << 8 | (s[2] as u32) << 16 | (s[3] as u32) << 24
+    }
+    pub const XRGB8888: u32 = fc(b"XR24");
+    pub const ARGB8888: u32 = fc(b"AR24");
+    pub const XBGR8888: u32 = fc(b"XB24");
+    pub const ABGR8888: u32 = fc(b"AB24");
+}
+
+impl EglContext {
+    /// DMA-BUF modifiers importable as GL_TEXTURE_2D for `fourcc`.
+    pub fn dmabuf_modifiers(&self, fourcc: u32) -> Vec<u64> {
+        let Some(q) = self.query_modifiers else { return Vec::new() };
+        let mut n = 0;
+        // SAFETY: two-call pattern: count, then fill.
+        unsafe {
+            if q(self.display, fourcc as EGLint, 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut n) != EGL_TRUE
+                || n <= 0
+            {
+                return Vec::new();
+            }
+            let mut mods = vec![0u64; n as usize];
+            let mut ext = vec![0u32; n as usize];
+            q(self.display, fourcc as EGLint, n, mods.as_mut_ptr(), ext.as_mut_ptr(), &mut n);
+            mods.into_iter().zip(ext).filter(|(_, e)| *e == 0).map(|(m, _)| m).collect()
+        }
+    }
+
+    /// Import a single-plane DMA-BUF as an EGLImage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_dmabuf(
+        &self,
+        w: u32,
+        h: u32,
+        fourcc: u32,
+        fd: i32,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+    ) -> Result<EGLImage> {
+        let create = self.create_image.ok_or("eglCreateImage unavailable")?;
+        let attrs: [EGLAttrib; 17] = [
+            EGL_WIDTH as EGLAttrib,
+            w as EGLAttrib,
+            EGL_HEIGHT as EGLAttrib,
+            h as EGLAttrib,
+            EGL_LINUX_DRM_FOURCC_EXT as EGLAttrib,
+            fourcc as EGLAttrib,
+            EGL_DMA_BUF_PLANE0_FD_EXT as EGLAttrib,
+            fd as EGLAttrib,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT as EGLAttrib,
+            offset as EGLAttrib,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT as EGLAttrib,
+            stride as EGLAttrib,
+            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT as EGLAttrib,
+            (modifier & 0xffff_ffff) as EGLAttrib,
+            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT as EGLAttrib,
+            (modifier >> 32) as EGLAttrib,
+            EGL_NONE as EGLAttrib,
+        ];
+        // SAFETY: valid display and attribute list; fd stays owned by PipeWire.
+        let img = unsafe {
+            create(self.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, std::ptr::null_mut(), attrs.as_ptr())
+        };
+        if img.is_null() { Err(self.api.error("eglCreateImage(dma-buf)")) } else { Ok(img) }
+    }
+
+    pub fn destroy_image(&self, img: EGLImage) {
+        if let Some(d) = self.destroy_image {
+            // SAFETY: image created by import_dmabuf on this display.
+            unsafe { d(self.display, img) };
+        }
+    }
+}
+
 impl Drop for EglContext {
     fn drop(&mut self) {
         // SAFETY: destroying what we created.

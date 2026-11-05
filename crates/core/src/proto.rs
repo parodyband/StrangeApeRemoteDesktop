@@ -416,6 +416,36 @@ impl PairPayload {
     }
 }
 
+/// Audio packet (payload of `msg::AUDIO`): interleaved s16le stereo, 48 kHz.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioPacket {
+    pub seq: u32,
+    pub capture_us: u64,
+    pub samples: Vec<i16>,
+}
+
+impl AudioPacket {
+    pub fn encode(seq: u32, capture_us: u64, samples: &[i16]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(14 + samples.len() * 2);
+        b.put_u32(seq);
+        b.put_u64(capture_us);
+        b.put_u16((samples.len() / 2) as u16);
+        for s in samples {
+            b.extend_from_slice(&s.to_le_bytes());
+        }
+        b
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        let seq = r.u32()?;
+        let capture_us = r.u64()?;
+        let frames = r.u16()? as usize;
+        let raw = r.bytes(frames * 4)?;
+        let samples = raw.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
+        Ok(Self { seq, capture_us, samples })
+    }
+}
+
 /// Receiver report, sent ~4x per second by the video receiver.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Report {
@@ -508,6 +538,11 @@ mod tests {
             assert_eq!(Control::decode(&m.encode()).unwrap(), m);
         }
         assert!(Control::decode(&[200]).is_err());
+        let a = AudioPacket::encode(7, 99, &[1, -2, 3, -4]);
+        assert_eq!(
+            AudioPacket::decode(&a).unwrap(),
+            AudioPacket { seq: 7, capture_us: 99, samples: vec![1, -2, 3, -4] }
+        );
         assert!(Control::decode(&[tag::KEY, 1]).is_err());
     }
 }
