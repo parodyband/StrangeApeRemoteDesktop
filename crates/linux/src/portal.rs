@@ -255,10 +255,7 @@ impl PortalInput {
         let (w, h) = stream.size;
         let px = (x.clamp(0.0, 1.0) as f64 * w as f64).min(w as f64 - 0.5);
         let py = (y.clamp(0.0, 1.0) as f64 * h as f64).min(h as f64 - 0.5);
-        self.notify(
-            "NotifyPointerMotionAbsolute",
-            vec![Value::U32(stream.node_id), Value::F64(px), Value::F64(py)],
-        )
+        self.notify("NotifyPointerMotionAbsolute", vec![Value::U32(stream.node_id), Value::F64(px), Value::F64(py)])
     }
 
     pub fn move_rel(&self, dx: f32, dy: f32) -> Result<()> {

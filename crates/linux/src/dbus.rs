@@ -433,6 +433,12 @@ impl Message {
         if let Some(m) = &self.member {
             fields.push(field(3, Value::Str(m.clone())));
         }
+        if let Some(e) = &self.error_name {
+            fields.push(field(4, Value::Str(e.clone())));
+        }
+        if let Some(r) = self.reply_serial {
+            fields.push(field(5, Value::U32(r)));
+        }
         if let Some(d) = &self.destination {
             fields.push(field(6, Value::Str(d.clone())));
         }
@@ -528,11 +534,14 @@ pub struct Connection {
     pub unique_name: String,
 }
 
-fn session_socket() -> Result<UnixStream> {
-    let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().unwrap_or_else(|| {
+fn session_address() -> String {
+    std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().unwrap_or_else(|| {
         // SAFETY: getuid never fails.
         format!("unix:path=/run/user/{}/bus", unsafe { libc::getuid() })
-    });
+    })
+}
+
+fn bus_socket(addr: &str) -> Result<UnixStream> {
     for part in addr.split(';') {
         let Some(rest) = part.strip_prefix("unix:") else { continue };
         for kv in rest.split(',') {
@@ -553,7 +562,12 @@ fn session_socket() -> Result<UnixStream> {
 impl Connection {
     /// Connect and authenticate to the session bus.
     pub fn session() -> Result<Self> {
-        let mut sock = session_socket()?;
+        Self::open(&session_address())
+    }
+
+    /// Connect and authenticate to the bus at a D-Bus address (`unix:path=...`).
+    pub fn open(addr: &str) -> Result<Self> {
+        let mut sock = bus_socket(addr)?;
         sock.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
         // SASL EXTERNAL with our uid.
         // SAFETY: getuid never fails.
@@ -605,6 +619,8 @@ impl Connection {
         m.interface = msg.interface.clone();
         m.member = msg.member.clone();
         m.destination = msg.destination.clone();
+        m.error_name = msg.error_name.clone();
+        m.reply_serial = msg.reply_serial;
         let bytes = m.encode(args);
         let _g = self.write.lock().unwrap();
         (&self.sock).write_all(&bytes).map_err(|e| format!("dbus write: {e}"))?;
@@ -709,6 +725,65 @@ impl Connection {
             st.inbox.pop_front();
         }
         Ok(())
+    }
+
+    /// Answer a method call (no-op if the caller asked for no reply).
+    pub fn reply(&self, call: &Message, args: &[Value]) -> Result<()> {
+        if call.flags & FLAG_NO_REPLY_EXPECTED != 0 {
+            return Ok(());
+        }
+        let m = Message {
+            msg_type: METHOD_RETURN,
+            flags: FLAG_NO_REPLY_EXPECTED,
+            reply_serial: Some(call.serial),
+            destination: call.sender.clone(),
+            ..Default::default()
+        };
+        self.send(&m, args).map(|_| ())
+    }
+
+    pub fn reply_error(&self, call: &Message, name: &str, text: &str) -> Result<()> {
+        if call.flags & FLAG_NO_REPLY_EXPECTED != 0 {
+            return Ok(());
+        }
+        let m = Message {
+            msg_type: ERROR,
+            flags: FLAG_NO_REPLY_EXPECTED,
+            error_name: Some(name.into()),
+            reply_serial: Some(call.serial),
+            destination: call.sender.clone(),
+            ..Default::default()
+        };
+        self.send(&m, &[Value::Str(text.into())]).map(|_| ())
+    }
+
+    /// Broadcast a signal.
+    pub fn emit(&self, path: &str, iface: &str, member: &str, args: &[Value]) -> Result<()> {
+        let m = Message {
+            msg_type: SIGNAL,
+            flags: FLAG_NO_REPLY_EXPECTED,
+            path: Some(path.into()),
+            interface: Some(iface.into()),
+            member: Some(member.into()),
+            ..Default::default()
+        };
+        self.send(&m, args).map(|_| ())
+    }
+
+    /// Own a well-known bus name (fails if someone else has it).
+    pub fn request_name(&self, name: &str) -> Result<()> {
+        const DO_NOT_QUEUE: u32 = 4;
+        let r = self.call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "RequestName",
+            &[Value::Str(name.into()), Value::U32(DO_NOT_QUEUE)],
+        )?;
+        match r.body.first().and_then(Value::as_u32) {
+            Some(1) | Some(4) => Ok(()),
+            other => Err(format!("cannot own bus name {name} (reply {other:?})")),
+        }
     }
 
     pub fn add_match(&self, rule: &str) -> Result<()> {

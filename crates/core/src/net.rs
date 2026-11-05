@@ -1256,7 +1256,7 @@ fn raise_thread_priority() {
 /// Host side: listens for paired clients.
 pub struct Host {
     shared: Arc<Shared>,
-    accept_rx: Receiver<Connection>,
+    accept_rx: Mutex<Receiver<Connection>>,
 }
 
 pub struct HostOptions {
@@ -1284,7 +1284,7 @@ impl Host {
         let (tx, rx) = mpsc::channel::<Connection>();
         *lock(&shared.accept_tx) = Some(tx);
         shared.spawn();
-        Ok(Host { shared, accept_rx: rx })
+        Ok(Host { shared, accept_rx: Mutex::new(rx) })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -1300,7 +1300,7 @@ impl Host {
 
     /// Wait for the next client connection.
     pub fn accept(&self, timeout: Duration) -> Option<Connection> {
-        self.accept_rx.recv_timeout(timeout).ok()
+        lock(&self.accept_rx).recv_timeout(timeout).ok()
     }
 }
 
