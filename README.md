@@ -46,8 +46,8 @@ Latency figures are capture → decode/present and exclude the display's scan-ou
 | Decode           | NVDEC (dlopen), zero display delay                                | VideoToolbox                             |
 | Present          | EGL + OpenGL via CUDA/GL interop (no CPU copies)                  | Metal (CAMetalLayer)                     |
 | Input injection  | RemoteDesktop portal (evdev codes)                                | CGEvent                                  |
-| Audio            | PipeWire monitor capture / playback                               | (not yet)                                |
-| Clipboard        | Klipper over D-Bus, wl-clipboard fallback                         | (not yet)                                |
+| Audio            | PipeWire monitor capture / playback                               | CoreAudio output unit (playback)         |
+| Clipboard        | Klipper over D-Bus, wl-clipboard fallback                         | NSPasteboard                             |
 
 ### Transport (`crates/core`)
 
@@ -199,5 +199,6 @@ not implemented on macOS yet.
 - [x] macOS client: VideoToolbox + Metal (zero-copy), headless mode
 - [x] macOS host: ScreenCaptureKit + VideoToolbox + CGEvent
 - [ ] macOS AV1 decode (hardware is there on M3+), client-side cursor on macOS hosts
-- [ ] macOS audio and clipboard
+- [x] macOS clipboard and audio playback
+- [ ] macOS host audio capture (ScreenCaptureKit audio)
 - [ ] NAT traversal / relay (protocol already routes by session index)

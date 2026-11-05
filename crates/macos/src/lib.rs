@@ -7,8 +7,10 @@
 #![cfg(target_os = "macos")]
 
 pub mod annexb;
+pub mod audio;
 pub mod capture;
 pub mod cf;
+pub mod clipboard;
 pub mod ffi;
 pub mod input;
 pub mod metal;

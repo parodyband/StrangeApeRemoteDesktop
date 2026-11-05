@@ -22,13 +22,3 @@ pub fn open_audio_source(
 ) -> sard_core::media::Result<Box<dyn sard_core::media::AudioSource>> {
     Err(sard_core::media::err("audio capture is not implemented on macOS yet"))
 }
-
-#[cfg(target_os = "macos")]
-pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
-    None
-}
-
-#[cfg(target_os = "macos")]
-pub fn open_audio_sink() -> sard_core::media::Result<Box<dyn sard_core::media::AudioSink>> {
-    Err(sard_core::media::err("audio playback is not implemented on macOS yet"))
-}

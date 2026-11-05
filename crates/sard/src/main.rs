@@ -50,6 +50,7 @@ CLIENT OPTIONS:
   --headless             No window: decode only and log stats (testing)
   --duration <secs>      Exit after this long (with --headless)
   --snapshot <file.png>  Save a decoded frame (with --headless)
+  --audio                Also play audio (with --headless)
   --no-swap-modifiers    Don't map Cmd⇄Ctrl between macOS and Linux
   --max-datagram <n>     UDP payload size (default 1400; use ~1200 over VPNs)
 

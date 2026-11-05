@@ -639,16 +639,40 @@ fn run_headless(
         max_height: args.parse_value("max-height")?.unwrap_or(2160),
         max_fps: args.parse_value("fps")?.unwrap_or(60),
         bitrate_kbps: args.parse_value::<f32>("bitrate")?.map_or(0, |m| (m * 1000.0) as u32),
-        flags: client_flags::LOCAL_CURSOR,
+        flags: client_flags::LOCAL_CURSOR | if args.flag("audio") { client_flags::AUDIO } else { 0 },
         display: args.parse_value("display")?.unwrap_or(0),
     };
     conn.send_control(&Control::ClientHello(hello));
     let stop = Arc::new(AtomicBool::new(false));
+    let dry = std::env::var_os("SARD_AUDIO_DRY").is_some();
     {
         let stop = Arc::clone(&stop);
         std::thread::Builder::new().name("sard-events".into()).spawn(move || {
+            let mut audio: Option<Box<dyn sard_core::media::AudioSink>> = None;
+            let (mut packets, mut gaps, mut last_seq) = (0u64, 0u64, None::<u32>);
             for ev in events {
                 match ev {
+                    Event::Control(Control::AudioConfig { sample_rate, channels }) if !dry => {
+                        match platform::open_audio_sink() {
+                            Ok(s) => {
+                                info!("audio: {sample_rate} Hz x{channels} → {}", s.describe());
+                                audio = Some(s);
+                            }
+                            Err(e) => warn!("audio playback unavailable: {e}"),
+                        }
+                    }
+                    Event::Audio(bytes) => {
+                        if let Ok(p) = AudioPacket::decode(&bytes) {
+                            packets += 1;
+                            if last_seq.is_some_and(|l| p.seq != l.wrapping_add(1)) {
+                                gaps += 1;
+                            }
+                            last_seq = Some(p.seq);
+                            if let Some(a) = &audio {
+                                a.push(p.seq, &p.samples);
+                            }
+                        }
+                    }
                     Event::Control(Control::StreamConfig(s)) => {
                         info!(
                             "stream: {} {}x{} @ {} fps from {}",
@@ -666,6 +690,9 @@ fn run_headless(
                     }
                     _ => {}
                 }
+            }
+            if packets > 0 {
+                info!("audio: {packets} packets received, {gaps} gaps");
             }
             stop.store(true, Ordering::Relaxed);
         })?;

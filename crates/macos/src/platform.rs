@@ -31,6 +31,16 @@ pub fn create_video_sink(
 }
 
 /// Decode-only client sink (`sard connect --headless`).
+/// The system text clipboard (NSPasteboard).
+pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
+    Some(Box::new(crate::clipboard::MacClipboard::new()))
+}
+
+/// Play remote audio through the default output device.
+pub fn open_audio_sink() -> media::Result<Box<dyn sard_core::media::AudioSink>> {
+    Ok(Box::new(crate::audio::MacAudioSink::new()?))
+}
+
 pub fn create_headless_sink() -> media::Result<Box<dyn VideoSink>> {
     Ok(Box::new(HeadlessSink::default()))
 }
