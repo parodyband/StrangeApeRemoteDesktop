@@ -6,7 +6,7 @@
 //!   ─▶ R8 NV12 texture ─▶ CUDA (GL interop, GPU copy) ─▶ NVENC input ─▶ bitstream
 //! ```
 
-use crate::gl::egl::{EglContext, Target};
+use crate::gl::egl::{EGLImage, EglContext, Target, fourcc};
 use crate::gl::{self, FULLSCREEN_VS, Gl};
 use crate::nv::cuda::{CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY, CUgraphicsResource, Cuda, Mem};
 use crate::nv::nvenc::{EncoderParams, NvEncoder};
@@ -47,7 +47,24 @@ void main() {
 
 const TOKEN_FILE: &str = "portal_restore_token";
 
+/// A PipeWire DMA-BUF imported as a GL texture (cached per buffer).
+struct DmaTex {
+    key: (i32, u32, u32, u32, u32),
+    image: EGLImage,
+    tex: u32,
+}
+
+#[derive(Default)]
+struct Timing {
+    n: u32,
+    wait_us: u64,
+    import_us: u64,
+    convert_us: u64,
+    encode_us: u64,
+}
+
 struct Csc {
+    dma: Vec<DmaTex>,
     gl: Gl,
     program: u32,
     vao: u32,
@@ -74,6 +91,7 @@ pub struct PortalSource {
     force_key: bool,
     gl_current: bool,
     frames: u64,
+    timing: Timing,
 }
 
 // SAFETY: the source is created on the host thread and then used (and the GL
@@ -112,7 +130,16 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
         if session.remote_input { Box::new(PortalSink { input: session.input() }) } else { Box::new(NullSink) };
     let fd = session.open_pipewire_remote()?;
     let node = session.streams[0].node_id;
-    let capture = Capture::connect(fd, node, opts.fps, Vec::new())?;
+    let egl = EglContext::new(Target::Headless, 0, 0)?;
+    let modifiers = if std::env::var_os("SARD_NO_DMABUF").is_some() {
+        Vec::new()
+    } else {
+        let a = egl.dmabuf_modifiers(fourcc::XRGB8888);
+        let b = egl.dmabuf_modifiers(fourcc::ARGB8888);
+        a.into_iter().filter(|m| b.contains(m)).collect::<Vec<_>>()
+    };
+    debug!("offering {} DMA-BUF modifiers", modifiers.len());
+    let capture = Capture::connect(fd, node, opts.fps, modifiers)?;
     let format = capture.wait_format(Duration::from_secs(10))?;
     info!(
         "pipewire {}: {}x{} format {} ({})",
@@ -124,7 +151,6 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
     );
     let stream_size = (format.width, format.height);
     let out_size = fit(format.width, format.height, opts.max_width, opts.max_height);
-    let egl = EglContext::new(Target::Headless, 0, 0)?;
     let cuda = Cuda::new()?;
     let enc = NvEncoder::new(
         Arc::clone(&cuda),
@@ -153,6 +179,7 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
         force_key: true,
         gl_current: false,
         frames: 0,
+        timing: Timing::default(),
     };
     Ok((Box::new(src), input))
 }
@@ -199,7 +226,7 @@ impl PortalSource {
         };
         self.cuda.check(rc, "cuGraphicsGLRegisterImage")?;
         info!("capture pipeline: {} → {}x{} NV12 on {}", gl.string(gl::RENDERER), w, h, self.cuda.device_name);
-        self.csc = Some(Csc { gl, program, vao, u_size, src: 0, src_size: (0, 0), dst, fbo, dst_res });
+        self.csc = Some(Csc { dma: Vec::new(), gl, program, vao, u_size, src: 0, src_size: (0, 0), dst, fbo, dst_res });
         Ok(())
     }
 
@@ -231,7 +258,51 @@ impl PortalSource {
     }
 
     /// Run the CSC pass and copy the NV12 result into an NVENC input buffer.
-    fn convert(&mut self) -> media::Result<usize> {
+    /// Import (or reuse) a DMA-BUF as a GL texture.
+    fn import(&mut self, fd: i32, offset: u32, stride: u32, f: VideoFormat) -> media::Result<u32> {
+        let key = (fd, offset, stride, f.width, f.height);
+        let c = self.csc.as_mut().unwrap();
+        if let Some(d) = c.dma.iter().find(|d| d.key == key) {
+            return Ok(d.tex);
+        }
+        let fcc = if f.format == crate::pw::layout::VIDEO_FORMAT_BGRA { fourcc::ARGB8888 } else { fourcc::XRGB8888 };
+        let image = self.egl.import_dmabuf(f.width, f.height, fcc, fd, offset, stride, f.modifier.unwrap_or(0))?;
+        let gl = &c.gl;
+        let mut tex = 0;
+        // SAFETY: context current; image valid.
+        unsafe {
+            (gl.glGenTextures)(1, &mut tex);
+            (gl.glBindTexture)(gl::TEXTURE_2D, tex);
+            (gl.glTexParameteri)(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+            (gl.glTexParameteri)(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR);
+            (gl.glTexParameteri)(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE);
+            (gl.glTexParameteri)(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE);
+            (gl.glEGLImageTargetTexture2DOES)(gl::TEXTURE_2D, image);
+            if (gl.glGetError)() != 0 {
+                (gl.glDeleteTextures)(1, &tex);
+                self.egl.destroy_image(image);
+                return Err(media::err("glEGLImageTargetTexture2DOES failed"));
+            }
+        }
+        if c.dma.len() >= 16 {
+            self.drop_dma_cache();
+        }
+        let c = self.csc.as_mut().unwrap();
+        c.dma.push(DmaTex { key, image, tex });
+        debug!("imported dma-buf fd {fd} ({}x{}, modifier {:#x})", f.width, f.height, f.modifier.unwrap_or(0));
+        Ok(tex)
+    }
+
+    fn drop_dma_cache(&mut self) {
+        let Some(c) = self.csc.as_mut() else { return };
+        for d in c.dma.drain(..) {
+            // SAFETY: objects created by import().
+            unsafe { (c.gl.glDeleteTextures)(1, &d.tex) };
+            self.egl.destroy_image(d.image);
+        }
+    }
+
+    fn convert(&mut self, src_tex: u32) -> media::Result<usize> {
         let (w, h) = self.out_size;
         let c = self.csc.as_mut().unwrap();
         let gl = &c.gl;
@@ -242,7 +313,7 @@ impl PortalSource {
             (gl.glUseProgram)(c.program);
             (gl.glUniform2f)(c.u_size, w as f32, h as f32);
             (gl.glActiveTexture)(gl::TEXTURE0);
-            (gl.glBindTexture)(gl::TEXTURE_2D, c.src);
+            (gl.glBindTexture)(gl::TEXTURE_2D, src_tex);
             (gl.glBindVertexArray)(c.vao);
             (gl.glDrawArrays)(gl::TRIANGLE_STRIP, 0, 4);
             (gl.glFlush)();
@@ -272,6 +343,26 @@ impl PortalSource {
             r?;
         }
         Ok(idx)
+    }
+
+    fn account(&mut self, wait_us: u64, t0: std::time::Instant, t1: std::time::Instant, t2: std::time::Instant) {
+        let t = &mut self.timing;
+        t.n += 1;
+        t.wait_us += wait_us;
+        t.import_us += (t1 - t0).as_micros() as u64;
+        t.convert_us += (t2 - t1).as_micros() as u64;
+        t.encode_us += t2.elapsed().as_micros() as u64;
+        if t.n == 300 {
+            let n = t.n as f64 * 1000.0;
+            debug!(
+                "capture stages (avg ms): compositor→us {:.2} | upload/import {:.2} | convert {:.2} | encode {:.2}",
+                t.wait_us as f64 / n,
+                t.import_us as f64 / n,
+                t.convert_us as f64 / n,
+                t.encode_us as f64 / n
+            );
+            *t = Timing::default();
+        }
     }
 
     fn encode(&mut self, idx: usize, capture_us: u64) -> media::Result<EncodedFrame> {
@@ -307,14 +398,43 @@ impl VideoSource for PortalSource {
             debug!("stream resized to {}x{}", frame.format.width, frame.format.height);
             self.stream_size = (frame.format.width, frame.format.height);
         }
-        let r = match frame.data {
-            FrameData::Mem { ptr, stride, len } => self.upload(ptr, stride, len, frame.format),
-            FrameData::DmaBuf { .. } => Err(media::err("DMA-BUF frames are not supported yet")),
+        let t0 = std::time::Instant::now();
+        let src_tex = match frame.data {
+            FrameData::Mem { ptr, stride, len } => {
+                let r = self.upload(ptr, stride, len, frame.format);
+                // glTexSubImage2D has copied the pixels; give the buffer back now.
+                self.capture.release(frame);
+                r?;
+                self.csc.as_ref().unwrap().src
+            }
+            FrameData::DmaBuf { fd, offset, stride } => match self.import(fd, offset, stride, frame.format) {
+                Ok(t) => {
+                    let t1 = std::time::Instant::now();
+                    // The CUDA map in convert() waits for the GL read of the buffer.
+                    let idx = self.convert(t);
+                    self.capture.release(frame);
+                    let idx = idx?;
+                    let t2 = std::time::Instant::now();
+                    let out = self.encode(idx, capture_us)?;
+                    self.account(now.saturating_sub(capture_us), t0, t1, t2);
+                    return Ok(Some(out));
+                }
+                Err(e) => {
+                    warn!("DMA-BUF import failed ({e}); falling back to shared memory");
+                    self.capture.release(frame);
+                    self.drop_dma_cache();
+                    self.capture.fall_back_to_shm();
+                    self.force_key = true;
+                    return Ok(None);
+                }
+            },
         };
-        self.capture.release(frame);
-        r?;
-        let idx = self.convert()?;
-        self.encode(idx, capture_us).map(Some)
+        let t1 = std::time::Instant::now();
+        let idx = self.convert(src_tex)?;
+        let t2 = std::time::Instant::now();
+        let out = self.encode(idx, capture_us)?;
+        self.account(now.saturating_sub(capture_us), t0, t1, t2);
+        Ok(Some(out))
     }
 
     fn request_keyframe(&mut self) {
@@ -376,6 +496,7 @@ impl VideoSource for PortalSource {
 
 impl Drop for PortalSource {
     fn drop(&mut self) {
+        self.drop_dma_cache();
         if let Some(c) = self.csc.take() {
             let _g = self.cuda.push();
             // SAFETY: resources created by us; context current on this thread.

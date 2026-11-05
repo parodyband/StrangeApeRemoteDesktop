@@ -137,17 +137,19 @@ unsafe fn rd_ptr(p: *const u8, off: usize) -> *mut u8 {
 }
 
 fn enum_formats(fps: u32, modifiers: &[u64]) -> Vec<Vec<u8>> {
-    let formats = [L::VIDEO_FORMAT_BGRX, L::VIDEO_FORMAT_BGRA, L::VIDEO_FORMAT_RGBX, L::VIDEO_FORMAT_RGBA];
+    let shm_formats = [L::VIDEO_FORMAT_BGRX, L::VIDEO_FORMAT_BGRA, L::VIDEO_FORMAT_RGBX, L::VIDEO_FORMAT_RGBA];
+    // DMA-BUF: only the formats whose modifiers the caller queried (XR24/AR24).
+    let dma_formats = [L::VIDEO_FORMAT_BGRX, L::VIDEO_FORMAT_BGRA];
     let fmt_choice = |list: &[u32]| {
         let mut e = vec![u32s(list[0])];
         e.extend(list.iter().map(|f| u32s(*f)));
         choice(L::CHOICE_ENUM, L::T_ID, &e)
     };
-    let common = |extra: Vec<Vec<u8>>| {
+    let common = |formats: &[u32], extra: Vec<Vec<u8>>| {
         let mut p = vec![
             prop(L::FORMAT_MEDIA_TYPE, 0, id(L::MEDIA_TYPE_VIDEO)),
             prop(L::FORMAT_MEDIA_SUBTYPE, 0, id(L::MEDIA_SUBTYPE_RAW)),
-            prop(L::FORMAT_VIDEO_FORMAT, 0, fmt_choice(&formats)),
+            prop(L::FORMAT_VIDEO_FORMAT, 0, fmt_choice(formats)),
             prop(
                 L::FORMAT_VIDEO_SIZE,
                 0,
@@ -167,13 +169,16 @@ fn enum_formats(fps: u32, modifiers: &[u64]) -> Vec<Vec<u8>> {
     if !modifiers.is_empty() {
         let mut e = vec![pod::i64s(modifiers[0] as i64)];
         e.extend(modifiers.iter().map(|m| pod::i64s(*m as i64)));
-        out.push(common(vec![prop(
-            L::FORMAT_VIDEO_MODIFIER,
-            L::PROP_FLAG_MANDATORY | L::PROP_FLAG_DONT_FIXATE,
-            choice(L::CHOICE_ENUM, L::T_LONG, &e),
-        )]));
+        out.push(common(
+            &dma_formats,
+            vec![prop(
+                L::FORMAT_VIDEO_MODIFIER,
+                L::PROP_FLAG_MANDATORY | L::PROP_FLAG_DONT_FIXATE,
+                choice(L::CHOICE_ENUM, L::T_LONG, &e),
+            )],
+        ));
     }
-    out.push(common(vec![]));
+    out.push(common(&shm_formats, vec![]));
     out
 }
 
@@ -571,6 +576,27 @@ impl Capture {
         let out = c.clone();
         c.shape = None;
         Some(out)
+    }
+
+    /// Drop DMA-BUF from the offered formats and renegotiate (import failed).
+    pub fn fall_back_to_shm(&self) {
+        let params: Vec<Pod> = enum_formats(self.inner.fps, &[]).iter().map(|b| Pod::from_bytes(b)).collect();
+        let mut ptrs: Vec<*const c_void> = params.iter().map(Pod::as_ptr).collect();
+        let api = self.inner.api;
+        *self.inner.format.lock().unwrap() = None;
+        // SAFETY: update_params from a foreign thread with the loop locked.
+        unsafe {
+            (api.pw_thread_loop_lock)(self.thread_loop);
+            if let Some((b, _)) = self.inner.slot.lock().unwrap().take() {
+                (api.pw_stream_queue_buffer)(self.inner.stream.load(Ordering::Relaxed), b as *mut c_void);
+            }
+            (api.pw_stream_update_params)(
+                self.inner.stream.load(Ordering::Relaxed),
+                ptrs.as_mut_ptr(),
+                ptrs.len() as u32,
+            );
+            (api.pw_thread_loop_unlock)(self.thread_loop);
+        }
     }
 
     pub fn is_streaming(&self) -> bool {
