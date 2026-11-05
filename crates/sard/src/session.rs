@@ -127,6 +127,7 @@ impl Session {
         if opts.fullscreen {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         }
+        window.focus_window();
         let size = window.inner_size();
         let win_size = Arc::new(AtomicU64::new(pack(size.width, size.height)));
         let sink = platform::create_video_sink(

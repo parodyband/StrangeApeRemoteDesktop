@@ -31,6 +31,13 @@ fn tray_icons() -> TrayIcons {
     }
 }
 
+/// Show a message without blocking the event loop (macOS dialogs are modal
+/// `osascript` runs that only return when dismissed).
+fn notify(title: &str, message: &str) {
+    let (t, m) = (title.to_string(), message.to_string());
+    std::thread::spawn(move || platform::show_message(&t, &m));
+}
+
 /// `settings.txt`: `key=value` lines.
 struct Settings {
     share: bool,
@@ -387,7 +394,7 @@ impl App {
         let (host, addr) = match client::resolve(&target) {
             Ok(x) => x,
             Err(e) => {
-                platform::show_message("Sard", &e.to_string());
+                notify("Sard", &e.to_string());
                 return;
             }
         };
@@ -495,15 +502,12 @@ impl App {
                 if let Some(h) = &self.host {
                     h.disconnect_viewer();
                 }
-                platform::show_message(
-                    "Sard",
-                    "The next time someone connects, this computer will ask which screens to share.",
-                );
+                notify("Sard", "The next time someone connects, this computer will ask which screens to share.");
             }
             Action::ToggleLogin => {
                 let on = !platform::launch_at_login();
                 if let Err(e) = platform::set_launch_at_login(on) {
-                    platform::show_message("Sard", &format!("Could not change Start at Login: {e}"));
+                    notify("Sard", &format!("Could not change Start at Login: {e}"));
                 }
                 self.refresh();
             }
@@ -520,7 +524,7 @@ impl App {
         let Some(st) = self.host_status() else { return };
         let Some((code, _)) = st.pairing else { return };
         let addr = st.ips.first().cloned().unwrap_or_else(|| st.name.clone());
-        platform::show_message(
+        notify(
             "Pair a new device",
             &format!(
                 "On the other computer, open Sard → Connect To → Pair with a New Computer…\n\n\
@@ -535,7 +539,7 @@ impl App {
             let s = self.sessions.remove(i);
             info!("session with {} closed: {reason}", s.label);
             if reason.starts_with("Disconnected:") {
-                platform::show_message("Sard", &format!("{}: {}", s.label, reason));
+                notify("Sard", &format!("{}: {}", s.label, reason));
             }
         }
         self.refresh();
@@ -560,7 +564,7 @@ impl ApplicationHandler<AppEvent> for App {
                     Ok(Some(target)) => self.connect(target),
                     Ok(None) => self.refresh(),
                     Err(e) => {
-                        platform::show_message("Pairing failed", &e);
+                        notify("Pairing failed", &e);
                         self.refresh();
                     }
                 }
@@ -576,10 +580,10 @@ impl ApplicationHandler<AppEvent> for App {
                                 s.focus();
                                 self.sessions.push(s);
                             }
-                            Err(e) => platform::show_message("Sard", &format!("Cannot open a window for {label}: {e}")),
+                            Err(e) => notify("Sard", &format!("Cannot open a window for {label}: {e}")),
                         }
                     }
-                    Err(e) => platform::show_message("Sard", &format!("Could not connect to {label}: {e}")),
+                    Err(e) => notify("Sard", &format!("Could not connect to {label}: {e}")),
                 }
                 self.refresh();
             }

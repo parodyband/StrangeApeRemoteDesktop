@@ -142,6 +142,9 @@ pub fn event_loop() -> Result<winit::event_loop::EventLoop<session::AppEvent>> {
         use winit::platform::macos::EventLoopBuilderExtMacOS;
         // No default menu: Cmd+Q etc. must reach the remote machine.
         builder.with_default_menu(false);
+        // Don't jump to the front at launch (login item, menu bar app);
+        // viewer windows take focus explicitly when opened.
+        builder.with_activate_ignoring_other_apps(false);
     }
     Ok(builder.build()?)
 }
