@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/linux", "crates/macos", "crates/sard"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+sard-core = { path = "crates/core" }
+sard-linux = { path = "crates/linux" }
+sard-macos = { path = "crates/macos" }
+libc = "0.2"
+
+# Fast incremental dev builds: our code lightly optimized, dependencies fully optimized
+# (crypto + FEC must be fast even in dev builds so latency tests are meaningful).
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
