@@ -104,6 +104,10 @@ pub fn run(args: &Args) -> Result<()> {
         started: false,
         pairing_busy: false,
         next_refresh: None,
+        update: None,
+        update_busy: false,
+        // First check shortly after start, then twice a day.
+        next_update_check: Instant::now() + Duration::from_secs(15),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -123,8 +127,12 @@ enum Action {
     KickViewer,
     ChooseScreens,
     ToggleLogin,
+    CheckUpdates,
+    InstallUpdate,
     Quit,
 }
+
+const UPDATE_INTERVAL: Duration = Duration::from_secs(12 * 3600);
 
 struct App {
     args: Args,
@@ -144,6 +152,10 @@ struct App {
     pairing_busy: bool,
     /// Re-render the menu then (pairing-code countdown).
     next_refresh: Option<Instant>,
+    /// A newer release, once a check found one.
+    update: Option<crate::update::UpdateInfo>,
+    update_busy: bool,
+    next_update_check: Instant,
 }
 
 /// (session id, label, [(display id, name)], current display)
@@ -354,6 +366,17 @@ impl App {
         m.push(MenuEntry::Separator);
         let login = self.check("Start at Login", platform::launch_at_login(), Action::ToggleLogin);
         m.push(login);
+        let upd = match (&self.update, self.update_busy) {
+            (_, true) => {
+                MenuEntry::Item { id: 0, label: "Checking for Updates…".into(), enabled: false, checked: None }
+            }
+            (Some(u), false) => {
+                let label = format!("Install Sard {} and Restart", u.version);
+                self.item(label, Action::InstallUpdate)
+            }
+            (None, false) => self.item("Check for Updates…", Action::CheckUpdates),
+        };
+        m.push(upd);
         m.push(Self::text(format!("Sard {}", env!("CARGO_PKG_VERSION"))));
         let quit = self.item("Quit Sard", Action::Quit);
         m.push(quit);
@@ -511,6 +534,8 @@ impl App {
                 }
                 self.refresh();
             }
+            Action::CheckUpdates => self.check_updates(true),
+            Action::InstallUpdate => self.install_update(),
             Action::Quit => {
                 self.sessions.clear();
                 self.host = None;
@@ -518,6 +543,41 @@ impl App {
                 el.exit();
             }
         }
+    }
+
+    fn check_updates(&mut self, manual: bool) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = manual; // quiet background checks don't change the menu
+        self.next_update_check = Instant::now() + UPDATE_INTERVAL;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = crate::update::check().map_err(|e| e.to_string());
+            let _ = proxy.send_event(AppEvent::UpdateChecked { manual, result });
+        });
+        if manual {
+            self.refresh();
+        }
+    }
+
+    fn install_update(&mut self) {
+        let Some(info) = self.update.clone() else { return };
+        if let Err(e) = crate::update::install_target() {
+            notify(
+                "Sard update",
+                &format!("Sard {} is available, but this copy can't update itself: {e}", info.version),
+            );
+            return;
+        }
+        self.update_busy = true;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            info!("installing Sard {}", info.version);
+            let r = crate::update::install(&info).map_err(|e| e.to_string());
+            let _ = proxy.send_event(AppEvent::UpdateInstalled(r));
+        });
+        self.refresh();
     }
 
     fn show_pairing(&self) {
@@ -558,6 +618,48 @@ impl ApplicationHandler<AppEvent> for App {
         match ev {
             AppEvent::Menu(id) => self.on_menu(el, id),
             AppEvent::HostChanged | AppEvent::Refresh => self.refresh(),
+            AppEvent::UpdateChecked { manual, result } => {
+                self.update_busy = false;
+                match result {
+                    Ok(Some(u)) => {
+                        info!("update available: Sard {}", u.version);
+                        if manual {
+                            notify(
+                                "Sard update",
+                                &format!(
+                                    "Sard {} is available. Choose “Install Sard {} and Restart” in the menu.",
+                                    u.version, u.version
+                                ),
+                            );
+                        }
+                        self.update = Some(u);
+                    }
+                    Ok(None) if manual => notify("Sard", &format!("Sard {} is up to date.", env!("CARGO_PKG_VERSION"))),
+                    Ok(None) => {}
+                    Err(e) if manual => {
+                        warn!("update check failed: {e}");
+                        notify("Sard update", &format!("Could not check for updates: {e}"))
+                    }
+                    Err(e) => warn!("update check failed: {e}"),
+                }
+                self.refresh();
+            }
+            AppEvent::UpdateInstalled(r) => {
+                self.update_busy = false;
+                match r {
+                    Ok(()) => {
+                        info!("update installed; restarting");
+                        self.sessions.clear();
+                        self.host = None;
+                        self.tray = None;
+                        crate::update::restart();
+                    }
+                    Err(e) => {
+                        notify("Sard update", &format!("The update could not be installed: {e}"));
+                        self.refresh();
+                    }
+                }
+            }
             AppEvent::Paired(r) => {
                 self.pairing_busy = false;
                 match r {
@@ -616,13 +718,17 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         use winit::event_loop::ControlFlow;
+        if !self.started {
+            return;
+        }
         match self.next_refresh {
             Some(t) if Instant::now() >= t => self.refresh(),
             _ => {}
         }
-        el.set_control_flow(match self.next_refresh {
-            Some(t) => ControlFlow::WaitUntil(t),
-            None => ControlFlow::Wait,
-        });
+        if Instant::now() >= self.next_update_check {
+            self.check_updates(false);
+        }
+        let wake = self.next_refresh.map_or(self.next_update_check, |t| t.min(self.next_update_check));
+        el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }

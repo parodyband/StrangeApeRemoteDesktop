@@ -98,7 +98,6 @@ pub fn platform() -> Option<&'static str> {
 }
 
 /// Fetch and verify the latest release manifest. `Ok(None)` when this build is up to date.
-#[allow(dead_code, reason = "API for the tray app")]
 pub fn check() -> Result<Option<UpdateInfo>> {
     let platform = platform().ok_or("automatic updates are not published for this platform")?;
     select(&fetch_manifest()?, VERSION, platform)
@@ -159,7 +158,6 @@ pub fn install_target() -> Result<PathBuf> {
 
 /// Replace this process with the (newly installed) version, keeping the command line. macOS relaunches the
 /// bundle through LaunchServices (`open -n`) so permissions stay attributed to Sard.app.
-#[allow(dead_code, reason = "API for the tray app")]
 pub fn restart() -> ! {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let target = install_target().or_else(|_| current_exe());

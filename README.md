@@ -27,13 +27,13 @@ Download the latest release from
 [Releases](https://github.com/parodyband/StrangeApeRemoteDesktop/releases/latest).
 Sard checks for updates itself (menu → *Check for Updates…*).
 
-**macOS** (Apple Silicon, macOS 13+): unzip `Sard-macos.zip`, move **Sard.app** to
-Applications and open it. Sard lives in the menu bar.
+**macOS** (Apple Silicon, macOS 13+): unzip `sard-<version>-macos-arm64.zip`, move
+**Sard.app** to Applications and open it. Sard lives in the menu bar.
 
 **Linux** (NVIDIA GPU, PipeWire, KDE Plasma or GNOME on Wayland or X11):
 
 ```sh
-tar xf sard-linux-x86_64.tar.gz && cd sard-* && ./install.sh   # installs to ~/.local
+tar xf sard-*-linux-x86_64.tar.gz && cd sard-*-linux-x86_64 && ./install.sh   # installs to ~/.local
 ```
 
 Then start **Sard** from your app launcher. It lives in the system tray.

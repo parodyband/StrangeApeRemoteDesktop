@@ -48,8 +48,12 @@ pub enum AppEvent {
     Paired(std::result::Result<Option<String>, String>),
     /// Host service state changed (viewer connected, sharing toggled, ...).
     HostChanged,
-    /// Re-render the tray menu (e.g. an update check finished).
+    /// Re-render the tray menu.
     Refresh,
+    /// An update check finished (`manual`: the user asked, so report "up to date" too).
+    UpdateChecked { manual: bool, result: std::result::Result<Option<crate::update::UpdateInfo>, String> },
+    /// Downloading and installing an update finished.
+    UpdateInstalled(std::result::Result<(), String>),
 }
 
 #[derive(Clone, Debug, Default)]

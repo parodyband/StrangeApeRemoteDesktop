@@ -83,7 +83,7 @@ if [ -f "$desktop" ]; then
         *) exe=$bindir/sard ;;
     esac
     mkdir -p "$datadir/applications"
-    sed -e "s|^Exec=sard\$|Exec=$exe|" -e "s|^TryExec=sard\$|TryExec=$exe|" "$desktop" > "$datadir/applications/sard.desktop.tmp.$$"
+    sed -e "s|^Exec=sard app\$|Exec=$exe app|" -e "s|^TryExec=sard\$|TryExec=$exe|" "$desktop" > "$datadir/applications/sard.desktop.tmp.$$"
     chmod 644 "$datadir/applications/sard.desktop.tmp.$$"
     mv -f "$datadir/applications/sard.desktop.tmp.$$" "$datadir/applications/sard.desktop"
 fi
