@@ -187,8 +187,8 @@ open -n dist/Sard.app --stdout /tmp/sard.log --stderr /tmp/sard.log --args conne
 ```
 
 `--display <n>` picks the display to share (0 = main display, then the others).
-The cursor is drawn into the video by ScreenCaptureKit. Audio and clipboard are
-not implemented on macOS yet.
+The cursor is drawn into the video by ScreenCaptureKit. Clipboard sync and audio
+playback work on macOS; capturing the Mac's own audio (Mac as host) is not done yet.
 
 ## Roadmap
 

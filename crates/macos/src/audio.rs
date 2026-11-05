@@ -52,8 +52,10 @@ struct AURenderCallbackStruct {
     input_proc_ref_con: *mut c_void,
 }
 
-#[link(name = "AudioToolbox", kind = "framework")]
 #[link(name = "CoreAudio", kind = "framework")]
+unsafe extern "C" {}
+
+#[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
     fn AudioComponentFindNext(component: *mut c_void, desc: *const AudioComponentDescription) -> *mut c_void;
     fn AudioComponentInstanceNew(component: *mut c_void, out: *mut AudioUnit) -> OSStatus;
