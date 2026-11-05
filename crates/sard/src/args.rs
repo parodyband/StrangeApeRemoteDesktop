@@ -18,6 +18,7 @@ const BOOL_FLAGS: &[&str] = &[
 /// Flags whose value is optional (`--test-pattern` or `--test-pattern 1920x1080`).
 const OPTIONAL_VALUE: &[&str] = &["test-pattern"];
 
+#[derive(Clone)]
 pub struct Args {
     positional: Vec<String>,
     flags: HashMap<String, Option<String>>,

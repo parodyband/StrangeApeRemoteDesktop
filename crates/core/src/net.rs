@@ -932,10 +932,12 @@ impl Shared {
             let mut sessions = lock(&self.sessions);
             let old: Vec<u32> = sessions.iter().filter(|(_, c)| c.remote_static == rs).map(|(k, _)| *k).collect();
             for k in old {
-                if let Some(c) = sessions.remove(&k)
-                    && !c.closed.swap(true, Ordering::Relaxed)
-                {
-                    let _ = c.events_tx.send(Event::Disconnected("replaced by new connection".into()));
+                if let Some(c) = sessions.remove(&k) {
+                    // Tell the old endpoint (if it is still alive) before dropping it.
+                    c.send_payload(&[msg::DISCONNECT]);
+                    if !c.closed.swap(true, Ordering::Relaxed) {
+                        let _ = c.events_tx.send(Event::Disconnected("replaced by new connection".into()));
+                    }
                 }
             }
         }
