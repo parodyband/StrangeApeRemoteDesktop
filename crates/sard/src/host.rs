@@ -213,6 +213,14 @@ struct Shared {
     stop: AtomicBool,
     keyframe: AtomicBool,
     bitrate_kbps: AtomicU32,
+    /// Display the client asked for (applied by the video thread).
+    select_display: Mutex<Option<u32>>,
+}
+
+fn displays_msg(source: &dyn VideoSource) -> Option<Control> {
+    let list = source.displays();
+    let current = source.current_display()?;
+    (!list.is_empty()).then_some(Control::Displays { current, list })
 }
 
 fn serve(conn: &Connection, args: &Args) -> Result<()> {
@@ -254,6 +262,9 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
         })
     };
     conn.send_control(&stream_cfg(w, h, ceiling));
+    if let Some(d) = displays_msg(source.as_ref()) {
+        conn.send_control(&d);
+    }
 
     // Audio: uncompressed PCM in 5 ms packets, straight from the capture callback.
     let _audio = if hello.flags & client_flags::AUDIO != 0 && !args.flag("no-audio") {
@@ -290,6 +301,7 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
         stop: AtomicBool::new(false),
         keyframe: AtomicBool::new(true),
         bitrate_kbps: AtomicU32::new(ceiling),
+        select_display: Mutex::new(None),
     });
     let input_thread = {
         let shared = Arc::clone(&shared);
@@ -320,6 +332,20 @@ fn video_loop(
     let mut frames = 0u32;
     let mut last_log = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) && !conn.is_closed() {
+        if let Some(id) = shared.select_display.lock().unwrap().take() {
+            match source.select_display(id) {
+                Ok(()) => {
+                    // A new display may have a new size; the client resets on StreamConfig.
+                    let (w, h) = source.size();
+                    size = (w, h);
+                    conn.send_control(&stream_cfg(w, h, current_kbps));
+                    if let Some(d) = displays_msg(source) {
+                        conn.send_control(&d);
+                    }
+                }
+                Err(e) => conn.send_control(&Control::Status { text: format!("cannot switch display: {e}") }),
+            }
+        }
         if shared.keyframe.swap(false, Ordering::Relaxed) {
             source.request_keyframe();
         }
@@ -512,6 +538,9 @@ fn input_loop(
                 Control::Scroll { dx, dy, discrete } => inject(&mut input, InputEvent::Scroll { dx, dy, discrete }),
                 Control::MouseRel { dx, dy } => inject(&mut input, InputEvent::MoveRel { dx, dy }),
                 Control::ReleaseAll => release_all(&mut pressed, &mut input),
+                Control::SelectDisplay { id } => {
+                    *shared.select_display.lock().unwrap() = Some(id);
+                }
                 Control::SetBitrate { kbps } => {
                     rc.ceiling = if kbps == 0 { ceiling } else { kbps };
                     rc.current = rc.ceiling;
