@@ -13,6 +13,7 @@ const BOOL_FLAGS: &[&str] = &[
     "input-test",
     "view-only",
     "reselect",
+    "headless",
 ];
 /// Flags whose value is optional (`--test-pattern` or `--test-pattern 1920x1080`).
 const OPTIONAL_VALUE: &[&str] = &["test-pattern"];

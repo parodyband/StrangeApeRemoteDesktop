@@ -173,6 +173,10 @@ pub trait VideoSink: Send {
     fn redraw(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Save the next decoded frame as a PNG (diagnostics; optional).
+    fn snapshot_next(&mut self, _path: &std::path::Path) -> Result<()> {
+        Err(err("snapshots are not supported by this video output"))
+    }
     fn describe(&self) -> String {
         String::new()
     }

@@ -24,6 +24,11 @@ pub fn open_audio_source(
 }
 
 #[cfg(target_os = "macos")]
+pub fn create_headless_sink() -> sard_core::media::Result<Box<dyn sard_core::media::VideoSink>> {
+    Err(sard_core::media::err("--headless is not implemented on macOS yet"))
+}
+
+#[cfg(target_os = "macos")]
 pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
     None
 }

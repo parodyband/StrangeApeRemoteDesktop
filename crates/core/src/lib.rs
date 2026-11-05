@@ -14,6 +14,7 @@ pub mod input;
 pub mod log;
 pub mod media;
 pub mod net;
+pub mod png;
 pub mod proto;
 pub mod rand;
 pub mod reliable;

@@ -30,6 +30,11 @@ pub fn create_video_sink(
     Ok(Box::new(GlVideoSink::new(display, window, width, height)?))
 }
 
+/// Decode-only video output without a window (tests/benchmarks).
+pub fn create_headless_sink() -> media::Result<Box<dyn VideoSink>> {
+    Ok(Box::new(crate::headless::HeadlessSink::new()?))
+}
+
 /// Capture what this machine is playing (host side).
 pub fn open_audio_source(cb: AudioCallback) -> media::Result<Box<dyn AudioSource>> {
     crate::pw::audio::open_source(cb)
