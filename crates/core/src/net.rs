@@ -153,9 +153,19 @@ struct ConnState {
     rx_bytes_window: u64,
 }
 
-struct Conn {
+/// Where a session's packets go. On macOS each host session gets its own
+/// `connect()`ed socket: Darwin runs a costly per-datagram policy check
+/// (Local Network privacy / NECP) on *unconnected* UDP sockets, which caps
+/// throughput at a few thousand packets/s and builds 100+ ms queues.
+struct ConnIo {
     socket: Arc<UdpSocket>,
-    peer: Mutex<SocketAddr>,
+    peer: SocketAddr,
+    /// `socket` is connected to `peer`: use send(), not send_to().
+    connected: bool,
+}
+
+struct Conn {
+    io: Mutex<ConnIo>,
     local_index: u32,
     remote_index: u32,
     remote_static: [u8; 32],
@@ -188,8 +198,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Conn {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        socket: Arc<UdpSocket>,
-        peer: SocketAddr,
+        io: ConnIo,
         local_index: u32,
         remote_index: u32,
         remote_static: [u8; 32],
@@ -203,8 +212,7 @@ impl Conn {
         let now = clock::now_us();
         let mp = cfg.max_payload();
         Arc::new(Conn {
-            socket,
-            peer: Mutex::new(peer),
+            io: Mutex::new(io),
             local_index,
             remote_index,
             remote_static,
@@ -265,10 +273,14 @@ impl Conn {
         let tag = self.send_cipher.seal(counter, hdr, &mut body[..n]);
         body[n..n + 16].copy_from_slice(&tag);
         let total = packet::DATA_HEADER_LEN + n + 16;
-        let peer = *lock(&self.peer);
-        if let Err(e) = self.socket.send_to(&pkt[..total], peer) {
-            // ENOBUFS / EAGAIN under bursts: drop, FEC/NACK will cover it.
-            debug!("send_to {peer}: {e}");
+        {
+            let io = lock(&self.io);
+            let r =
+                if io.connected { io.socket.send(&pkt[..total]) } else { io.socket.send_to(&pkt[..total], io.peer) };
+            if let Err(e) = r {
+                // ENOBUFS / EAGAIN under bursts: drop, FEC/NACK will cover it.
+                debug!("send to {}: {e}", io.peer);
+            }
         }
         self.tx_bytes.fetch_add(total as u64, Ordering::Relaxed);
         self.tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -555,7 +567,7 @@ impl Connection {
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
-        *lock(&self.conn.peer)
+        lock(&self.conn.io).peer
     }
 
     pub fn is_closed(&self) -> bool {
@@ -696,6 +708,8 @@ struct HandshakeCache {
 
 struct Shared {
     socket: Arc<UdpSocket>,
+    /// Client role: the socket is `connect()`ed to the host.
+    connected: bool,
     identity: Keypair,
     cfg: NetConfig,
     sessions: Mutex<HashMap<u32, Arc<Conn>>>,
@@ -752,11 +766,12 @@ fn configure_socket(sock: &UdpSocket, buf: usize) {
 }
 
 impl Shared {
-    fn new(socket: UdpSocket, identity: Keypair, cfg: NetConfig) -> io::Result<Arc<Self>> {
+    fn new(socket: UdpSocket, identity: Keypair, cfg: NetConfig, connected: bool) -> io::Result<Arc<Self>> {
         configure_socket(&socket, cfg.socket_buffer);
         socket.set_read_timeout(Some(Duration::from_millis(1)))?;
         Ok(Arc::new(Shared {
             socket: Arc::new(socket),
+            connected,
             identity,
             cfg,
             sessions: Mutex::new(HashMap::new()),
@@ -771,6 +786,57 @@ impl Shared {
             sim_rng: Mutex::new(crate::rand::XorShift(crate::rand::u64() | 1)),
             pending: Mutex::new(None),
         }))
+    }
+
+    /// macOS: a socket sharing the listening port, connected to `peer`.
+    #[cfg(target_os = "macos")]
+    fn session_socket(&self, peer: SocketAddr) -> Option<Arc<UdpSocket>> {
+        let local = self.socket.local_addr().ok()?;
+        let r = (|| -> io::Result<UdpSocket> {
+            let s = bind_reusable(SocketAddr::new(local.ip(), local.port()))?;
+            s.connect(peer)?;
+            configure_socket(&s, self.cfg.socket_buffer);
+            s.set_read_timeout(Some(Duration::from_millis(50)))?;
+            Ok(s)
+        })();
+        match r {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                warn!("per-session socket for {peer} failed ({e}); using the shared socket");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn session_socket(&self, _peer: SocketAddr) -> Option<Arc<UdpSocket>> {
+        None
+    }
+
+    /// Receive loop for a per-session socket (ends when the session closes
+    /// or the peer roams to another address).
+    fn spawn_session_reader(self: &Arc<Self>, sock: Arc<UdpSocket>, conn: Arc<Conn>) {
+        let me = Arc::clone(self);
+        let r = std::thread::Builder::new().name("sard-net-session".into()).spawn(move || {
+            raise_thread_priority();
+            let mut buf = [0u8; 2048];
+            while !me.stop.load(Ordering::Relaxed) && !conn.closed.load(Ordering::Relaxed) {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, from)) => me.on_packet(&buf[..n], from),
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(e) => {
+                        debug!("session recv: {e}");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                if !Arc::ptr_eq(&lock(&conn.io).socket, &sock) {
+                    break;
+                }
+            }
+        });
+        if let Err(e) = r {
+            warn!("cannot spawn session reader: {e}");
+        }
     }
 
     fn spawn(self: &Arc<Self>) {
@@ -852,10 +918,15 @@ impl Shared {
         let now = clock::now_us();
         conn.last_recv_us.store(now, Ordering::Relaxed);
         {
-            let mut peer = lock(&conn.peer);
-            if *peer != from {
-                info!("peer {} moved {} -> {}", conn.remote_name, *peer, from);
-                *peer = from;
+            let mut io = lock(&conn.io);
+            if io.peer != from {
+                info!("peer {} moved {} -> {}", conn.remote_name, io.peer, from);
+                io.peer = from;
+                if io.connected && !self.connected {
+                    // The per-session socket is tied to the old address.
+                    io.socket = Arc::clone(&self.socket);
+                    io.connected = false;
+                }
             }
         }
         {
@@ -942,18 +1013,16 @@ impl Shared {
             }
         }
         let display = if hello.name.is_empty() { peer_name } else { hello.name.clone() };
-        let conn = Conn::new(
-            Arc::clone(&self.socket),
-            from,
-            local_index,
-            sender_index,
-            rs,
-            display,
-            out.send,
-            out.recv,
-            &self.cfg,
-        );
+        let session_socket = self.session_socket(from);
+        let io = match &session_socket {
+            Some(s) => ConnIo { socket: Arc::clone(s), peer: from, connected: true },
+            None => ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: false },
+        };
+        let conn = Conn::new(io, local_index, sender_index, rs, display, out.send, out.recv, &self.cfg);
         lock(&self.sessions).insert(local_index, Arc::clone(&conn));
+        if let Some(s) = session_socket {
+            self.spawn_session_reader(s, Arc::clone(&conn));
+        }
         let _ = self.socket.send_to(&response, from);
         lock(&self.hs_cache).insert(rs, HandshakeCache { timestamp: hello.timestamp, msg1_hash, response });
         info!("{} connected from {from}", conn.remote_name);
@@ -988,8 +1057,7 @@ impl Shared {
                     Err(NetError::Rejected(format!("host speaks protocol v{}", hello.version)))
                 } else {
                     let conn = Conn::new(
-                        Arc::clone(&self.socket),
-                        from,
+                        ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: self.connected },
                         receiver_index,
                         sender_index,
                         out.remote_static,
@@ -1069,8 +1137,11 @@ pub struct HostOptions {
 
 impl Host {
     pub fn bind(addr: SocketAddr, identity: Keypair, cfg: NetConfig, opts: HostOptions) -> io::Result<Host> {
+        #[cfg(target_os = "macos")]
+        let socket = bind_reusable(addr)?;
+        #[cfg(not(target_os = "macos"))]
         let socket = UdpSocket::bind(addr)?;
-        let shared = Shared::new(socket, identity, cfg)?;
+        let shared = Shared::new(socket, identity, cfg, false)?;
         *lock(&shared.trusted) = opts.trusted;
         *lock(&shared.pairing_psk) = opts.pairing_code.as_deref().map(crate::crypto::pairing_psk);
         *lock(&shared.on_paired) = opts.on_paired;
@@ -1118,6 +1189,57 @@ fn resolve(addr: &str) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("cannot resolve {addr}")))
 }
 
+/// Bind with SO_REUSEADDR + SO_REUSEPORT so per-session connected sockets can
+/// share the listening port (incoming datagrams prefer the connected socket).
+#[cfg(target_os = "macos")]
+fn bind_reusable(addr: SocketAddr) -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    // SAFETY: plain socket syscalls; the fd is owned by the UdpSocket immediately.
+    unsafe {
+        let fd = libc::socket(domain, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sock = UdpSocket::from_raw_fd(fd);
+        let one: libc::c_int = 1;
+        for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        let mut ss: libc::sockaddr_storage = std::mem::zeroed();
+        let len = match addr {
+            SocketAddr::V4(a) => {
+                let sin = &mut *(&mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in);
+                sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+                sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                sin.sin_port = a.port().to_be();
+                sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
+                std::mem::size_of::<libc::sockaddr_in>()
+            }
+            SocketAddr::V6(a) => {
+                let sin6 = &mut *(&mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6);
+                sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sin6.sin6_port = a.port().to_be();
+                sin6.sin6_addr.s6_addr = a.ip().octets();
+                sin6.sin6_flowinfo = a.flowinfo();
+                sin6.sin6_scope_id = a.scope_id();
+                std::mem::size_of::<libc::sockaddr_in6>()
+            }
+        };
+        if libc::bind(fd, (&ss as *const libc::sockaddr_storage).cast(), len as libc::socklen_t) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sock)
+    }
+}
+
 fn bind_for(peer: &SocketAddr) -> io::Result<UdpSocket> {
     if peer.is_ipv6() { UdpSocket::bind("[::]:0") } else { UdpSocket::bind("0.0.0.0:0") }
 }
@@ -1133,7 +1255,10 @@ impl Client {
     ) -> Result<Connection, NetError> {
         let peer = resolve(addr)?;
         let socket = bind_for(&peer)?;
-        let shared = Shared::new(socket, identity.clone(), cfg.clone())?;
+        // A connected socket: cheaper per packet everywhere, and on macOS it
+        // avoids a per-datagram policy check that otherwise throttles UDP.
+        socket.connect(peer)?;
+        let shared = Shared::new(socket, identity.clone(), cfg.clone(), true)?;
         let local_index = shared.new_index();
         let mut ini = IkInitiator::new(&identity, host_key, IK_PROLOGUE);
         let hello = HelloPayload { version: PROTOCOL_VERSION, timestamp: clock::unix_ns(), name: cfg.name.clone() };
@@ -1148,7 +1273,7 @@ impl Client {
 
         let deadline = Instant::now() + timeout;
         loop {
-            if let Err(e) = shared.socket.send_to(&pkt, peer) {
+            if let Err(e) = shared.socket.send(&pkt) {
                 shared.stop.store(true, Ordering::Relaxed);
                 return Err(e.into());
             }
@@ -1185,6 +1310,7 @@ impl Client {
         let psk = crate::crypto::pairing_psk(&normalized);
         let peer = resolve(addr)?;
         let socket = bind_for(&peer)?;
+        socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(300)))?;
         let local_index = crate::rand::u32();
         let mut ini = PairInitiator::new(&psk, PAIR_PROLOGUE);
@@ -1197,7 +1323,7 @@ impl Client {
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 2048];
         while Instant::now() < deadline {
-            socket.send_to(&pkt, peer)?;
+            socket.send(&pkt)?;
             let until = Instant::now() + Duration::from_millis(300);
             while Instant::now() < until {
                 match socket.recv_from(&mut buf) {

@@ -134,8 +134,17 @@ Measured on an M5 Pro (macOS 26.5), Mac on Wi-Fi, Linux box wired:
 | VideoToolbox HEVC encode, 1080p / 1440p / 4K (`--preset 1`, default) | 2.6 / 4.1 / 8.3 ms |
 | same with low-latency rate control (`--preset 2`+) | 4.4 / 7.1 / 14.7 ms |
 | VideoToolbox HEVC decode, 1080p / 1440p / 4K | 1.0 / 1.2 / 1.7 ms |
-| Mac test pattern → decoded on Linux (2560×1440 HEVC @ 60) | **10.7–11.7 ms** p50 (low-latency RC: 13.4 ms) |
-| Linux test pattern → decoded on Mac (1920×1080 HEVC @ 30) | 15.5–18.9 ms p50 (Wi-Fi RTT ≈ 10 ms) |
+| Mac test pattern → decoded on Linux (2560×1440 HEVC @ 60) | **9–11 ms** p50, 0 frames lost |
+| Linux test pattern → decoded on Mac (2560×1440 HEVC @ 60) | **7.8–8.1 ms** p50, 0 frames lost |
+| Linux test pattern → decoded on Mac (2560×1440 HEVC @ 120) | **7.4–7.6 ms** p50, p95 8.3 ms |
+
+Wi-Fi RTT is ≈ 3 ms here; on Ethernet expect ~2–3 ms less.
+
+> **Why connected sockets:** on macOS every datagram sent or received on an
+> *unconnected* UDP socket goes through a per-packet policy check (Local Network
+> privacy / NECP). It capped the Mac at a few thousand packets/s and built 100 ms+
+> queues. sard therefore `connect()`s the client socket, and a macOS host gives each
+> session its own connected socket on the shared port (`SO_REUSEPORT`).
 
 `--preset 1` (default) uses VideoToolbox's normal rate control with
 *PrioritizeEncodingSpeedOverQuality* for HEVC, which encodes ~40 % faster than
