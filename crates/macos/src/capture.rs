@@ -4,18 +4,22 @@
 //! SCStream delivers frames only when the screen changes; the latest one
 //! wins (no queueing). On a keyframe request with a static screen the last
 //! buffer is re-encoded as a keyframe.
+//!
+//! Display switching starts a new SCStream on the other display (recreating
+//! the encoder if the size changes) and then stops the old one; the input
+//! sink shares the current display id, so pointer mapping follows.
 
 use crate::cf::{self, CfRef};
 use crate::ffi::*;
 use crate::input::{CgInput, DisplayBounds};
-use crate::objc::error_string;
+use crate::objc::{error_string, ns_string, to_string};
 use crate::vt::{EncoderConfig, RateControl, VtEncoder};
 use block2::RcBlock;
 use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, NSObject, Sel};
 use objc2::{ClassType, class, msg_send, sel};
 use sard_core::clock;
-use sard_core::media::{self, CursorMode, EncodedFrame, InputSink, SourceOptions, VideoSource};
+use sard_core::media::{self, CursorMode, DisplayInfo, EncodedFrame, InputSink, SourceOptions, VideoSource};
 use sard_core::proto::Codec;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -134,7 +138,7 @@ struct SendObj(Retained<AnyObject>);
 unsafe impl Send for SendObj {}
 
 /// Run an async ObjC call taking a `^(id result, NSError *error)` block and wait.
-fn wait_object(
+pub(crate) fn wait_object(
     call: impl FnOnce(&block2::Block<dyn Fn(*mut AnyObject, *mut AnyObject)>),
 ) -> Result<Retained<AnyObject>, String> {
     let (tx, rx) = mpsc::channel::<Result<SendObj, String>>();
@@ -154,7 +158,10 @@ fn wait_object(
 }
 
 /// Run an async ObjC call taking a `^(NSError *error)` block and wait.
-fn wait_done(call: impl FnOnce(&block2::Block<dyn Fn(*mut AnyObject)>), timeout: Duration) -> Result<(), String> {
+pub(crate) fn wait_done(
+    call: impl FnOnce(&block2::Block<dyn Fn(*mut AnyObject)>),
+    timeout: Duration,
+) -> Result<(), String> {
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
     let tx = Mutex::new(Some(tx));
     let block = RcBlock::new(move |err: *mut AnyObject| {
@@ -210,25 +217,205 @@ pub fn fit_size(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     (fw.max(2), fh.max(2))
 }
 
-pub struct ScreenSource {
+/// The current `SCShareableContent` (needs Screen Recording permission).
+pub(crate) fn shareable_content() -> Result<Retained<AnyObject>, String> {
+    wait_object(|block| unsafe {
+        let _: () = msg_send![
+            class!(SCShareableContent),
+            getShareableContentExcludingDesktopWindows: true,
+            onScreenWindowsOnly: true,
+            completionHandler: block
+        ];
+    })
+    .map_err(|e| format!("cannot list displays: {e}. {SCREEN_RECORDING_HINT}"))
+}
+
+/// The `SCDisplay` for a CoreGraphics display id.
+///
+/// # Safety
+/// `content` must be an `SCShareableContent`.
+pub(crate) unsafe fn find_display(content: &AnyObject, id: CGDirectDisplayID) -> Option<Retained<AnyObject>> {
+    // SAFETY: SCShareableContent / SCDisplay accessors.
+    unsafe {
+        let displays: *mut AnyObject = msg_send![content, displays];
+        let n: usize = if displays.is_null() { 0 } else { msg_send![displays, count] };
+        (0..n).find_map(|i| {
+            let d: *mut AnyObject = msg_send![displays, objectAtIndex: i];
+            let did: u32 = msg_send![d, displayID];
+            if did == id { Retained::retain(d) } else { None }
+        })
+    }
+}
+
+/// Active displays, main display first (the order of `--display <n>`).
+/// Ids are CoreGraphics display ids; positions are global points
+/// (`CGDisplayBounds`). Needs no permission.
+pub fn display_list() -> Vec<DisplayInfo> {
+    let mut buf = [0u32; 32];
+    let mut n = 0u32;
+    // SAFETY: valid buffer and count pointers.
+    let ok = unsafe { CGGetActiveDisplayList(buf.len() as u32, buf.as_mut_ptr(), &mut n) } == 0;
+    // SAFETY: plain query.
+    let main = unsafe { CGMainDisplayID() };
+    let mut ids: Vec<u32> = if ok { buf[..(n as usize).min(buf.len())].to_vec() } else { Vec::new() };
+    if ids.is_empty() {
+        ids.push(main);
+    }
+    ids.sort_by_key(|&id| id != main); // stable: main first, then CoreGraphics order
+    let names = screen_names();
+    let mut list: Vec<DisplayInfo> = ids
+        .into_iter()
+        .map(|id| {
+            let (width, height) = display_pixel_size(id);
+            // SAFETY: plain queries.
+            let (b, builtin) = unsafe { (CGDisplayBounds(id), CGDisplayIsBuiltin(id) != 0) };
+            let name = names.iter().find(|(i, n)| *i == id && !n.is_empty()).map(|(_, n)| n.clone());
+            let name =
+                name.unwrap_or_else(|| if builtin { "Built-in Display".into() } else { format!("Display {id}") });
+            DisplayInfo { id, name, width, height, x: b.origin.x.round() as i32, y: b.origin.y.round() as i32 }
+        })
+        .collect();
+    dedupe_names(&mut list);
+    list
+}
+
+/// `NSScreen.localizedName` by display id (empty list if AppKit has none).
+fn screen_names() -> Vec<(u32, String)> {
+    autoreleasepool(|_| {
+        let key = ns_string("NSScreenNumber");
+        // SAFETY: NSScreen / NSDictionary / NSNumber accessors; all +0 within the pool.
+        unsafe {
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            let n: usize = if screens.is_null() { 0 } else { msg_send![screens, count] };
+            (0..n)
+                .filter_map(|i| {
+                    let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+                    let desc: *mut AnyObject = msg_send![screen, deviceDescription];
+                    if desc.is_null() {
+                        return None;
+                    }
+                    let num: *mut AnyObject = msg_send![desc, objectForKey: &*key];
+                    if num.is_null() {
+                        return None;
+                    }
+                    let id: u32 = msg_send![num, unsignedIntValue];
+                    let name: *mut AnyObject = msg_send![screen, localizedName];
+                    Some((id, to_string(name)))
+                })
+                .collect()
+        }
+    })
+}
+
+/// Make identical display names distinguishable ("DELL U2720Q (1)", "… (2)").
+fn dedupe_names(list: &mut [DisplayInfo]) {
+    let names: Vec<String> = list.iter().map(|d| d.name.clone()).collect();
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    for d in list.iter_mut() {
+        if names.iter().filter(|n| **n == d.name).count() > 1 {
+            let k = seen.entry(d.name.clone()).or_insert(0);
+            *k += 1;
+            d.name = format!("{} ({k})", d.name);
+        }
+    }
+}
+
+/// One running SCStream and the state its output object delivers into.
+struct Capture {
     stream: Retained<AnyObject>,
     output: Retained<AnyObject>,
     queue: *mut c_void,
     shared: Arc<Shared>,
+}
+
+// SAFETY: SCStream's methods are thread-safe; the callbacks only touch `Shared`.
+unsafe impl Send for Capture {}
+
+impl Capture {
+    /// Start capturing `display` (an `SCDisplay`) at `w`x`h` NV12.
+    fn start(display: &AnyObject, w: u32, h: u32, fps: u32) -> Result<Capture, String> {
+        let shared = Arc::new(Shared::default());
+        // SAFETY: standard SCK object setup; `output` stays registered until Drop.
+        unsafe {
+            let output: Retained<AnyObject> = msg_send![output_class(), new];
+            registry().lock().unwrap().insert(Retained::as_ptr(&output) as usize, Arc::clone(&shared));
+
+            let empty: Retained<AnyObject> = msg_send![class!(NSArray), array];
+            let f: Allocated<AnyObject> = msg_send![class!(SCContentFilter), alloc];
+            let filter: Retained<AnyObject> = msg_send![f, initWithDisplay: display, excludingWindows: &*empty];
+            let cfg = stream_config(w, h, fps);
+            let s: Allocated<AnyObject> = msg_send![class!(SCStream), alloc];
+            let stream: Retained<AnyObject> =
+                msg_send![s, initWithFilter: &*filter, configuration: &*cfg, delegate: &*output];
+
+            let attr = dispatch_queue_attr_make_with_qos_class(std::ptr::null(), QOS_CLASS_USER_INTERACTIVE, 0);
+            let queue = dispatch_queue_create(c"com.strangeape.sard.capture".as_ptr(), attr);
+            let cap = Capture { stream, output, queue, shared };
+            let mut err: *mut AnyObject = null_mut();
+            let ok: bool = msg_send![
+                &*cap.stream,
+                addStreamOutput: &*cap.output,
+                type: 0isize,
+                sampleHandlerQueue: queue as *mut AnyObject,
+                error: &mut err
+            ];
+            if !ok {
+                return Err(format!("addStreamOutput failed: {}", error_string(err)));
+            }
+            wait_done(
+                |block| {
+                    let _: () = msg_send![&*cap.stream, startCaptureWithCompletionHandler: block];
+                },
+                Duration::from_secs(15),
+            )
+            .map_err(|e| format!("cannot start screen capture: {e}. {SCREEN_RECORDING_HINT}"))?;
+            Ok(cap)
+        }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        autoreleasepool(|_| {
+            // SAFETY: valid stream/output.
+            unsafe {
+                let r = wait_done(
+                    |block| {
+                        let _: () = msg_send![&*self.stream, stopCaptureWithCompletionHandler: block];
+                    },
+                    Duration::from_secs(3),
+                );
+                if let Err(e) = r {
+                    sard_core::debug!("stopCapture: {e}");
+                }
+                let mut err: *mut AnyObject = null_mut();
+                let _: bool =
+                    msg_send![&*self.stream, removeStreamOutput: &*self.output, type: 0isize, error: &mut err];
+            }
+        });
+        if let Ok(mut r) = registry().lock() {
+            r.remove(&(Retained::as_ptr(&self.output) as usize));
+        }
+        // SAFETY: our queue; SCK has dropped its use of it after removal.
+        unsafe { dispatch_release(self.queue) };
+    }
+}
+
+pub struct ScreenSource {
+    cap: Capture,
     enc: VtEncoder,
     seen: u64,
     last: Option<CfRef>,
     force_key: bool,
-    display_id: CGDirectDisplayID,
+    /// Display being captured; shared with the input sink.
+    display: DisplayBounds,
+    max_size: (u32, u32),
+    fps: u32,
 }
-
-// SAFETY: the ObjC objects are only used from the thread owning the source
-// (SCStream's methods are thread-safe); callbacks only touch `Shared`.
-unsafe impl Send for ScreenSource {}
 
 pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
     let src = autoreleasepool(|_| ScreenSource::new(opts)).map_err(media::err)?;
-    let input = CgInput::new(Box::new(DisplayBounds(src.display_id)))?;
+    let input = CgInput::new(Box::new(src.display.clone()))?;
     Ok((Box::new(src), Box::new(input)))
 }
 
@@ -239,37 +426,17 @@ impl ScreenSource {
             sard_core::warn!("{SCREEN_RECORDING_HINT}");
             unsafe { CGRequestScreenCaptureAccess() };
         }
-        let content = wait_object(|block| unsafe {
-            let _: () = msg_send![
-                class!(SCShareableContent),
-                getShareableContentExcludingDesktopWindows: true,
-                onScreenWindowsOnly: true,
-                completionHandler: block
-            ];
-        })
-        .map_err(|e| format!("cannot list displays: {e}. {SCREEN_RECORDING_HINT}"))?;
-
-        // SAFETY: SCShareableContent / SCDisplay accessors.
-        let (display, display_id) = unsafe {
-            let displays: *mut AnyObject = msg_send![&*content, displays];
-            let n: usize = msg_send![displays, count];
-            let mut list: Vec<(*mut AnyObject, CGDirectDisplayID)> = (0..n)
-                .map(|i| {
-                    let d: *mut AnyObject = msg_send![displays, objectAtIndex: i];
-                    let id: u32 = msg_send![d, displayID];
-                    (d, id)
-                })
-                .collect();
-            let main = CGMainDisplayID();
-            list.sort_by_key(|&(_, id)| id != main); // main display first
-            let idx = opts.display as usize;
-            let Some(&(d, id)) = list.get(idx) else {
-                return Err(format!("display {idx} not found ({} display(s); 0 = main)", list.len()));
-            };
-            (Retained::retain(d).ok_or("nil display")?, id)
+        let content = shareable_content()?;
+        let list = display_list();
+        let idx = opts.display as usize;
+        let Some(info) = list.get(idx) else {
+            return Err(format!("display {idx} not found ({} display(s); 0 = main)", list.len()));
         };
-        let (pw, ph) = display_pixel_size(display_id);
-        let (w, h) = fit_size(pw, ph, opts.max_width.max(320), opts.max_height.max(240));
+        // SAFETY: `content` is an SCShareableContent.
+        let display = unsafe { find_display(&content, info.id) }
+            .ok_or_else(|| format!("display {} ({}) is not available for capture", info.id, info.name))?;
+        let max_size = (opts.max_width.max(320), opts.max_height.max(240));
+        let (w, h) = fit_size(info.width, info.height, max_size.0, max_size.1);
         let fps = opts.fps.max(1);
 
         let enc = VtEncoder::new(EncoderConfig {
@@ -280,46 +447,50 @@ impl ScreenSource {
             bitrate_kbps: opts.bitrate_kbps.max(1000),
             rate_control: RateControl::for_preset(opts.codec, opts.preset),
         })?;
+        let cap = Capture::start(&display, w, h, fps)?;
+        sard_core::info!(
+            "ScreenCaptureKit: display {} \"{}\" ({}x{} px) captured at {w}x{h} @ {fps} fps",
+            info.id,
+            info.name,
+            info.width,
+            info.height
+        );
+        Ok(ScreenSource {
+            cap,
+            enc,
+            seen: 0,
+            last: None,
+            force_key: true,
+            display: DisplayBounds::new(info.id),
+            max_size,
+            fps,
+        })
+    }
 
-        let shared = Arc::new(Shared::default());
-        // SAFETY: standard SCK object setup; `output` stays registered until Drop.
-        unsafe {
-            let output: Retained<AnyObject> = msg_send![output_class(), new];
-            registry().lock().unwrap().insert(Retained::as_ptr(&output) as usize, Arc::clone(&shared));
-
-            let empty: Retained<AnyObject> = msg_send![class!(NSArray), array];
-            let f: Allocated<AnyObject> = msg_send![class!(SCContentFilter), alloc];
-            let filter: Retained<AnyObject> = msg_send![f, initWithDisplay: &*display, excludingWindows: &*empty];
-            let cfg = stream_config(w, h, fps);
-            let s: Allocated<AnyObject> = msg_send![class!(SCStream), alloc];
-            let stream: Retained<AnyObject> =
-                msg_send![s, initWithFilter: &*filter, configuration: &*cfg, delegate: &*output];
-
-            let attr = dispatch_queue_attr_make_with_qos_class(std::ptr::null(), QOS_CLASS_USER_INTERACTIVE, 0);
-            let queue = dispatch_queue_create(c"com.strangeape.sard.capture".as_ptr(), attr);
-            let mut err: *mut AnyObject = null_mut();
-            let ok: bool = msg_send![
-                &*stream,
-                addStreamOutput: &*output,
-                type: 0isize,
-                sampleHandlerQueue: queue as *mut AnyObject,
-                error: &mut err
-            ];
-            let src =
-                ScreenSource { stream, output, queue, shared, enc, seen: 0, last: None, force_key: true, display_id };
-            if !ok {
-                return Err(format!("addStreamOutput failed: {}", error_string(err)));
-            }
-            wait_done(
-                |block| {
-                    let _: () = msg_send![&*src.stream, startCaptureWithCompletionHandler: block];
-                },
-                Duration::from_secs(15),
-            )
-            .map_err(|e| format!("cannot start screen capture: {e}. {SCREEN_RECORDING_HINT}"))?;
-            sard_core::info!("ScreenCaptureKit: display {display_id} ({pw}x{ph} px) captured at {w}x{h} @ {fps} fps");
-            Ok(src)
+    fn switch_to(&mut self, id: CGDirectDisplayID) -> Result<(), String> {
+        let content = shareable_content()?;
+        // SAFETY: `content` is an SCShareableContent.
+        let display = unsafe { find_display(&content, id) }.ok_or_else(|| format!("display {id} is not available"))?;
+        let (pw, ph) = display_pixel_size(id);
+        let (w, h) = fit_size(pw, ph, self.max_size.0, self.max_size.1);
+        let cur = *self.enc.config();
+        // Everything that can fail happens before the old stream is touched.
+        let enc = if (w, h) != (cur.width, cur.height) {
+            Some(VtEncoder::new(EncoderConfig { width: w, height: h, ..cur })?)
+        } else {
+            None
+        };
+        let cap = Capture::start(&display, w, h, self.fps)?;
+        drop(std::mem::replace(&mut self.cap, cap)); // stops the old stream
+        if let Some(enc) = enc {
+            self.enc = enc;
         }
+        self.display.set(id);
+        self.seen = 0;
+        self.last = None;
+        self.force_key = true;
+        sard_core::info!("ScreenCaptureKit: switched to display {id} ({pw}x{ph} px) captured at {w}x{h}");
+        Ok(())
     }
 
     fn encode(&mut self, image: CfRef, capture_us: u64) -> media::Result<Option<EncodedFrame>> {
@@ -338,7 +509,7 @@ impl ScreenSource {
 impl VideoSource for ScreenSource {
     fn next_frame(&mut self, timeout: Duration) -> media::Result<Option<EncodedFrame>> {
         let deadline = Instant::now() + timeout;
-        let mut g = self.shared.m.lock().unwrap();
+        let mut g = self.cap.shared.m.lock().unwrap();
         loop {
             if let Some(e) = &g.stopped {
                 return Err(media::err(format!("screen capture stopped: {e}")));
@@ -354,7 +525,7 @@ impl VideoSource for ScreenSource {
             if left.is_zero() || (self.force_key && self.last.is_some()) {
                 break;
             }
-            g = self.shared.cv.wait_timeout(g, left).unwrap().0;
+            g = self.cap.shared.cv.wait_timeout(g, left).unwrap().0;
         }
         drop(g);
         // Static screen but the client needs a keyframe: re-encode the last image.
@@ -390,7 +561,7 @@ impl VideoSource for ScreenSource {
         let c = self.enc.config();
         format!(
             "ScreenCaptureKit display {} {}x{} → VideoToolbox {}{}{}",
-            self.display_id,
+            self.display.id(),
             c.width,
             c.height,
             c.codec.name(),
@@ -398,32 +569,21 @@ impl VideoSource for ScreenSource {
             if self.enc.low_latency { ", low-latency RC)" } else { ")" }
         )
     }
-}
 
-impl Drop for ScreenSource {
-    fn drop(&mut self) {
-        autoreleasepool(|_| {
-            // SAFETY: valid stream/output; queue created by us.
-            unsafe {
-                let r = wait_done(
-                    |block| {
-                        let _: () = msg_send![&*self.stream, stopCaptureWithCompletionHandler: block];
-                    },
-                    Duration::from_secs(3),
-                );
-                if let Err(e) = r {
-                    sard_core::debug!("stopCapture: {e}");
-                }
-                let mut err: *mut AnyObject = null_mut();
-                let _: bool =
-                    msg_send![&*self.stream, removeStreamOutput: &*self.output, type: 0isize, error: &mut err];
-            }
-        });
-        if let Ok(mut r) = registry().lock() {
-            r.remove(&(Retained::as_ptr(&self.output) as usize));
+    fn displays(&self) -> Vec<DisplayInfo> {
+        display_list()
+    }
+
+    fn current_display(&self) -> Option<u32> {
+        Some(self.display.id())
+    }
+
+    fn select_display(&mut self, id: u32) -> media::Result<()> {
+        if id == self.display.id() {
+            self.force_key = true;
+            return Ok(());
         }
-        // SAFETY: our queue; SCK has dropped its use of it after removal.
-        unsafe { dispatch_release(self.queue) };
+        autoreleasepool(|_| self.switch_to(id)).map_err(media::err)
     }
 }
 
@@ -455,5 +615,39 @@ mod tests {
             }
         });
         let _ = output_class();
+    }
+
+    #[test]
+    fn display_list_without_permission() {
+        let list = display_list();
+        assert!(!list.is_empty());
+        assert_eq!(list[0].id, unsafe { CGMainDisplayID() }, "main display first");
+        for d in &list {
+            assert!(d.width > 0 && d.height > 0 && !d.name.is_empty(), "{d:?}");
+            eprintln!("display: {d:?}");
+        }
+        let mut ids: Vec<u32> = list.iter().map(|d| d.id).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), list.len());
+    }
+
+    #[test]
+    fn duplicate_display_names_are_numbered() {
+        let d = |id, name: &str| DisplayInfo { id, name: name.into(), width: 1, height: 1, x: 0, y: 0 };
+        let mut list = vec![d(1, "Built-in"), d(2, "DELL"), d(3, "DELL")];
+        dedupe_names(&mut list);
+        let names: Vec<&str> = list.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Built-in", "DELL (1)", "DELL (2)"]);
+    }
+
+    #[test]
+    fn shared_display_bounds_follow_switch() {
+        use crate::input::Bounds;
+        let main = unsafe { CGMainDisplayID() };
+        let b = DisplayBounds::new(0);
+        let sink_side = b.clone();
+        b.set(main);
+        assert_eq!(sink_side.id(), main);
+        assert_eq!(sink_side.rect(), unsafe { CGDisplayBounds(main) });
     }
 }

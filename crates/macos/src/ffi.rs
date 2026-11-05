@@ -153,7 +153,58 @@ unsafe extern "C" {
         nal_header_len: *mut i32,
     ) -> OSStatus;
     pub fn CMVideoFormatDescriptionGetDimensions(desc: CMFormatDescriptionRef) -> CMVideoDimensions;
+
+    pub fn CMSampleBufferGetNumSamples(sbuf: CMSampleBufferRef) -> isize;
+    pub fn CMAudioFormatDescriptionGetStreamBasicDescription(
+        desc: CMFormatDescriptionRef,
+    ) -> *const AudioStreamBasicDescription;
+    /// Fills `abl` (an `AudioBufferList` of `abl_size` bytes) with pointers into
+    /// the sample buffer's data, kept alive by the +1 `block_out`.
+    pub fn CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sbuf: CMSampleBufferRef,
+        size_needed_out: *mut usize,
+        abl: *mut c_void,
+        abl_size: usize,
+        block_alloc: CFAllocatorRef,
+        memory_alloc: CFAllocatorRef,
+        flags: u32,
+        block_out: *mut CMBlockBufferRef,
+    ) -> OSStatus;
 }
+
+pub const kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment: u32 = 1;
+
+// ------------------------------------------------------- CoreAudio types
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AudioStreamBasicDescription {
+    pub sample_rate: f64,
+    pub format_id: u32,
+    pub format_flags: u32,
+    pub bytes_per_packet: u32,
+    pub frames_per_packet: u32,
+    pub bytes_per_frame: u32,
+    pub channels_per_frame: u32,
+    pub bits_per_channel: u32,
+    pub reserved: u32,
+}
+
+/// One `AudioBuffer` of an `AudioBufferList` (which is a `u32` count, padded
+/// to 8 bytes, followed by `count` of these).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AudioBuffer {
+    pub number_channels: u32,
+    pub data_byte_size: u32,
+    pub data: *mut c_void,
+}
+
+pub const kAudioFormatLinearPCM: u32 = u32::from_be_bytes(*b"lpcm");
+pub const kAudioFormatFlagIsFloat: u32 = 1 << 0;
+pub const kAudioFormatFlagIsBigEndian: u32 = 1 << 1;
+pub const kAudioFormatFlagIsSignedInteger: u32 = 1 << 2;
+pub const kAudioFormatFlagIsNonInterleaved: u32 = 1 << 5;
 
 // ---------------------------------------------------------------- CoreVideo
 
@@ -416,6 +467,8 @@ unsafe extern "C" {
     pub static kCGDisplayStreamYCbCrMatrix_ITU_R_709_2: CFStringRef;
 
     pub fn CGMainDisplayID() -> CGDirectDisplayID;
+    pub fn CGGetActiveDisplayList(max: u32, displays: *mut CGDirectDisplayID, count: *mut u32) -> i32;
+    pub fn CGDisplayIsBuiltin(d: CGDirectDisplayID) -> u32;
     pub fn CGDisplayBounds(d: CGDirectDisplayID) -> CGRect;
     pub fn CGDisplayCopyDisplayMode(d: CGDirectDisplayID) -> *mut c_void;
     pub fn CGDisplayModeGetPixelWidth(mode: *mut c_void) -> usize;
@@ -480,7 +533,14 @@ unsafe extern "C" {
 pub const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
 unsafe extern "C" {
+    /// The main queue object; `dispatch_get_main_queue()` is a macro for its address.
+    static _dispatch_main_q: u8;
     pub fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
     pub fn dispatch_queue_attr_make_with_qos_class(attr: *const c_void, qos: u32, prio: i32) -> *const c_void;
     pub fn dispatch_release(obj: *mut c_void);
+    pub fn dispatch_async_f(queue: *mut c_void, context: *mut c_void, work: unsafe extern "C" fn(*mut c_void));
+}
+
+pub fn dispatch_get_main_queue() -> *mut c_void {
+    &raw const _dispatch_main_q as *mut c_void
 }

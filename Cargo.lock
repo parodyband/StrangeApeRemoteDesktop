@@ -1177,6 +1177,7 @@ dependencies = [
  "objc2 0.6.5",
  "raw-window-handle",
  "sard-core",
+ "winit",
 ]
 
 [[package]]
