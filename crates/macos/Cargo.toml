@@ -15,3 +15,7 @@ raw-window-handle = "0.6"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", features = ["relax-void-encoding"] }
 block2 = "0.6"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Only for examples/tray_demo.rs (the app itself gets winit through `sard`).
+winit = { version = "0.30", default-features = false }

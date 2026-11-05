@@ -30,38 +30,3 @@
 pub use sard_linux::platform::*;
 #[cfg(target_os = "macos")]
 pub use sard_macos::platform::*;
-
-// Audio on macOS is not implemented yet; these stubs keep the build working.
-// ---- macOS app-shell stubs (replaced by sard-macos implementations) ----
-#[cfg(target_os = "macos")]
-pub fn create_tray(
-    _icons: sard_core::media::TrayIcons,
-    _on_click: sard_core::media::TrayCallback,
-) -> sard_core::media::Result<Box<dyn sard_core::media::Tray>> {
-    Err(sard_core::media::err("menu bar item not implemented on macOS yet"))
-}
-#[cfg(target_os = "macos")]
-pub fn prompt_text(_title: &str, _message: &str) -> Option<String> {
-    None
-}
-#[cfg(target_os = "macos")]
-pub fn show_message(title: &str, message: &str) {
-    eprintln!("{title}: {message}");
-}
-#[cfg(target_os = "macos")]
-pub fn set_launch_at_login(_enabled: bool) -> sard_core::media::Result<()> {
-    Err(sard_core::media::err("launch at login not implemented on macOS yet"))
-}
-#[cfg(target_os = "macos")]
-pub fn launch_at_login() -> bool {
-    false
-}
-#[cfg(target_os = "macos")]
-pub fn set_dock_visible(_visible: bool) {}
-
-#[cfg(target_os = "macos")]
-pub fn open_audio_source(
-    _cb: sard_core::media::AudioCallback,
-) -> sard_core::media::Result<Box<dyn sard_core::media::AudioSource>> {
-    Err(sard_core::media::err("audio capture is not implemented on macOS yet"))
-}

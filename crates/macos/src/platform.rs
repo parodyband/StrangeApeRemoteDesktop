@@ -5,7 +5,9 @@ use crate::sink::{HeadlessSink, MetalVideoSink};
 use crate::test_source::TestPatternSource;
 use crate::vt::{self, EncoderConfig, RateControl, VtEncoder};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use sard_core::media::{self, InputSink, SourceOptions, VideoSink, VideoSource};
+use sard_core::media::{
+    self, AudioCallback, AudioSource, InputSink, SourceOptions, Tray, TrayCallback, TrayIcons, VideoSink, VideoSource,
+};
 use sard_core::proto::Codec;
 use std::sync::{Arc, OnceLock};
 
@@ -62,6 +64,40 @@ pub fn open_clipboard() -> Option<Box<dyn sard_core::media::Clipboard>> {
 /// Play remote audio through the default output device.
 pub fn open_audio_sink() -> media::Result<Box<dyn sard_core::media::AudioSink>> {
     Ok(Box::new(crate::audio::MacAudioSink::new()?))
+}
+
+/// Capture what this Mac is playing (ScreenCaptureKit; needs Screen Recording).
+pub fn open_audio_source(cb: AudioCallback) -> media::Result<Box<dyn AudioSource>> {
+    let src = objc2::rc::autoreleasepool(|_| crate::audio_capture::ScreenAudioSource::new(cb)).map_err(media::err)?;
+    Ok(Box::new(src))
+}
+
+// ---- app shell: `tray.rs` / `shell.rs` ----
+
+/// Menu bar item. Call on the main thread with NSApplication running (from
+/// inside the winit event loop); the callback runs on the main thread.
+pub fn create_tray(icons: TrayIcons, on_click: TrayCallback) -> media::Result<Box<dyn Tray>> {
+    Ok(Box::new(crate::tray::MacTray::new(icons, on_click)?))
+}
+
+pub fn prompt_text(title: &str, message: &str) -> Option<String> {
+    crate::shell::prompt_text(title, message)
+}
+
+pub fn show_message(title: &str, message: &str) {
+    crate::shell::show_message(title, message)
+}
+
+pub fn set_launch_at_login(enabled: bool) -> media::Result<()> {
+    crate::shell::set_launch_at_login(enabled)
+}
+
+pub fn launch_at_login() -> bool {
+    crate::shell::launch_at_login()
+}
+
+pub fn set_dock_visible(visible: bool) {
+    crate::shell::set_dock_visible(visible)
 }
 
 pub fn create_headless_sink() -> media::Result<Box<dyn VideoSink>> {
