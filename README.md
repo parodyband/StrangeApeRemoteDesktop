@@ -119,13 +119,76 @@ Useful options: `--fps`, `--bitrate <Mbps>`, `--codec hevc|h264|av1`, `--yuv444`
 * `SARD_SIM_LOSS=0.05` — drop 5 % of incoming packets (test FEC / recovery).
 * `SARD_LOG=debug` — verbose logs, including per-stage capture timings.
 
+## macOS
+
+Apple Silicon, macOS 13 or newer. Everything runs on the media engine and GPU:
+ScreenCaptureKit delivers IOSurface NV12 buffers straight into VideoToolbox (no
+copy); on the client, VideoToolbox decodes into IOSurfaces that Metal samples
+through `CVMetalTextureCache` (no copy), converting BT.709 YUV→RGB in a shader and
+presenting on a `CAMetalLayer` with display sync off.
+
+Measured on an M5 Pro (macOS 26.5), Mac on Wi-Fi, Linux box wired:
+
+| Path | Result |
+|---|---|
+| VideoToolbox HEVC encode, 1080p / 1440p / 4K (`--preset 1`, default) | 2.6 / 4.1 / 8.3 ms |
+| same with low-latency rate control (`--preset 2`+) | 4.4 / 7.1 / 14.7 ms |
+| VideoToolbox HEVC decode, 1080p / 1440p / 4K | 1.0 / 1.2 / 1.7 ms |
+| Mac test pattern → decoded on Linux (2560×1440 HEVC @ 60) | **10.7–11.7 ms** p50 (low-latency RC: 13.4 ms) |
+| Linux test pattern → decoded on Mac (1920×1080 HEVC @ 30) | 15.5–18.9 ms p50 (Wi-Fi RTT ≈ 10 ms) |
+
+`--preset 1` (default) uses VideoToolbox's normal rate control with
+*PrioritizeEncodingSpeedOverQuality* for HEVC, which encodes ~40 % faster than
+the low-latency rate control but spends more bits for the same quality;
+`--preset 2` and above (and H.264 always) use the low-latency rate control
+(steadier frame sizes, better quality per bit).
+
+### Permissions
+
+macOS ties privacy permissions to the signed app, so build an app bundle:
+
+```sh
+scripts/macos-app.sh            # → dist/Sard.app (release build, signed)
+```
+
+It signs with the first code-signing identity in your keychain (e.g. a free
+"Apple Development" certificate from Xcode). **With an ad-hoc signature (no
+identity, or a locked keychain over SSH) every rebuild looks like a new app and
+macOS forgets the grants below**, so use a stable identity for day-to-day use.
+
+| Permission | Needed for | Where |
+|---|---|---|
+| Screen & System Audio Recording | `sard host` (screen capture) | System Settings → Privacy & Security → Screen & System Audio Recording → enable **Sard** |
+| Accessibility | `sard host` (keyboard/mouse injection) | System Settings → Privacy & Security → Accessibility → enable **Sard** |
+| Local Network | host and client (LAN traffic) | allow the "find devices on local networks" prompt; if missed: Privacy & Security → Local Network → **Sard** |
+
+The first `sard host` run shows the system prompts (or adds Sard to the lists);
+enable the switches, then restart the host. `sard info` prints whether Screen
+Recording and Accessibility are granted. When sard is run from a terminal instead
+of through the app, macOS attributes the permissions to the terminal app.
+`sard host --test-pattern` and the client need no permissions besides Local Network
+(without it, connections fail with "No route to host").
+
+### Running
+
+```sh
+open -n dist/Sard.app --stdout /tmp/sard-host.log --stderr /tmp/sard-host.log --args host --pair
+open -n dist/Sard.app --stdout /tmp/sard.log --stderr /tmp/sard.log --args connect 192.168.1.77
+# environment variables: open --env SARD_LOG=debug --env SARD_CONFIG_DIR=... -n dist/Sard.app --args ...
+```
+
+`--display <n>` picks the display to share (0 = main display, then the others).
+The cursor is drawn into the video by ScreenCaptureKit. Audio and clipboard are
+not implemented on macOS yet.
+
 ## Roadmap
 
 - [x] Core transport: crypto, FEC, reliable channel, video reassembly, adaptive FEC/bitrate
 - [x] Linux host: portal + PipeWire capture (DMA-BUF zero-copy), NVENC, portal input injection
 - [x] Linux client: NVDEC + GL presentation, input capture, local cursor, relative mouse
 - [x] Audio (Linux), clipboard sync (Linux)
-- [ ] macOS client: VideoToolbox + Metal (in progress)
-- [ ] macOS host: ScreenCaptureKit + VideoToolbox + CGEvent (in progress)
+- [x] macOS client: VideoToolbox + Metal (zero-copy), headless mode
+- [x] macOS host: ScreenCaptureKit + VideoToolbox + CGEvent
+- [ ] macOS AV1 decode (hardware is there on M3+), client-side cursor on macOS hosts
 - [ ] macOS audio and clipboard
 - [ ] NAT traversal / relay (protocol already routes by session index)
