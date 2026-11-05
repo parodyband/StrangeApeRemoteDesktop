@@ -192,7 +192,7 @@ fn buffer_params(dmabuf: bool) -> Vec<Vec<u8>> {
             &[
                 prop(L::BUFFERS_BUFFERS, 0, choice(L::CHOICE_RANGE, L::T_INT, &[i32s(4), i32s(2), i32s(16)])),
                 prop(L::BUFFERS_BLOCKS, 0, int(1)),
-                prop(L::BUFFERS_DATA_TYPE, 0, choice(L::CHOICE_FLAGS, L::T_INT, &[i32s(types as i32)])),
+                prop(L::BUFFERS_DATA_TYPE, 0, choice(L::CHOICE_FLAGS, L::T_INT, &[i32s(types)])),
             ],
         ),
         object(
@@ -316,7 +316,7 @@ unsafe fn read_cursor(spa: *const u8, c: &mut Cursor) {
                 let mut rgba = Vec::with_capacity((w * h * 4) as usize);
                 for row in 0..h as usize {
                     let r = unsafe { std::slice::from_raw_parts(px.add(row * stride as usize), w as usize * 4) };
-                    for p in r.chunks_exact(4) {
+                    for p in r.as_chunks::<4>().0 {
                         match fmt {
                             L::VIDEO_FORMAT_BGRA | L::VIDEO_FORMAT_BGRX => {
                                 rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]])
@@ -327,8 +327,13 @@ unsafe fn read_cursor(spa: *const u8, c: &mut Cursor) {
                         }
                     }
                 }
-                let hot =
-                    unsafe { (rd_i32(d, L::MC_HOTSPOT).max(0) as u32, rd_i32(d, L::MC_HOTSPOT + 4).max(0) as u32) };
+                // Clamp: compositors sometimes report hotspots outside tiny/empty images.
+                let hot = unsafe {
+                    (
+                        (rd_i32(d, L::MC_HOTSPOT).max(0) as u32).min(w - 1),
+                        (rd_i32(d, L::MC_HOTSPOT + 4).max(0) as u32).min(h - 1),
+                    )
+                };
                 // FNV-1a so identical shapes don't get re-sent.
                 let mut hash =
                     0xcbf29ce484222325u64 ^ ((w as u64) << 32 | h as u64) ^ ((hot.0 as u64) << 16 | hot.1 as u64);

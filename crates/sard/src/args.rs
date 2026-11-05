@@ -3,7 +3,17 @@
 use std::collections::HashMap;
 
 /// Flags that never take a value.
-const BOOL_FLAGS: &[&str] = &["pair", "yuv444", "fullscreen", "no-swap-modifiers", "no-audio", "verbose"];
+const BOOL_FLAGS: &[&str] = &[
+    "pair",
+    "yuv444",
+    "fullscreen",
+    "no-swap-modifiers",
+    "no-audio",
+    "verbose",
+    "input-test",
+    "view-only",
+    "reselect",
+];
 /// Flags whose value is optional (`--test-pattern` or `--test-pattern 1920x1080`).
 const OPTIONAL_VALUE: &[&str] = &["test-pattern"];
 

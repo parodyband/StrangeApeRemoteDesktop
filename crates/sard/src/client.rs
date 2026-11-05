@@ -88,6 +88,7 @@ pub fn run(args: &Args) -> Result<()> {
         args_codec: args.value("codec").and_then(Codec::parse),
         args_display: args.parse_value("display")?.unwrap_or(0),
         fullscreen: args.flag("fullscreen"),
+        view_only: args.flag("view-only"),
         swap_mods_allowed: !args.flag("no-swap-modifiers"),
         host_name: host.name.clone(),
         frames: Some(frames),
@@ -137,6 +138,7 @@ struct App {
     args_codec: Option<Codec>,
     args_display: u8,
     fullscreen: bool,
+    view_only: bool,
     swap_mods_allowed: bool,
     host_name: String,
     frames: Option<Receiver<CompleteFrame>>,
@@ -309,7 +311,13 @@ impl App {
                 let cursor = if let Some(c) = self.cursors.get(&serial) {
                     c.clone()
                 } else {
-                    match CustomCursor::from_rgba(rgba, width, height, hot_x, hot_y) {
+                    match CustomCursor::from_rgba(
+                        rgba,
+                        width,
+                        height,
+                        hot_x.min(width.saturating_sub(1)),
+                        hot_y.min(height.saturating_sub(1)),
+                    ) {
                         Ok(src) => {
                             let c = el.create_custom_cursor(src);
                             if self.cursors.len() > 64 {
@@ -386,6 +394,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if down && self.hotkey() && self.handle_hotkey(el, code) {
                     return;
                 }
+                if self.view_only {
+                    return;
+                }
                 if let Some(mut k) = keymap::to_evdev(code) {
                     if self.swap_mods {
                         k = keymap::swap_ctrl_meta(k);
@@ -393,6 +404,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.conn.send_control(&Control::Key { code: k, down });
                 }
             }
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+                if self.view_only => {}
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
                 if !self.relative

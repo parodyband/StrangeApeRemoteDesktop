@@ -26,6 +26,10 @@ pub fn run(args: &Args) -> Result<()> {
     let dir = config::config_dir();
     let identity = config::load_or_create_identity(&dir)?;
     let trust = TrustStore::load(&dir)?;
+    if args.flag("reselect") {
+        // Forget the saved screen-share approval so the picker is shown again.
+        let _ = std::fs::remove_file(dir.join("portal_restore_token"));
+    }
     let pairing = if args.flag("pair") || trust.peers.is_empty() { Some(generate_pairing_code()) } else { None };
     let trusted: HashMap<[u8; 32], String> = trust.peers.iter().map(|p| (p.key, p.name.clone())).collect();
     let trust = Arc::new(Mutex::new(trust));
@@ -360,6 +364,7 @@ fn input_loop(
     ceiling: u32,
 ) {
     let mut pressed = PressedSet::default();
+    let mut pending: Option<Event> = None;
     let mut rc = RateControl { ceiling, current: ceiling, last_change: Instant::now(), clean_reports: 0 };
     let inject = |input: &mut Box<dyn InputSink>, ev: InputEvent| {
         if let Err(e) = input.inject(&ev) {
@@ -367,11 +372,26 @@ fn input_loop(
         }
     };
     while !shared.stop.load(Ordering::Relaxed) {
-        let ev = match events.recv_timeout(Duration::from_millis(100)) {
-            Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(_) => break,
+        let mut ev = match pending.take() {
+            Some(ev) => ev,
+            None => match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(ev) => ev,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            },
         };
+        // Coalesce bursts of absolute moves: only the newest position matters,
+        // and each injection is a round trip through the compositor.
+        if matches!(ev, Event::MouseAbs { .. }) {
+            while let Ok(next) = events.try_recv() {
+                if matches!(next, Event::MouseAbs { .. }) {
+                    ev = next;
+                } else {
+                    pending = Some(next);
+                    break;
+                }
+            }
+        }
         match ev {
             Event::MouseAbs { x, y } => inject(&mut input, InputEvent::MoveAbs { x, y }),
             Event::KeyframeRequest => shared.keyframe.store(true, Ordering::Relaxed),

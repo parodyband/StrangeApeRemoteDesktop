@@ -124,11 +124,14 @@ impl PropValue {
     }
 }
 
+/// `(object type, id, [(key, value)])`
+pub type ParsedObject = (u32, u32, Vec<(u32, PropValue)>);
+
 /// Parse an Object pod into `(object type, id, [(key, value)])`.
 ///
 /// # Safety
 /// `p` must point to a valid spa_pod.
-pub unsafe fn parse_object(p: *const std::ffi::c_void) -> Option<(u32, u32, Vec<(u32, PropValue)>)> {
+pub unsafe fn parse_object(p: *const std::ffi::c_void) -> Option<ParsedObject> {
     if p.is_null() {
         return None;
     }
@@ -142,7 +145,7 @@ pub unsafe fn parse_object(p: *const std::ffi::c_void) -> Option<(u32, u32, Vec<
     parse_object_body(body)
 }
 
-pub fn parse_object_body(body: &[u8]) -> Option<(u32, u32, Vec<(u32, PropValue)>)> {
+pub fn parse_object_body(body: &[u8]) -> Option<ParsedObject> {
     let rd = |o: usize| -> Option<u32> { body.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) };
     let obj_type = rd(0)?;
     let obj_id = rd(4)?;
