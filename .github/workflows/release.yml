@@ -45,11 +45,16 @@ jobs:
   linux:
     needs: meta
     runs-on: ubuntu-latest
+    # Build against Debian 12's glibc (2.36): the binary then needs glibc >= 2.34
+    # (Ubuntu 22.04, Debian 12, RHEL 9) without loader warnings. On a newer build
+    # host, std's weak references to newer glibc symbols (pidfd_spawnp, 2.39) make
+    # older loaders print "weak version not found" on every start.
+    container: rust:1-bookworm
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo --version && ldd --version | head -n1
       - run: scripts/package-linux.sh --out dist
       - name: Smoke test the tarball
         run: |
@@ -58,12 +63,36 @@ jobs:
           HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/x/sard-$VERSION-linux-x86_64/install.sh"
           test "$("$RUNNER_TEMP/home/.local/bin/sard" version)" = "sard $VERSION"
           ldd "$RUNNER_TEMP/home/.local/bin/sard"
-          objdump -T "$RUNNER_TEMP/home/.local/bin/sard" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1
+          # Oldest glibc that can load it: the highest non-weak GLIBC_ version it needs.
+          floor=$(readelf -V -W "$RUNNER_TEMP/home/.local/bin/sard" \
+            | awk '/Version needs/ {n=1} n && /Name: GLIBC_/ && /Flags: none/ {sub(/.*Name: GLIBC_/, ""); sub(/ .*/, ""); print}' \
+            | sort -V | tail -n1)
+          echo "needs glibc >= $floor"
       - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/sard-*-linux-x86_64.tar.gz
           if-no-files-found: error
+
+  linux-compat:
+    # The tarball must run (and install) on the oldest supported distro.
+    needs: [meta, linux]
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux
+          path: dist
+      - run: |
+          ldd --version | head -n1
+          tar -xzf "dist/sard-$VERSION-linux-x86_64.tar.gz" -C /tmp
+          HOME=/tmp/home "/tmp/sard-$VERSION-linux-x86_64/install.sh"
+          out=$(/tmp/home/.local/bin/sard version 2>&1)
+          echo "$out"
+          test "$out" = "sard $VERSION"
 
   macos:
     needs: meta
@@ -176,7 +205,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [meta, linux, macos]
+    needs: [meta, linux, linux-compat, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write

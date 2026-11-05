@@ -44,11 +44,15 @@ git tag -d v0.0.0-test.1                              # and the local tag
 ## What the workflow does
 
 1. **meta**: reads the crate version and checks it against the tag.
-2. **linux** (`ubuntu-latest`): `scripts/package-linux.sh`, then installs the tarball
-   into a scratch `$HOME` and runs it as a smoke test. The binary needs no system
-   libraries at build time (GPU, PipeWire and Wayland libraries are `dlopen`ed).
-   Its glibc floor is whatever `ubuntu-latest` ships; the job logs the highest
-   `GLIBC_` symbol version it uses.
+2. **linux** (`ubuntu-latest`, in a `rust:1-bookworm` container): `scripts/package-linux.sh`,
+   then installs the tarball into a scratch `$HOME` and runs it as a smoke test. The
+   binary needs no system libraries at build time (GPU, PipeWire and Wayland libraries
+   are `dlopen`ed).
+   It is built against Debian 12's glibc, so it runs on **glibc ≥ 2.34** (Ubuntu
+   22.04+, Debian 12+, RHEL 9+), and the job logs that floor. Built on a newer distro,
+   it would still run there, but Rust std's weak references to newer glibc symbols make
+   older loaders print `weak version 'GLIBC_2.39' not found` on every start.
+   **linux-compat** then installs and runs the tarball in an `ubuntu:22.04` container.
 3. **macos** (`macos-latest`, Apple Silicon): builds with `MACOSX_DEPLOYMENT_TARGET=13.0`,
    then `scripts/macos-app.sh --release --zip`:
    - Imports the Developer ID certificate into a temporary keychain (deleted at the end
