@@ -6,6 +6,9 @@
 #
 # PREFIX=/some/dir ./install.sh installs into /some/dir/bin and /some/dir/share instead.
 # Afterwards `sard update` (or the tray menu) keeps the binary up to date.
+#
+# From a source checkout, `packaging/linux/install.sh` installs target/release/sard
+# (after `cargo build --release`). Such development builds don't update themselves.
 set -eu
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -17,6 +20,17 @@ else
     datadir=${XDG_DATA_HOME:-$HOME/.local/share}
 fi
 sizes="16 32 48 64 128 256 512"
+
+# Unpacked release tarball, or packaging/linux/ inside a source checkout.
+bin=$here/sard
+desktop=$here/share/applications/sard.desktop
+icon_src() { echo "$here/share/icons/hicolor/${1}x$1/apps/sard.png"; }
+if [ ! -e "$bin" ] && [ -f "$here/../../Cargo.toml" ] && [ -f "$here/sard.desktop" ]; then
+    root=$(CDPATH='' cd -- "$here/../.." && pwd)
+    bin=$root/target/release/sard
+    desktop=$here/sard.desktop
+    icon_src() { echo "$root/assets/icons/app/sard-$1.png"; }
+fi
 
 mode=install
 case "${1:-}" in
@@ -55,15 +69,14 @@ if [ "$mode" = uninstall ]; then
     exit 0
 fi
 
-[ -x "$here/sard" ] || { echo "error: $here/sard not found (run install.sh from the unpacked release)" >&2; exit 1; }
-"$here/sard" version >/dev/null || { echo "error: this sard build does not run on this system" >&2; exit 1; }
+[ -x "$bin" ] || { echo "error: $bin not found (run install.sh from the unpacked release, or cargo build --release first)" >&2; exit 1; }
+"$bin" version >/dev/null || { echo "error: this sard build does not run on this system" >&2; exit 1; }
 
-put 755 "$here/sard" "$bindir/sard"
+put 755 "$bin" "$bindir/sard"
 
 # The menu entry runs the installed binary by absolute path, so it works even
 # when ~/.local/bin is not on the desktop session's PATH. Paths with characters
 # that would need desktop-entry quoting fall back to plain `sard`.
-desktop="$here/share/applications/sard.desktop"
 if [ -f "$desktop" ]; then
     case "$bindir" in
         *[!A-Za-z0-9/._+-]*) exe=sard ;;
@@ -75,7 +88,7 @@ if [ -f "$desktop" ]; then
     mv -f "$datadir/applications/sard.desktop.tmp.$$" "$datadir/applications/sard.desktop"
 fi
 for s in $sizes; do
-    icon="$here/share/icons/hicolor/${s}x$s/apps/sard.png"
+    icon=$(icon_src "$s")
     if [ -f "$icon" ]; then put 644 "$icon" "$datadir/icons/hicolor/${s}x$s/apps/sard.png"; fi
 done
 refresh
