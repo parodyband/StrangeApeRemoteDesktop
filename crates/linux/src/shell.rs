@@ -9,7 +9,8 @@ fn have(tool: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
 }
 
-fn kde() -> bool {
+/// Running under KDE Plasma (as the portal frontend picks its backend).
+pub(crate) fn kde() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_ascii_uppercase().contains("KDE"))
 }
 

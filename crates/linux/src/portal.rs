@@ -225,7 +225,17 @@ impl Session {
     /// Input injector that targets whichever stream `active` holds (the
     /// capture source updates it when switching displays).
     pub fn input(&self, active: Arc<std::sync::Mutex<StreamInfo>>) -> PortalInput {
-        PortalInput { conn: Arc::clone(&self.conn), session: self.path.clone(), stream: active, scroll_acc: (0.0, 0.0) }
+        let kde_axis = crate::shell::kde();
+        if kde_axis {
+            debug!("portal: KDE backend, compensating for its inverted NotifyPointerAxis dy");
+        }
+        PortalInput {
+            conn: Arc::clone(&self.conn),
+            session: self.path.clone(),
+            stream: active,
+            scroll_acc: (0.0, 0.0),
+            kde_axis,
+        }
     }
 }
 
@@ -241,6 +251,19 @@ pub struct PortalInput {
     session: String,
     stream: Arc<std::sync::Mutex<StreamInfo>>,
     scroll_acc: (f32, f32),
+    /// xdg-desktop-portal-kde negates `dy` of NotifyPointerAxis before handing
+    /// it to KWin (`wl_fixed_from_double(-y)` in waylandintegration.cpp, still
+    /// in Plasma 6.6); mutter passes it through. Only that call is affected:
+    /// `dx` and NotifyPointerAxisDiscrete are not negated on either.
+    kde_axis: bool,
+}
+
+/// Wire continuous scroll (`dy > 0` up, `dx > 0` left) to NotifyPointerAxis
+/// arguments: Wayland convention (`> 0` = down/right), except that the KDE
+/// portal wants `dy` pre-negated.
+fn axis_args(dx: f32, dy: f32, kde: bool) -> (f64, f64) {
+    let dy = if kde { dy } else { -dy };
+    (-dx as f64, dy as f64)
 }
 
 impl PortalInput {
@@ -287,14 +310,29 @@ impl PortalInput {
             }
             Ok(())
         } else {
-            let mut full = vec![
+            let (ax, ay) = axis_args(dx, dy, self.kde_axis);
+            let full = vec![
                 Value::Path(self.session.clone()),
                 dict(vec![("finish", Value::Bool(false))]),
-                Value::F64(-dx as f64),
-                Value::F64(-dy as f64),
+                Value::F64(ax),
+                Value::F64(ay),
             ];
-            let _ = &mut full;
             self.conn.call_noreply(DEST, PATH, RD, "NotifyPointerAxis", &full)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::axis_args;
+
+    #[test]
+    fn continuous_scroll_signs() {
+        // Wire: dy > 0 scrolls up, dx > 0 scrolls left.
+        // mutter: Wayland convention, > 0 = down/right.
+        assert_eq!(axis_args(2.0, 3.0, false), (-2.0, -3.0));
+        // KDE: the portal negates dy itself, so it must arrive un-negated;
+        // dx is passed through by KDE, so it is the same as mutter.
+        assert_eq!(axis_args(2.0, 3.0, true), (-2.0, 3.0));
     }
 }
