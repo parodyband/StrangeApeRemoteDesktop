@@ -60,8 +60,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_BUILD: bool = option_env!("SARD_RELEASE_BUILD").is_some();
 #[cfg(target_os = "macos")]
 const BUNDLE_ID: &str = "com.strangeape.sard";
-/// Set for the process [`restart`] starts on Windows, which may have to wait for the old one to let go of the
-/// app lock (there is no `exec` there).
+/// Set for the process [`restart`] starts on Windows and macOS, which may have to wait for the old one to let
+/// go of the app lock (there is no `exec` there).
 pub const RESTARTED_ENV: &str = "SARD_RESTARTED";
 
 /// A downloadable build for one platform, as listed in the signed manifest.
@@ -199,8 +199,10 @@ pub fn restart() -> ! {
     if let Ok(bundle) = &target
         && bundle.extension().is_some_and(|e| e == "app")
     {
+        // `open` does not pass our environment on; `--env` does. Without it the new instance found the
+        // app lock still held by this one and quit as "already running".
         let mut open = Command::new("/usr/bin/open");
-        open.arg("-n").arg(bundle);
+        open.arg("-n").arg("--env").arg(format!("{RESTARTED_ENV}=1")).arg(bundle);
         if !args.is_empty() {
             open.arg("--args").args(&args);
         }
