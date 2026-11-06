@@ -68,6 +68,7 @@ unsafe extern "C" {
     ) -> CFStringRef;
     pub fn CFStringGetCString(s: CFStringRef, buf: *mut c_char, size: CFIndex, encoding: u32) -> Boolean;
     pub fn CFCopyDescription(cf: CFTypeRef) -> CFStringRef;
+    pub fn CFDataCreate(alloc: CFAllocatorRef, bytes: *const u8, len: CFIndex) -> CFTypeRef;
 }
 
 /// An owned (+1) CoreFoundation reference, released on drop.
@@ -155,6 +156,13 @@ pub unsafe fn to_string(s: CFStringRef) -> String {
         }
         std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
     }
+}
+
+/// An immutable CFData copy of `bytes`.
+pub fn data(bytes: &[u8]) -> CfRef {
+    // SAFETY: copies `bytes`; +1 result.
+    unsafe { CfRef::from_owned(CFDataCreate(kCFAllocatorDefault, bytes.as_ptr(), bytes.len() as CFIndex)) }
+        .expect("CFDataCreate")
 }
 
 pub fn i32(v: i32) -> CfRef {

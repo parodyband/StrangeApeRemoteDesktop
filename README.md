@@ -129,7 +129,7 @@ does not include the display's scan-out.
 | | Linux (NVIDIA) | macOS (Apple Silicon) |
 |---|---|---|
 | Capture | xdg-desktop-portal + PipeWire, DMA-BUF | ScreenCaptureKit (IOSurface) |
-| Encode / decode | NVENC / NVDEC: HEVC, H.264, AV1 | VideoToolbox: HEVC, H.264 |
+| Encode / decode | NVENC / NVDEC: AV1, HEVC, H.264 | VideoToolbox: HEVC, H.264 encode; AV1 (M3+), HEVC, H.264 decode |
 | Present | EGL + OpenGL via CUDA/GL interop | Metal (`CAMetalLayer`) |
 | Input | RemoteDesktop portal | CGEvent |
 | Audio | PipeWire | ScreenCaptureKit / CoreAudio |
@@ -204,9 +204,10 @@ keychain); with an ad-hoc signature, macOS forgets the grants on every rebuild.
 
 - [x] Linux and macOS hosts and viewers, audio, clipboard, multi-monitor switching
 - [x] Menu bar / tray app, pairing from the UI, start at login, self-update
-- [ ] macOS AV1 decode (M3+ hardware), viewer-drawn cursor for macOS hosts
-- [ ] Connections beyond the LAN (NAT traversal / relay; the protocol already
-      routes by session index)
+- [x] AV1 by default when both ends have hardware for it (Mac viewers: M3 and later), else HEVC
+- [x] Connect Anywhere: reach paired computers across the internet (hole punching, TURN relay fallback)
+- [ ] Viewer-drawn cursor for macOS hosts
+- [ ] Bitrate control that tells Wi-Fi delay spikes from real congestion
 
 ## License
 

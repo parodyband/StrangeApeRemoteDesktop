@@ -319,12 +319,14 @@ fn negotiate(hello: &ClientHello, args: &Args) -> Result<SourceOptions> {
         c
     } else if let Some(c) = Codec::from_u8(hello.codec_pref).filter(|c| pick(*c)) {
         c
+    } else if pick(Codec::Av1) {
+        // Best quality per bit; only offered by viewers with a hardware AV1
+        // decoder (others get HEVC).
+        Codec::Av1
     } else if pick(Codec::Hevc) {
         Codec::Hevc
-    } else if pick(Codec::H264) {
-        Codec::H264
     } else {
-        Codec::Av1
+        Codec::H264
     };
     let host_fps: Option<u32> = args.parse_value("fps")?;
     let client_fps = if hello.max_fps == 0 { 60 } else { hello.max_fps as u32 };

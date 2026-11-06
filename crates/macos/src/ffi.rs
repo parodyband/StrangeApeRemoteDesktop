@@ -74,6 +74,16 @@ pub const kCVPixelFormatType_420v: u32 = u32::from_be_bytes(*b"420v");
 unsafe extern "C" {
     pub static kCMSampleAttachmentKey_NotSync: CFStringRef;
     pub static kCMSampleAttachmentKey_DependsOnOthers: CFStringRef;
+    pub static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CFStringRef;
+
+    pub fn CMVideoFormatDescriptionCreate(
+        alloc: CFAllocatorRef,
+        codec: u32,
+        width: i32,
+        height: i32,
+        extensions: CFDictionaryRef,
+        out: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
 
     pub fn CMSampleBufferGetDataBuffer(sbuf: CMSampleBufferRef) -> CMBlockBufferRef;
     pub fn CMSampleBufferGetFormatDescription(sbuf: CMSampleBufferRef) -> CMFormatDescriptionRef;
@@ -380,6 +390,8 @@ unsafe extern "C" {
     pub fn VTSessionCopyProperty(s: *mut c_void, key: CFStringRef, alloc: CFAllocatorRef, out: *mut c_void)
     -> OSStatus;
     pub fn VTIsHardwareDecodeSupported(codec: u32) -> Boolean;
+    /// macOS 11+: make an optional decoder (e.g. AV1) available to this process.
+    pub fn VTRegisterSupplementalVideoDecoderIfAvailable(codec: u32);
 }
 
 // ------------------------------------------------------------- CoreGraphics

@@ -7,6 +7,7 @@
 //! `sard-macos`) only deal with capture, encode, decode, presentation and input.
 
 pub mod anywhere;
+pub mod av1;
 pub mod clock;
 pub mod config;
 pub mod crypto;

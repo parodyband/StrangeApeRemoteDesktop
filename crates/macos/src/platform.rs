@@ -189,10 +189,11 @@ fn caps() -> &'static Caps {
                 Err(e) => sard_core::debug!("no {} encoder: {e}", c.name()),
             }
         }
-        // VideoToolbox always has H.264/HEVC decoders (software fallback);
-        // AV1 is not wired up in this backend.
-        let dec = Codec::Hevc.bit() | Codec::H264.bit();
+        // VideoToolbox always has H.264/HEVC decoders (software fallback).
+        // AV1 only with a hardware decoder (M3 and later): software AV1 is
+        // too slow for this, and the host then falls back to HEVC.
         let hw_dec = ALL.iter().filter(|&&c| vt::hardware_decode_supported(c)).fold(0, |m, c| m | c.bit());
+        let dec = Codec::Hevc.bit() | Codec::H264.bit() | (hw_dec & Codec::Av1.bit());
         Caps { gpu, os, enc, dec, enc_notes, hw_dec }
     })
 }

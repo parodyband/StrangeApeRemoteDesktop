@@ -105,3 +105,49 @@ fn h264_1080p() {
 fn av1_1440p() {
     roundtrip(Codec::Av1, 2560, 1440);
 }
+
+/// NVENC's AV1 output parses as VideoToolbox will need it: temporal units
+/// split into OBUs, and an `av1C` record from the keyframe's sequence header.
+#[test]
+fn av1_bitstream_for_videotoolbox() {
+    let Ok(cuda) = Cuda::new() else { return };
+    let (w, h) = (1920u32, 1080u32);
+    let params =
+        EncoderParams { codec: Codec::Av1, width: w, height: h, fps: 60, bitrate_kbps: 20_000, ..Default::default() };
+    let Ok(mut enc) = NvEncoder::new(cuda.clone(), params) else {
+        eprintln!("skipping: no NVENC AV1");
+        return;
+    };
+    let mut src = vec![0u8; (w * h * 3 / 2) as usize];
+    for t in 0..3u32 {
+        test_pattern_nv12(w as usize, h as usize, w as usize, t, &mut src);
+        let (idx, dptr, pitch) = enc.next_input();
+        {
+            let _g = cuda.push();
+            cuda.copy_2d(
+                Mem::Host(src.as_ptr()),
+                w as usize,
+                Mem::Device(dptr),
+                pitch,
+                w as usize,
+                (h * 3 / 2) as usize,
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+        }
+        let mut bits = Vec::new();
+        let key = enc.encode(idx, t as u64, false, &mut bits).unwrap();
+        let tu = sard_core::av1::split(&bits).expect("well-formed OBUs");
+        assert!(!tu.sample.is_empty());
+        if key {
+            let seq = tu.sequence_header.expect("keyframes carry a sequence header");
+            let (rec, s) = sard_core::av1::av1c(seq).expect("parsable sequence header");
+            assert_eq!((s.width, s.height), (w, h), "{s:?}");
+            assert!(s.subsampling_x && s.subsampling_y && !s.high_bitdepth, "{s:?}");
+            assert_eq!(rec[0], 0x81);
+            println!("NVENC AV1: {s:?}, av1C {:02x?}", &rec[..4]);
+        } else {
+            assert!(tu.sequence_header.is_none() || t == 0);
+        }
+    }
+}

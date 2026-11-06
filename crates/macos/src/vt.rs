@@ -449,7 +449,8 @@ pub struct VtDecoder {
     params: Vec<Vec<u8>>,
     slot: Box<DecSlot>,
     codec: Codec,
-    nal: NalCodec,
+    /// H.264 / HEVC: Annex-B NAL units; None for AV1 (OBUs).
+    nal: Option<NalCodec>,
     pub hardware: bool,
 }
 
@@ -458,13 +459,21 @@ unsafe impl Send for VtDecoder {}
 
 impl VtDecoder {
     pub fn new(codec: Codec) -> Result<Self> {
+        let nal = match codec {
+            Codec::Av1 => {
+                // SAFETY: plain registration call (no-op if unavailable).
+                unsafe { VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1) };
+                None
+            }
+            c => Some(nal_codec(c)?),
+        };
         Ok(VtDecoder {
             session: None,
             format: None,
             params: Vec::new(),
             slot: Box::new(DecSlot { out: Mutex::new(None) }),
             codec,
-            nal: nal_codec(codec)?,
+            nal,
             hardware: false,
         })
     }
@@ -477,21 +486,36 @@ impl VtDecoder {
     /// IOSurface-backed NV12 `CVPixelBuffer`, or `None` if the decoder
     /// produced no picture.
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<CfRef>> {
-        let au = annexb::split_access_unit(self.nal, data);
-        if !au.params.is_empty() {
-            let same =
-                au.params.len() == self.params.len() && au.params.iter().zip(&self.params).all(|(a, b)| *a == &b[..]);
-            if !same || self.session.is_none() {
-                self.configure(&au.params)?;
+        let sample = match self.nal {
+            Some(nal) => {
+                let au = annexb::split_access_unit(nal, data);
+                if !au.params.is_empty() {
+                    let same = au.params.len() == self.params.len()
+                        && au.params.iter().zip(&self.params).all(|(a, b)| *a == &b[..]);
+                    if !same || self.session.is_none() {
+                        self.configure(&au.params)?;
+                    }
+                }
+                au.sample
             }
-        }
+            None => {
+                // AV1: the sequence header (on keyframes) sets the decoder up.
+                let tu = sard_core::av1::split(data).ok_or("malformed AV1 data")?;
+                if let Some(seq) = tu.sequence_header
+                    && (self.session.is_none() || self.params.first().is_none_or(|p| p[..] != *seq))
+                {
+                    self.configure(&[seq])?;
+                }
+                tu.sample
+            }
+        };
         let (Some(session), Some(format)) = (&self.session, &self.format) else {
             return Err("waiting for a keyframe with parameter sets".into());
         };
-        if au.sample.is_empty() {
+        if sample.is_empty() {
             return Ok(None);
         }
-        let len = au.sample.len();
+        let len = sample.len();
         // SAFETY: CoreMedia allocates and owns the block memory; we copy into it.
         let sample = unsafe {
             let mut bb: CMBlockBufferRef = null_mut();
@@ -511,7 +535,7 @@ impl VtDecoder {
             )?;
             let bb = CfRef::from_owned(bb).ok_or("null block buffer")?;
             cf::check(
-                CMBlockBufferReplaceDataBytes(au.sample.as_ptr() as _, bb.as_ptr(), 0, len),
+                CMBlockBufferReplaceDataBytes(sample.as_ptr() as _, bb.as_ptr(), 0, len),
                 "CMBlockBufferReplaceDataBytes",
             )?;
             let mut sb: CMSampleBufferRef = null_mut();
@@ -558,7 +582,24 @@ impl VtDecoder {
         // SAFETY: arrays of `params.len()` valid parameter sets.
         let st = unsafe {
             match self.nal {
-                NalCodec::H264 => CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                None => {
+                    // AV1: describe the stream with an `av1C` record built from
+                    // the sequence header OBU.
+                    let (record, seq) = sard_core::av1::av1c(params[0]).ok_or("unparsable AV1 sequence header")?;
+                    let av1c_key = cf::string("av1C");
+                    let atoms = cf::Dict::new().set_ref(av1c_key.as_ptr(), &cf::data(&record));
+                    let ext = cf::Dict::new()
+                        .set(kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, atoms.as_ptr());
+                    CMVideoFormatDescriptionCreate(
+                        kCFAllocatorDefault,
+                        kCMVideoCodecType_AV1,
+                        seq.width as i32,
+                        seq.height as i32,
+                        ext.as_ptr(),
+                        &mut fd,
+                    )
+                }
+                Some(NalCodec::H264) => CMVideoFormatDescriptionCreateFromH264ParameterSets(
                     kCFAllocatorDefault,
                     params.len(),
                     ptrs.as_ptr(),
@@ -566,7 +607,7 @@ impl VtDecoder {
                     4,
                     &mut fd,
                 ),
-                NalCodec::Hevc => CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                Some(NalCodec::Hevc) => CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                     kCFAllocatorDefault,
                     params.len(),
                     ptrs.as_ptr(),
