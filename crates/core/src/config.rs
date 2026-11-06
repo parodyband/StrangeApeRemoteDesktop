@@ -118,6 +118,16 @@ impl TrustStore {
         self.save()
     }
 
+    pub fn remove(&mut self, key: &[u8; 32]) -> io::Result<bool> {
+        let before = self.peers.len();
+        self.peers.retain(|p| &p.key != key);
+        let changed = self.peers.len() != before;
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
     pub fn remove_by_name(&mut self, name: &str) -> io::Result<bool> {
         let before = self.peers.len();
         self.peers.retain(|p| p.name != name);
@@ -183,6 +193,14 @@ impl KnownHosts {
             .or_else(|| self.hosts.iter().find(|h| h.name.eq_ignore_ascii_case(q)))
     }
 
+    /// Forget a host; returns it if it was known.
+    pub fn remove(&mut self, key: &[u8; 32]) -> io::Result<Option<KnownHost>> {
+        let Some(i) = self.hosts.iter().position(|h| &h.key == key) else { return Ok(None) };
+        let h = self.hosts.remove(i);
+        self.save()?;
+        Ok(Some(h))
+    }
+
     pub fn add(&mut self, key: [u8; 32], addr: &str, name: &str) -> io::Result<()> {
         self.hosts.retain(|h| h.key != key && h.addr != addr);
         self.hosts.push(KnownHost { key, addr: addr.to_string(), name: sanitize(name) });
@@ -245,6 +263,18 @@ impl Aliases {
         self.entries.retain(|(a, _)| !a.eq_ignore_ascii_case(alias));
         self.entries.push((alias.to_string(), addr.to_string()));
         self.save()
+    }
+
+    /// Drop every alias that points at `host` (by address or name).
+    pub fn remove_for(&mut self, host: &KnownHost) -> io::Result<()> {
+        let before = self.entries.len();
+        self.entries.retain(|(_, addr)| {
+            !(addr == &host.addr || strip_port(addr) == strip_port(&host.addr) || addr.eq_ignore_ascii_case(&host.name))
+        });
+        if self.entries.len() != before {
+            self.save()?;
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, alias: &str) -> io::Result<bool> {

@@ -44,6 +44,10 @@ pub enum AppEvent {
     Menu(u32),
     /// A background connect attempt finished.
     Connected { id: u64, label: String, result: std::result::Result<Connection, String> },
+    /// The user confirmed forgetting a paired host (by key).
+    ForgetHost([u8; 32]),
+    /// The user confirmed revoking a device allowed to view this computer.
+    RemoveDevice([u8; 32]),
     /// "Pair with a new computer" finished: the address to connect to (None = cancelled).
     Paired(std::result::Result<Option<String>, String>),
     /// Host service state changed (viewer connected, sharing toggled, ...).
@@ -203,6 +207,11 @@ impl Session {
 
     pub fn window_id(&self) -> WindowId {
         self.window.id()
+    }
+
+    /// The host's public key (identifies it in `known_hosts.txt`).
+    pub fn host_key(&self) -> [u8; 32] {
+        self.conn.peer_key()
     }
 
     pub fn focus(&self) {

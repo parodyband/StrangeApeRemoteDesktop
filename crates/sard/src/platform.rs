@@ -23,6 +23,7 @@
 //!     // (inside `resumed`). The callback may fire on any thread.
 //! fn prompt_text(title: &str, message: &str) -> Option<String>;  // modal text entry; None = cancelled
 //! fn show_message(title: &str, message: &str);                   // modal notice
+//! fn confirm(title: &str, message: &str, action: &str) -> bool;  // modal yes/no (blocks)
 //! fn set_launch_at_login(enabled: bool) -> Result<()>;
 //! fn launch_at_login() -> bool;
 //! fn set_dock_visible(visible: bool);  // macOS: Dock icon while a viewer window is open (no-op on Linux)

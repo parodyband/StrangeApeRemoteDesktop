@@ -77,6 +77,10 @@ pub fn prompt_text(title: &str, message: &str) -> Option<String> {
     crate::shell::prompt_text(title, message)
 }
 
+pub fn confirm(title: &str, message: &str, action: &str) -> bool {
+    crate::shell::confirm(title, message, action)
+}
+
 pub fn show_message(title: &str, message: &str) {
     crate::shell::show_message(title, message)
 }

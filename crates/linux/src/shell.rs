@@ -34,6 +34,25 @@ pub fn prompt_text(title: &str, message: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Ask before doing something; `true` if the user chose `action`. Blocks
+/// until answered: call from a background thread.
+pub fn confirm(title: &str, message: &str, action: &str) -> bool {
+    let status = match dialog_tool() {
+        Some("kdialog") => Command::new("kdialog")
+            .args(["--title", title, "--warningcontinuecancel", message, "--continue-label", action])
+            .status(),
+        Some(_) => Command::new("zenity")
+            .args(["--question", "--no-wrap", "--title", title, "--text", message, "--ok-label", action])
+            .args(["--cancel-label", "Cancel"])
+            .status(),
+        None => {
+            eprintln!("{title}: {message} (install kdialog or zenity to confirm)");
+            return false;
+        }
+    };
+    status.is_ok_and(|s| s.success())
+}
+
 /// Show an informational message without blocking the caller.
 pub fn show_message(title: &str, message: &str) {
     let mut cmd = match dialog_tool() {

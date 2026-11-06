@@ -41,31 +41,30 @@ fn flatten(entries: &[MenuEntry], nodes: &mut Vec<Node>) -> Vec<i32> {
     for e in entries {
         let id = nodes.len() as i32;
         nodes.push(Node { props: Vec::new(), children: Vec::new(), user_id: None });
+        // Always send every property: Plasma's importer only updates the
+        // properties present in a new layout, so an omitted "enabled" would
+        // keep a reused item greyed out (e.g. after "Checking for Updates…").
+        let full = |label: &str, enabled: bool, sep: bool, check: Option<bool>, submenu: bool| {
+            vec![
+                ("type", Value::Str(if sep { "separator" } else { "standard" }.into())),
+                ("label", Value::Str(label.replace('_', "__"))),
+                ("enabled", Value::Bool(enabled)),
+                ("visible", Value::Bool(true)),
+                ("toggle-type", Value::Str(if check.is_some() { "checkmark" } else { "" }.into())),
+                ("toggle-state", Value::I32(check.map_or(-1, i32::from))),
+                ("children-display", Value::Str(if submenu { "submenu" } else { "" }.into())),
+            ]
+        };
         let node = match e {
             MenuEntry::Separator => {
-                Node { props: vec![("type", Value::Str("separator".into()))], children: Vec::new(), user_id: None }
+                Node { props: full("", true, true, None, false), children: Vec::new(), user_id: None }
             }
             MenuEntry::Item { id: uid, label, enabled, checked } => {
-                let mut props = vec![("label", Value::Str(label.replace('_', "__")))];
-                if !enabled {
-                    props.push(("enabled", Value::Bool(false)));
-                }
-                if let Some(c) = checked {
-                    props.push(("toggle-type", Value::Str("checkmark".into())));
-                    props.push(("toggle-state", Value::I32(*c as i32)));
-                }
-                Node { props, children: Vec::new(), user_id: Some(*uid) }
+                Node { props: full(label, *enabled, false, *checked, false), children: Vec::new(), user_id: Some(*uid) }
             }
             MenuEntry::Submenu { label, enabled, items } => {
                 let children = flatten(items, nodes);
-                let mut props = vec![
-                    ("label", Value::Str(label.replace('_', "__"))),
-                    ("children-display", Value::Str("submenu".into())),
-                ];
-                if !enabled {
-                    props.push(("enabled", Value::Bool(false)));
-                }
-                Node { props, children, user_id: None }
+                Node { props: full(label, *enabled, false, None, true), children, user_id: None }
             }
         };
         nodes[id as usize] = node;

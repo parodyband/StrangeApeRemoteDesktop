@@ -83,11 +83,31 @@ from a clone of the repo:
 | Secret | Required | What |
 |---|---|---|
 | `UPDATE_SIGNING_KEY` | **yes** (set) | ed25519 private key for `latest.txt` |
-| `MACOS_CERTIFICATE_P12` | for signed macOS builds | base64 of the *Developer ID Application* certificate + private key (`.p12`) |
+| `MACOS_SELFSIGN_P12` | **yes** (set) | base64 of Sard's own code-signing certificate + key (`.p12`), used when there is no Developer ID |
+| `MACOS_SELFSIGN_P12_PASSWORD` | with the above (set) | its password |
+| `MACOS_CERTIFICATE_P12` | for notarized macOS builds | base64 of the *Developer ID Application* certificate + private key (`.p12`); takes precedence |
 | `MACOS_CERTIFICATE_PASSWORD` | with the above | password chosen when exporting the `.p12` |
 | `APPLE_API_KEY_ID` | for notarization | App Store Connect API key ID (10 characters) |
 | `APPLE_API_ISSUER_ID` | for notarization | App Store Connect issuer ID (UUID) |
 | `APPLE_API_KEY_P8` | for notarization | base64 of the downloaded `AuthKey_<KEYID>.p8` |
+
+### Sard's own certificate (`MACOS_SELFSIGN_P12`)
+
+macOS remembers Screen Recording / Accessibility grants per *code signing
+identity*. An ad-hoc signature changes with every build, so each update looked
+like a new app and the grants were lost. Without a Developer ID, releases are
+therefore signed with a self-signed certificate made for Sard
+(`CN=Sard Code Signing (Strange Ape)`, valid until 2046; the public half is
+`packaging/macos/sard-codesign.pem`). The workflow trusts it for code signing
+on the throwaway runner, signs with it (hardened runtime, no timestamp) and
+skips notarization. The designated requirement is then
+`identifier "com.strangeape.sard" and certificate root = H"801a3366…"`, the
+same for every release, so grants survive updates.
+
+The private key, `.p12` and its password are backed up in
+`~/.config/sard-release/macos-signing.*` (mode 0600) on the maintainer's
+Linux machine; keep a second copy somewhere safe. Never replace the
+certificate casually: every user would have to grant the permissions again.
 
 ### Developer ID Application certificate (`MACOS_CERTIFICATE_P12`, `MACOS_CERTIFICATE_PASSWORD`)
 

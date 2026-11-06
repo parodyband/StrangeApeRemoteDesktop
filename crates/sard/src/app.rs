@@ -7,7 +7,7 @@ use crate::client;
 use crate::host::{HostService, HostStatus};
 use crate::session::{AppEvent, Outcome, Session, SessionEvent, SessionOpts};
 use crate::{Result, platform};
-use sard_core::config::{self, Aliases, KnownHosts};
+use sard_core::config::{self, Aliases, KnownHosts, TrustStore};
 use sard_core::media::{MenuEntry, Rgba, Tray, TrayIcons};
 use sard_core::net::Client;
 use sard_core::proto::Control;
@@ -151,6 +151,8 @@ enum Action {
     CheckUpdates,
     InstallUpdate,
     OpenPermission(&'static str),
+    ForgetHost([u8; 32], String),
+    RemoveDevice([u8; 32], String),
     Quit,
 }
 
@@ -188,8 +190,19 @@ struct App {
 /// (session id, label, [(display id, name)], current display)
 type SessionMenu = (u64, String, Vec<(u32, String)>, Option<u32>);
 
+/// Remove a paired host and any aliases pointing at it.
+fn forget_host(key: &[u8; 32]) -> Result<()> {
+    let dir = config::config_dir();
+    if let Some(h) = KnownHosts::load(&dir)?.remove(key)? {
+        Aliases::load(&dir)?.remove_for(&h)?;
+        info!("forgot {} ({})", h.name, h.addr);
+    }
+    Ok(())
+}
+
 /// One paired host as shown in the menu.
 struct HostEntry {
+    key: [u8; 32],
     label: String,
     target: String,
 }
@@ -208,9 +221,9 @@ fn paired_hosts() -> Vec<HostEntry> {
             });
             match alias {
                 Some((a, _)) if !a.eq_ignore_ascii_case(&h.name) => {
-                    HostEntry { label: format!("{a} ({})", h.name), target: a.clone() }
+                    HostEntry { key: h.key, label: format!("{a} ({})", h.name), target: a.clone() }
                 }
-                _ => HostEntry { label: h.name.clone(), target: h.addr.clone() },
+                _ => HostEntry { key: h.key, label: h.name.clone(), target: h.addr.clone() },
             }
         })
         .collect()
@@ -376,6 +389,11 @@ impl App {
 
         // ---- connect ----
         let hosts = paired_hosts();
+        let mut forget = Vec::new();
+        for h in &hosts {
+            let e = self.item(format!("{}…", h.label), Action::ForgetHost(h.key, h.label.clone()));
+            forget.push(e);
+        }
         let mut sub = Vec::new();
         for h in hosts {
             let open = self.sessions.iter().find(|s| s.target == h.target).map(|s| s.id);
@@ -391,6 +409,9 @@ impl App {
         let pair_label = if self.pairing_busy { "Pairing…" } else { "Pair with a New Computer…" };
         let pair = self.item(pair_label, Action::PairHost);
         sub.push(pair);
+        if !forget.is_empty() {
+            sub.push(MenuEntry::Submenu { label: "Forget".into(), enabled: true, items: forget });
+        }
         m.push(MenuEntry::Submenu { label: "Connect To".into(), enabled: true, items: sub });
         m.push(MenuEntry::Separator);
 
@@ -409,6 +430,17 @@ impl App {
                 m.push(c);
             }
         }
+        let devices = TrustStore::load(&config::config_dir()).map(|t| t.peers).unwrap_or_default();
+        let mut allowed = Vec::new();
+        for d in devices {
+            let name = if d.name.is_empty() { sard_core::crypto::fingerprint(&d.key) } else { d.name.clone() };
+            let e = self.item(format!("Remove {name}…"), Action::RemoveDevice(d.key, name));
+            allowed.push(e);
+        }
+        if allowed.is_empty() {
+            allowed.push(Self::text("No devices yet"));
+        }
+        m.push(MenuEntry::Submenu { label: "Allowed Devices".into(), enabled: true, items: allowed });
         m.push(MenuEntry::Separator);
         let login = self.check("Start at Login", platform::launch_at_login(), Action::ToggleLogin);
         m.push(login);
@@ -583,6 +615,28 @@ impl App {
                 self.refresh();
             }
             Action::OpenPermission(p) => platform::open_permission_settings(p),
+            Action::ForgetHost(key, label) => {
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let msg = format!(
+                        "This computer won't be able to connect to {label} any more until you pair them again."
+                    );
+                    if platform::confirm(&format!("Forget {label}?"), &msg, "Forget") {
+                        let _ = proxy.send_event(AppEvent::ForgetHost(key));
+                    }
+                });
+            }
+            Action::RemoveDevice(key, name) => {
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let msg = format!(
+                        "{name} won't be able to view or control this computer any more until you pair them again."
+                    );
+                    if platform::confirm(&format!("Remove {name}?"), &msg, "Remove") {
+                        let _ = proxy.send_event(AppEvent::RemoveDevice(key));
+                    }
+                });
+            }
             Action::CheckUpdates => self.check_updates(true),
             Action::InstallUpdate => self.install_update(),
             Action::Quit => {
@@ -668,6 +722,26 @@ impl ApplicationHandler<AppEvent> for App {
         match ev {
             AppEvent::Menu(id) => self.on_menu(el, id),
             AppEvent::HostChanged | AppEvent::Refresh => self.refresh(),
+            AppEvent::ForgetHost(key) => {
+                if let Err(e) = forget_host(&key) {
+                    notify("Sard", &format!("Could not forget that computer: {e}"));
+                }
+                self.sessions.retain(|s| s.host_key() != key);
+                self.refresh();
+            }
+            AppEvent::RemoveDevice(key) => {
+                let r = match &self.host {
+                    Some(h) => h.remove_device(&key),
+                    None => TrustStore::load(&config::config_dir())
+                        .and_then(|mut t| t.remove(&key))
+                        .map(|_| ())
+                        .map_err(Into::into),
+                };
+                if let Err(e) = r {
+                    notify("Sard", &format!("Could not remove that device: {e}"));
+                }
+                self.refresh();
+            }
             AppEvent::UpdateChecked { manual, result } => {
                 self.update_busy = false;
                 match result {

@@ -87,6 +87,7 @@ pub struct HostService {
     /// Held while sharing: one host per user (two would split the port).
     _lock: std::fs::File,
     host: Arc<Host>,
+    trust: Arc<Mutex<TrustStore>>,
     state: Arc<ServiceState>,
     accept: Option<std::thread::JoinHandle<()>>,
 }
@@ -103,6 +104,7 @@ impl HostService {
         let trusted: HashMap<[u8; 32], String> = trust.peers.iter().map(|p| (p.key, p.name.clone())).collect();
         let pair = pair || trust.peers.is_empty();
         let trust = Arc::new(Mutex::new(trust));
+        let trust_paired = Arc::clone(&trust);
         let port: u16 = args.parse_value("port")?.unwrap_or(sard_core::DEFAULT_PORT);
         let bind: SocketAddr = format!("{}:{port}", args.value("bind").unwrap_or("0.0.0.0")).parse()?;
         let cfg = crate::net_config(args)?;
@@ -128,7 +130,7 @@ impl HostService {
                 pairing_code: None,
                 on_paired: Some(Box::new(move |key, name| {
                     info!("paired with {name}");
-                    if let Err(e) = trust.lock().unwrap().add(key, name) {
+                    if let Err(e) = trust_paired.lock().unwrap().add(key, name) {
                         error!("could not save trusted client: {e}");
                     }
                     paired_state.status.lock().unwrap().pairing = None; // the code is spent
@@ -138,7 +140,8 @@ impl HostService {
             },
         )?;
         let host = Arc::new(host);
-        let mut svc = HostService { _lock: lock, host: Arc::clone(&host), state: Arc::clone(&state), accept: None };
+        let mut svc =
+            HostService { _lock: lock, host: Arc::clone(&host), trust, state: Arc::clone(&state), accept: None };
         let _ = std::fs::remove_file(dir.join("pairing-code.txt"));
         if pair {
             svc.new_pairing_code();
@@ -176,6 +179,23 @@ impl HostService {
         self.state.status.lock().unwrap().pairing = Some((code.clone(), Instant::now() + PAIRING_TTL));
         (self.state.on_change)();
         code
+    }
+
+    /// Revoke a paired device: it can't connect any more (and is disconnected
+    /// if it is viewing right now).
+    pub fn remove_device(&self, key: &[u8; 32]) -> Result<()> {
+        self.host.untrust(key);
+        self.trust.lock().unwrap().remove(key)?;
+        let current = self.state.current.lock().unwrap().clone();
+        if let Some(c) = current
+            && &c.peer_key() == key
+        {
+            c.send_control(&Control::Status { text: "this device's access was removed".into() });
+            std::thread::sleep(Duration::from_millis(30));
+            c.close();
+        }
+        (self.state.on_change)();
+        Ok(())
     }
 
     /// End the current viewer's session.

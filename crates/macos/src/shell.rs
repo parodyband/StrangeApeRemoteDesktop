@@ -30,6 +30,15 @@ const MESSAGE_SCRIPT: &[&str] = &[
     "end run",
 ];
 
+/// Yes/no alert; exits non-zero on Cancel.
+const CONFIRM_SCRIPT: &[&str] = &[
+    "on run argv",
+    "activate",
+    "display alert (item 1 of argv) message (item 2 of argv) as warning \
+     buttons {\"Cancel\", (item 3 of argv)} default button (item 3 of argv) cancel button \"Cancel\"",
+    "end run",
+];
+
 fn osascript(script: &[&str], args: &[&str]) -> std::io::Result<Output> {
     let mut cmd = Command::new("/usr/bin/osascript");
     for line in script {
@@ -57,6 +66,18 @@ pub fn prompt_text(title: &str, message: &str) -> Option<String> {
         Err(e) => {
             sard_core::warn!("cannot run osascript: {e}");
             None
+        }
+    }
+}
+
+/// Ask before doing something; `true` if the user chose `action`. Blocks
+/// until answered (any thread).
+pub fn confirm(title: &str, message: &str, action: &str) -> bool {
+    match osascript(CONFIRM_SCRIPT, &[title, message, action]) {
+        Ok(out) => out.status.success(),
+        Err(e) => {
+            sard_core::warn!("cannot run osascript: {e}");
+            false
         }
     }
 }

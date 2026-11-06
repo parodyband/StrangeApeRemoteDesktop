@@ -1378,6 +1378,11 @@ impl Host {
         self.shared.socket.local_addr()
     }
 
+    /// Stop accepting a paired client (its sessions are not closed here).
+    pub fn untrust(&self, key: &[u8; 32]) {
+        lock(&self.shared.trusted).remove(key);
+    }
+
     /// Open (or close, with None) a pairing window for a normalized code.
     pub fn set_pairing_code(&self, code: Option<&str>) {
         lock(&self.shared.pake).clear();

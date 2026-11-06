@@ -108,14 +108,27 @@ jobs:
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - run: cargo build --release --locked -p sard
 
-      - name: Import Developer ID certificate into a temporary keychain
+      - name: Import the signing certificate into a temporary keychain
         id: cert
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SELFSIGN_P12: ${{ secrets.MACOS_SELFSIGN_P12 }}
+          MACOS_SELFSIGN_P12_PASSWORD: ${{ secrets.MACOS_SELFSIGN_P12_PASSWORD }}
         run: |
-          if [ -z "$MACOS_CERTIFICATE_P12" ]; then
-            echo "::warning::MACOS_CERTIFICATE_P12 is not set: the macOS build is ad-hoc signed and not notarized"
+          kind=developer-id
+          if [ -z "$MACOS_CERTIFICATE_P12" ] && [ -n "$MACOS_SELFSIGN_P12" ]; then
+            # Sard's own certificate (packaging/macos/sard-codesign.pem): not
+            # notarizable, but a stable identity, so macOS keeps Screen Recording /
+            # Accessibility grants across updates (ad-hoc signatures lose them).
+            kind=selfsigned
+            MACOS_CERTIFICATE_P12=$MACOS_SELFSIGN_P12
+            MACOS_CERTIFICATE_PASSWORD=$MACOS_SELFSIGN_P12_PASSWORD
+          fi
+          [ -n "$MACOS_CERTIFICATE_P12" ] || kind=adhoc
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          if [ "$kind" = adhoc ]; then
+            echo "::warning::no signing certificate secret is set: the macOS build is ad-hoc signed and not notarized"
             echo "identity=-" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -131,9 +144,18 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
           # Search the temporary keychain first (and keep the existing ones).
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
-          identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ "$kind" = selfsigned ]; then
+            # codesign only uses trusted identities: trust this one certificate
+            # for code signing on the (throwaway) runner.
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+              -k /Library/Keychains/System.keychain packaging/macos/sard-codesign.pem
+            identity=$(security find-identity -v -p codesigning "$keychain" | awk '/Sard Code Signing/ {print $2; exit}')
+          else
+            identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          fi
           if [ -z "$identity" ]; then
-            echo "::error::MACOS_CERTIFICATE_P12 contains no valid 'Developer ID Application' identity"
+            echo "::error::the certificate secret contains no valid signing identity ($kind)"
+            security find-identity -p codesigning "$keychain"
             exit 1
           fi
           echo "identity=$identity" >> "$GITHUB_OUTPUT"
@@ -141,15 +163,18 @@ jobs:
       - name: Build and sign Sard.app
         env:
           IDENTITY: ${{ steps.cert.outputs.identity }}
+          KIND: ${{ steps.cert.outputs.kind }}
         run: |
-          scripts/macos-app.sh --no-build --release --zip --identity "$IDENTITY" --out dist
+          extra=()
+          [ "$KIND" = selfsigned ] && extra+=(--no-timestamp)
+          scripts/macos-app.sh --no-build --release --zip --identity "$IDENTITY" "${extra[@]}" --out dist
           codesign --verify --strict --verbose=2 dist/Sard.app
           codesign -dv dist/Sard.app
           test "$(dist/Sard.app/Contents/MacOS/sard version)" = "sard $VERSION"
 
       - name: Notarize and staple
         id: notarize
-        if: steps.cert.outputs.identity != '-'
+        if: steps.cert.outputs.kind == 'developer-id'
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
@@ -184,10 +209,10 @@ jobs:
       - name: Result
         id: result
         env:
-          IDENTITY: ${{ steps.cert.outputs.identity }}
+          KIND: ${{ steps.cert.outputs.kind }}
           NOTARIZED: ${{ steps.notarize.outputs.notarized }}
         run: |
-          if [ "$IDENTITY" = - ]; then echo "signing=adhoc" >> "$GITHUB_OUTPUT"; else echo "signing=developer-id" >> "$GITHUB_OUTPUT"; fi
+          echo "signing=$KIND" >> "$GITHUB_OUTPUT"
           echo "notarized=${NOTARIZED:-false}" >> "$GITHUB_OUTPUT"
 
       - name: Remove temporary keychain and API key
@@ -253,6 +278,12 @@ jobs:
               echo "> The macOS build of this release is **ad-hoc signed and not notarized** (no Developer ID certificate was configured)."
               echo "> Gatekeeper blocks it on first launch: Control-click Sard.app → Open, or run \`xattr -dr com.apple.quarantine Sard.app\`."
               echo "> macOS also forgets the Screen Recording / Accessibility grants on every update of an ad-hoc signed app."
+              echo
+            elif [ "$SIGNING" = selfsigned ]; then
+              echo "> [!NOTE]"
+              echo "> The macOS build is signed with Sard's own certificate, not an Apple Developer ID, so it is not notarized."
+              echo "> The one-line installer (README) installs it directly. A zip downloaded with a browser needs Control-click → Open the first time."
+              echo "> Screen Recording / Accessibility grants are kept across updates."
               echo
             elif [ "$NOTARIZED" != true ]; then
               echo "> [!WARNING]"

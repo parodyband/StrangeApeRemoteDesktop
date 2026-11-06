@@ -17,6 +17,8 @@
 #               as notarization requires. Default identity: the first
 #               "Developer ID Application" one; signing failures are fatal.
 #   --zip       Also write <out>/sard-<version>-macos-<arch>.zip (ditto).
+#   --no-timestamp  Skip the secure timestamp (for identities Apple's timestamp
+#               service won't serve, e.g. Sard's own self-signed certificate).
 #
 # The app icon is built from assets/icons/app/sard-{16..1024}.png (skipped if
 # they are missing). Run it afterwards with e.g.:
@@ -30,6 +32,7 @@ cd "$(dirname "$0")/.."
 profile=release
 build=1
 identity=auto
+no_timestamp=0
 out=dist
 release=0
 zip=0
@@ -38,6 +41,7 @@ while [ $# -gt 0 ]; do
         --debug) profile=debug ;;
         --no-build) build=0 ;;
         --identity) identity="$2"; shift ;;
+        --no-timestamp) no_timestamp=1 ;;
         --out) out="$2"; shift ;;
         --release) release=1 ;;
         --zip) zip=1 ;;
@@ -140,7 +144,7 @@ sign() {
     if [ "$release" = 1 ]; then
         # Hardened runtime + secure timestamp: required for notarization.
         ts=--timestamp
-        [ "$1" = - ] && ts=--timestamp=none
+        { [ "$1" = - ] || [ "$no_timestamp" = 1 ]; } && ts=--timestamp=none
         codesign --force --sign "$1" --identifier com.strangeape.sard --options runtime "$ts" \
             --entitlements packaging/macos/sard.entitlements "$app"
     else
