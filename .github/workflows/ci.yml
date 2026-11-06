@@ -52,6 +52,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # GPU / PipeWire / D-Bus / VideoToolbox / D3D11 hardware tests skip themselves on runners without them.
       - run: cargo test --workspace --locked
+      - name: Direct3D pipeline on the runner's software GPU (output)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p sard-windows --test d3d_pipeline --test clipboard -- --nocapture
       - name: Smoke test the Windows binary, package and installer
         if: runner.os == 'Windows'
         run: |
