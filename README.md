@@ -96,6 +96,17 @@ shared); all screens are always available.
 | <kbd>K</kbd> | request a fresh keyframe |
 | <kbd>Q</kbd> | disconnect |
 
+### Smoother streaming from a Mac on Wi-Fi
+
+While AirDrop, Handoff, Universal Control or Sidecar are active, a Mac's Wi-Fi
+radio leaves your network for AWDL (Apple's device-to-device link) for about
+70 ms every half second. Average latency stays low, but frames arrive in jerks.
+Sard notices the pattern and adds **⚠ Wi-Fi Stalls: Turn Off AirDrop &
+Handoff…** to its menu, which opens that settings page. Setting AirDrop to
+"Receiving Off" and turning Handoff off while you stream makes it smooth again;
+Ethernet avoids it entirely. (Marking traffic as real-time voice/video didn't
+help in testing, and disabling AWDL needs root.)
+
 ## Command line
 
 Everything in the menu also works from a terminal:
@@ -262,7 +273,7 @@ keychain); with an ad-hoc signature, macOS forgets the grants on every rebuild.
 - [x] Connect Anywhere: reach paired computers across the internet (hole punching, TURN relay fallback)
 - [x] Viewer-drawn cursor for macOS hosts (instant pointer; the video no longer carries the cursor)
 - [x] Bitrate control that tells Wi-Fi stalls (AWDL / power save) from real congestion
-- [ ] Optional: pause AWDL (AirDrop/Handoff radio) while viewing from a Mac on Wi-Fi
+- [x] Mac viewers on Wi-Fi: detect AWDL stalls and point to the AirDrop & Handoff setting
 
 ## License
 

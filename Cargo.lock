@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "sard"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "sard-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "sard-linux"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "libc",
  "raw-window-handle",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "sard-macos"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "block2 0.6.2",
  "libc",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "sard-windows"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "raw-window-handle",
  "sard-core",

@@ -31,9 +31,14 @@ const STREAM_CURSOR_METADATA: u32 = crate::host::STREAM_CURSOR_METADATA;
 #[derive(Debug)]
 pub enum SessionEvent {
     Control(Control),
-    CursorPos { visible: bool },
+    CursorPos {
+        visible: bool,
+    },
     Disconnected(String),
     Stats(String),
+    /// Smooth on average but with regular long stalls: the pattern of a Mac's
+    /// Wi-Fi pausing for AWDL (AirDrop/Handoff). Sent at most once per session.
+    WifiStalls,
 }
 
 /// Everything the winit event loop can be woken with.
@@ -114,6 +119,8 @@ pub struct Session {
     focused: bool,
     cursors: HashMap<u32, CustomCursor>,
     remote_cursor_visible: bool,
+    /// The viewer saw the AWDL stall pattern (see [`SessionEvent::WifiStalls`]).
+    pub wifi_stalls: bool,
 }
 
 fn pack(w: u32, h: u32) -> u64 {
@@ -213,6 +220,7 @@ impl Session {
             focused: true,
             cursors: HashMap::new(),
             remote_cursor_visible: true,
+            wifi_stalls: false,
         })
     }
 
@@ -437,6 +445,7 @@ impl Session {
             }
             SessionEvent::Disconnected(r) => return Outcome::Closed(format!("Disconnected: {r}")),
             SessionEvent::Stats(s) => self.window.set_title(&s),
+            SessionEvent::WifiStalls => self.wifi_stalls = true,
         }
         Outcome::Continue
     }
@@ -535,6 +544,23 @@ fn fit_window(w: &Window, vw: u32, vh: u32) {
     let _ = w.request_inner_size(PhysicalSize::new((vw as f64 * scale) as u32, (vh as f64 * scale) as u32));
 }
 
+/// Spots the pattern of a Mac's Wi-Fi pausing for AWDL (AirDrop/Handoff):
+/// seconds whose median latency is fine but whose p95 is long, in at least 4
+/// of the last 10 seconds.
+#[derive(Default)]
+struct StallDetector {
+    history: u16,
+}
+
+impl StallDetector {
+    /// Feed one second's latency percentiles (µs); true once the pattern holds.
+    fn second(&mut self, p50_us: u32, p95_us: u32) -> bool {
+        let stalled = p95_us > 40_000 && p95_us > 3 * p50_us.max(1) && p50_us < 25_000;
+        self.history = (self.history << 1 | stalled as u16) & 0x3ff;
+        self.history.count_ones() >= 4
+    }
+}
+
 /// Network events → UI thread; audio and clipboard are handled right here.
 fn forward_events(
     events: Receiver<Event>,
@@ -605,6 +631,7 @@ fn render_loop(
     let (mut n, mut bytes, mut errors, mut log_n) = (0u32, 0usize, 0u32, 0u32);
     let mut last = Instant::now();
     let mut meta_last: Option<FrameMeta> = None;
+    let (mut stalls, mut stalls_reported) = (StallDetector::default(), false);
     while !stop.load(Ordering::Relaxed) {
         let s = win_size.load(Ordering::Relaxed);
         if s != size {
@@ -640,6 +667,16 @@ fn render_loop(
         let dt = last.elapsed();
         if dt >= Duration::from_secs(1) {
             let (l, d, st) = (e2e.take(), decode.take(), conn.stats());
+            // AWDL signature: a normal median but a long tail, again and again.
+            if cfg!(target_os = "macos") && !stalls_reported && n >= 20 && stalls.second(l.p50, l.p95) {
+                stalls_reported = true;
+                info!(
+                    "Wi-Fi stalls detected (latency p50 {:.1} ms, p95 {:.1} ms)",
+                    l.p50 as f64 / 1e3,
+                    l.p95 as f64 / 1e3
+                );
+                let _ = proxy.send_event(AppEvent::Session(id, SessionEvent::WifiStalls));
+            }
             let title = match meta_last {
                 Some(m) => format!(
                     "Sard — {label} — {}x{} {} — {:.0} fps — latency {:.1} ms (p95 {:.1}) — decode {:.1} ms — {:.1} Mbps — rtt {:.1} ms — lost {}",
@@ -667,5 +704,29 @@ fn render_loop(
             bytes = 0;
             last = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StallDetector;
+
+    #[test]
+    fn stall_pattern_needs_repeats_and_a_good_median() {
+        let mut d = StallDetector::default();
+        // Smooth seconds and one-off hiccups don't count.
+        for _ in 0..10 {
+            assert!(!d.second(6_000, 9_000));
+        }
+        for _ in 0..3 {
+            assert!(!d.second(6_000, 120_000));
+        }
+        // A congested link (everything slow) isn't the AWDL pattern.
+        let mut c = StallDetector::default();
+        for _ in 0..10 {
+            assert!(!c.second(60_000, 120_000));
+        }
+        // Repeated long tails over a good median: yes.
+        assert!(d.second(7_000, 90_000));
     }
 }

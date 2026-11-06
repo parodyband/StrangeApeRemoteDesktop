@@ -192,6 +192,7 @@ enum Action {
     InstallUpdate,
     OpenPermission(&'static str),
     SetUpAnywhere,
+    AirDropSettings,
     ForgetHost([u8; 32], String),
     RemoveDevice([u8; 32], String),
     Quit,
@@ -232,7 +233,8 @@ struct App {
 }
 
 /// (session id, label, [(display id, name)], current display)
-type SessionMenu = (u64, String, Vec<(u32, String)>, Option<u32>);
+/// (session id, label, [(display id, name)], current display, Wi-Fi stalls seen)
+type SessionMenu = (u64, String, Vec<(u32, String)>, Option<u32>, bool);
 
 /// Remove a paired host and any aliases pointing at it.
 fn forget_host(key: &[u8; 32]) -> Result<()> {
@@ -420,12 +422,16 @@ impl App {
                         (d.id, format!("{}{size}", d.name))
                     })
                     .collect();
-                (s.id, s.label.clone(), list, cur)
+                (s.id, s.label.clone(), list, cur, s.wifi_stalls)
             })
             .collect();
-        for (sid, label, displays, current) in sessions {
+        for (sid, label, displays, current, stalls) in sessions {
             let header = self.item(format!("Viewing {label}"), Action::Focus(sid));
             m.push(header);
+            if stalls {
+                let e = self.item("⚠ Wi-Fi Stalls: Turn Off AirDrop & Handoff…", Action::AirDropSettings);
+                m.push(e);
+            }
             if displays.len() > 1 {
                 for (did, name) in displays {
                     let e =
@@ -663,6 +669,14 @@ impl App {
                     h.disconnect_viewer();
                 }
                 notify("Sard", "The next time someone connects, this computer will ask which screens to share.");
+            }
+            Action::AirDropSettings => {
+                // macOS 13+: System Settings → General → AirDrop & Handoff.
+                std::thread::spawn(|| {
+                    std::process::Command::new("/usr/bin/open")
+                        .arg("x-apple.systempreferences:com.apple.AirDrop-Handoff-Settings.extension")
+                        .status()
+                });
             }
             Action::SetUpAnywhere => {
                 let proxy = self.proxy.clone();
@@ -934,8 +948,11 @@ impl ApplicationHandler<AppEvent> for App {
                 self.refresh();
             }
             AppEvent::Session(sid, ev) => {
-                let menu_change =
-                    matches!(ev, SessionEvent::Control(Control::Displays { .. } | Control::StreamConfig(_)));
+                let menu_change = matches!(
+                    ev,
+                    SessionEvent::Control(Control::Displays { .. } | Control::StreamConfig(_))
+                        | SessionEvent::WifiStalls
+                );
                 let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid) else { return };
                 match s.on_event(el, ev) {
                     Outcome::Closed(r) => self.session_closed(sid, &r),
