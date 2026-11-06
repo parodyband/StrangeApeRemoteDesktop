@@ -1,178 +1,158 @@
 #!/usr/bin/env python3
-"""Generate sard's icons: app icon (all sizes), tray/menu-bar icons, and raw
-RGBA tray assets embedded in the binary. Pure Pillow, drawn at 4x and
-downsampled for anti-aliasing.
+"""Generate sard's icons from assets/icons/sard.svg: app icon (all sizes),
+tray/menu-bar icons, and raw RGBA tray assets embedded in the binary.
+
+Needs Pillow plus the librsvg and cairo shared libraries (loaded with ctypes;
+present on most Linux desktops, `brew install librsvg` on macOS).
 
     python3 tools/icon/make_icons.py
 """
+import ctypes
+import ctypes.util
+import re
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[2]
+SVG = ROOT / "assets/icons/sard.svg"
 APP = ROOT / "assets/icons/app"
 TRAY = ROOT / "assets/icons/tray"
 EMBED = ROOT / "crates/sard/assets/tray"
-SS = 4  # supersampling factor
-
-# Palette
-BG_TOP = (124, 92, 255)
-BG_BOTTOM = (38, 22, 104)
-FUR = (43, 30, 58)
-FUR_HI = (66, 48, 86)
-SKIN = (244, 203, 164)
-SKIN_SHADE = (226, 178, 138)
-EYE = (24, 16, 32)
-BEZEL = (240, 238, 250)
-SCREEN_A = (32, 214, 214)
-SCREEN_B = (58, 82, 236)
+SS = 4  # supersampling factor for the hand-drawn mono icons
 
 
-def lerp(a, b, t):
-    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(len(a)))
+def load_lib(names):
+    for name in names:
+        for candidate in (name, ctypes.util.find_library(name.split(".")[0].removeprefix("lib"))):
+            if not candidate:
+                continue
+            try:
+                return ctypes.CDLL(candidate)
+            except OSError:
+                pass
+    raise SystemExit(f"could not load any of {names}")
 
 
-def gradient(size, c0, c1, diagonal=True):
-    w, h = size
-    g = Image.new("RGB", (w, h))
-    px = g.load()
-    for y in range(h):
-        for x in range(w):
-            t = ((x / w) * 0.35 + (y / h) * 0.65) if diagonal else y / h
-            px[x, y] = lerp(c0, c1, t)
-    return g
+class RsvgRectangle(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_double) for n in ("x", "y", "width", "height")]
 
 
-def squircle_mask(size, radius_frac=0.225):
-    w, h = size
-    m = Image.new("L", size, 0)
-    ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), radius=int(w * radius_frac), fill=255)
-    return m
+rsvg = load_lib(["librsvg-2.so.2", "librsvg-2.2.dylib", "/opt/homebrew/lib/librsvg-2.2.dylib", "/usr/local/lib/librsvg-2.2.dylib"])
+cairo = load_lib(["libcairo.so.2", "libcairo.2.dylib", "/opt/homebrew/lib/libcairo.2.dylib", "/usr/local/lib/libcairo.2.dylib"])
+vp = ctypes.c_void_p
+rsvg.rsvg_handle_new_from_data.restype = vp
+rsvg.rsvg_handle_new_from_data.argtypes = [ctypes.c_char_p, ctypes.c_size_t, vp]
+rsvg.rsvg_handle_render_document.restype = ctypes.c_int
+rsvg.rsvg_handle_render_document.argtypes = [vp, vp, ctypes.POINTER(RsvgRectangle), vp]
+cairo.cairo_image_surface_create.restype = vp
+cairo.cairo_image_surface_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+cairo.cairo_image_surface_get_data.restype = ctypes.POINTER(ctypes.c_ubyte)
+cairo.cairo_image_surface_get_data.argtypes = [vp]
+cairo.cairo_image_surface_get_stride.restype = ctypes.c_int
+cairo.cairo_image_surface_get_stride.argtypes = [vp]
+cairo.cairo_create.restype = vp
+cairo.cairo_create.argtypes = [vp]
+for fn in ("cairo_surface_flush", "cairo_surface_destroy", "cairo_destroy"):
+    getattr(cairo, fn).argtypes = [vp]
+gobject = load_lib(["libgobject-2.0.so.0", "libgobject-2.0.0.dylib", "/opt/homebrew/lib/libgobject-2.0.0.dylib", "/usr/local/lib/libgobject-2.0.0.dylib"])
+gobject.g_object_unref.argtypes = [vp]
 
 
-def ellipse(d, cx, cy, rx, ry, fill):
-    d.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=fill)
+def render_svg(svg: str, px: int) -> Image.Image:
+    data = svg.encode()
+    handle = rsvg.rsvg_handle_new_from_data(data, len(data), None)
+    if not handle:
+        raise SystemExit("librsvg could not parse the SVG")
+    surf = cairo.cairo_image_surface_create(0, px, px)  # CAIRO_FORMAT_ARGB32
+    cr = cairo.cairo_create(surf)
+    if not rsvg.rsvg_handle_render_document(handle, cr, ctypes.byref(RsvgRectangle(0, 0, px, px)), None):
+        raise SystemExit("librsvg could not render the SVG")
+    cairo.cairo_surface_flush(surf)
+    stride = cairo.cairo_image_surface_get_stride(surf)
+    buf = ctypes.string_at(cairo.cairo_image_surface_get_data(surf), stride * px)
+    # Cairo stores premultiplied native-endian ARGB (BGRA in memory on little-endian).
+    img = Image.frombuffer("RGBA", (px, px), buf, "raw", "BGRa", stride, 1).copy()
+    cairo.cairo_destroy(cr)
+    cairo.cairo_surface_destroy(surf)
+    gobject.g_object_unref(handle)
+    return img
+
+
+# The logo is a monitor on a squircle tile. The tile is drawn as an outline
+# only (fill="none"), so it is the first unfilled path.
+TILE_RE = re.compile(r'<path\b[^>]*\bfill="none"[^>]*/>')
+
+
+def svg_source():
+    svg = SVG.read_text()
+    if not TILE_RE.search(svg):
+        raise SystemExit(f"{SVG}: no tile outline path (fill=\"none\") found")
+    return svg
+
+
+def app_svg():
+    """Tile filled white, so the icon is opaque on dark docks and taskbars."""
+    return TILE_RE.sub(lambda m: m.group(0).replace('fill="none"', 'fill="#ffffff"', 1), svg_source(), count=1)
+
+
+def art_svg():
+    """Just the monitor (no tile), for tray slots where every pixel counts."""
+    return TILE_RE.sub("", svg_source(), count=1)
 
 
 def app_icon(px=1024):
-    S = px * SS
-    u = S / 1024.0  # design units are a 1024 grid
+    return render_svg(app_svg(), px)
 
-    def U(v):
-        return int(v * u)
 
-    # Background squircle with a soft vertical gradient (macOS grid: 100 px margin).
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    inset = U(100)
-    body = (S - 2 * inset, S - 2 * inset)
-    bg = gradient((body[0] // 8, body[1] // 8), BG_TOP, BG_BOTTOM).resize(body, Image.BICUBIC)
-    img.paste(bg, (inset, inset), squircle_mask(body))
-
-    layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    cx = U(512)
-
-    # Ape head (behind the screen)
-    ellipse(d, cx - U(205), U(392), U(68), U(68), FUR)          # ears
-    ellipse(d, cx + U(205), U(392), U(68), U(68), FUR)
-    ellipse(d, cx - U(205), U(392), U(40), U(40), SKIN_SHADE)
-    ellipse(d, cx + U(205), U(392), U(40), U(40), SKIN_SHADE)
-    ellipse(d, cx, U(388), U(200), U(196), FUR)                  # head
-    ellipse(d, cx - U(28), U(300), U(120), U(70), FUR_HI)        # soft highlight on the crown
-    ellipse(d, cx, U(388), U(200), U(196), None)
-    # Face: heart shape = two upper lobes + muzzle
-    ellipse(d, cx - U(66), U(372), U(86), U(82), SKIN)
-    ellipse(d, cx + U(66), U(372), U(86), U(82), SKIN)
-    ellipse(d, cx, U(462), U(128), U(86), SKIN)
-    ellipse(d, cx, U(480), U(104), U(62), SKIN_SHADE)            # lower muzzle shade
-    ellipse(d, cx, U(470), U(110), U(62), SKIN)
-    # Eyes
-    for s in (-1, 1):
-        ellipse(d, cx + s * U(62), U(372), U(26), U(28), EYE)
-        ellipse(d, cx + s * U(62) + U(9), U(362), U(8), U(8), (255, 255, 255))
-    # Nostrils + smile
-    ellipse(d, cx - U(20), U(438), U(10), U(8), EYE)
-    ellipse(d, cx + U(20), U(438), U(10), U(8), EYE)
-    d.arc((cx - U(52), U(440), cx + U(52), U(500)), start=20, end=160, fill=EYE, width=U(10))
-
-    # Monitor: bezel, screen with "stream" gradient, stand
-    top = U(556)
-    d.rounded_rectangle((U(158), top, U(866), U(868)), radius=U(46), fill=BEZEL)
-    scr_box = (U(190), top + U(32), U(834), U(836))
-    scr = gradient((64, 64), SCREEN_A, SCREEN_B).resize((scr_box[2] - scr_box[0], scr_box[3] - scr_box[1]), Image.BICUBIC)
-    m = Image.new("L", scr.size, 0)
-    ImageDraw.Draw(m).rounded_rectangle((0, 0, scr.size[0] - 1, scr.size[1] - 1), radius=U(26), fill=255)
-    layer.paste(scr, scr_box[:2], m)
-    # Screen glare + "signal" chevrons (remote stream)
-    glare = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glare)
-    gd.polygon([(U(190), top + U(32)), (U(470), top + U(32)), (U(330), U(836)), (U(190), U(836))], fill=(255, 255, 255, 34))
-    layer = Image.alpha_composite(layer, glare)
-    d = ImageDraw.Draw(layer)
-    for i, r in enumerate((U(70), U(118), U(166))):
-        d.arc((cx - r, U(806) - r, cx + r, U(806) + r), start=225, end=315, fill=(255, 255, 255, 235 - 40 * i), width=U(22))
-    ellipse(d, cx, U(806), U(20), U(20), (255, 255, 255, 240))
-    d.polygon([(U(452), U(868)), (U(572), U(868)), (U(596), U(912)), (U(428), U(912))], fill=BEZEL)
-
-    # Hands gripping the top of the bezel (in front)
-    for s in (-1, 1):
-        hx = cx + s * U(196)
-        ellipse(d, hx, top - U(6), U(78), U(46), FUR)
-        for f in range(4):
-            fx = hx + (f - 1.5) * U(30)
-            ellipse(d, fx, top + U(20), U(17), U(24), SKIN)
-
-    img = Image.alpha_composite(img, layer)
-    # Subtle drop shadow under the whole tile.
-    shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle((inset, inset + U(14), S - inset, S - inset + U(14)), radius=int(body[0] * 0.225), fill=(0, 0, 0, 90))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(U(18)))
-    out = Image.alpha_composite(shadow, img)
-    return out.resize((px, px), Image.LANCZOS)
+def tray_color(px, active):
+    big = render_svg(art_svg(), 1024)
+    l, t, r, b = big.getchannel("A").getbbox()
+    # Square crop around the artwork with a small margin.
+    side = int(max(r - l, b - t) * 1.04)
+    cx, cy = (l + r) // 2, (t + b) // 2
+    icon = big.crop((cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side))
+    icon = icon.resize((px, px), Image.LANCZOS)
+    if active:
+        d = ImageDraw.Draw(icon)
+        rad = px * 0.17
+        x, y = px - rad - px * 0.02, px - rad - px * 0.02
+        d.ellipse((x - rad - 1, y - rad - 1, x + rad + 1, y + rad + 1), fill=(255, 255, 255, 255))
+        d.ellipse((x - rad, y - rad, x + rad, y + rad), fill=(46, 204, 113, 255))
+    return icon
 
 
 def tray_mono(px, active):
-    """Menu-bar template (black + alpha): ape face cut-out above a screen.
-    Idle = screen outline, active (connected / being viewed) = filled screen."""
+    """Menu-bar template (black + alpha) of the logo: a monitor with two
+    "eyes" in the top of the bezel, a stacked back layer peeking out at the
+    left and bottom, and a stand. Idle = hollow screen, active (connected /
+    being viewed) = filled screen."""
     S = px * SS
     u = S / 22.0
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     black, clear = (0, 0, 0, 255), (0, 0, 0, 0)
 
-    def U(v):
-        return v * u
+    def U(*v):
+        return [x * u for x in v]
 
-    # Head + ears (solid)
-    ellipse(d, U(4.4), U(6.9), U(2.1), U(2.1), black)
-    ellipse(d, U(17.6), U(6.9), U(2.1), U(2.1), black)
-    ellipse(d, U(11), U(6.6), U(6.0), U(5.9), black)
-    # Heart-shaped face punched out
-    ellipse(d, U(9.0), U(6.2), U(2.5), U(2.3), clear)
-    ellipse(d, U(13.0), U(6.2), U(2.5), U(2.3), clear)
-    ellipse(d, U(11), U(8.9), U(3.9), U(2.6), clear)
-    # Eyes back in
-    ellipse(d, U(9.1), U(6.1), U(0.95), U(1.05), black)
-    ellipse(d, U(12.9), U(6.1), U(0.95), U(1.05), black)
-    # Screen below
-    box = (U(2.0), U(13.4), U(20.0), U(20.6))
-    d.rounded_rectangle(box, radius=U(1.6), fill=black)
-    if not active:
-        d.rounded_rectangle((U(3.7), U(15.1), U(18.3), U(18.9)), radius=U(0.7), fill=clear)
-    return img.resize((px, px), Image.LANCZOS)
-
-
-def tray_color(px, active):
-    icon = app_icon(256)
-    # Crop the tile margin away so the art fills the tray slot.
-    m = int(256 * 100 / 1024)
-    icon = icon.crop((m, m, 256 - m, 256 - m)).resize((px, px), Image.LANCZOS)
+    front = U(3.6, 1.8, 20.6, 14.4)
+    # Stand (behind the monitor) and base.
+    d.polygon([tuple(U(8.9, 14.0)), tuple(U(13.9, 14.0)), tuple(U(13.4, 17.6)), tuple(U(8.0, 17.6))], fill=black)
+    d.rounded_rectangle(U(5.6, 17.4, 16.4, 19.8), radius=0.8 * u, fill=black)
+    # Back layer, offset left/down, separated from the front by a clear gap.
+    d.rounded_rectangle(U(1.4, 3.2, 18.4, 15.8), radius=3.0 * u, fill=black)
+    d.rounded_rectangle(U(2.8, 1.1, 21.3, 15.1), radius=3.6 * u, fill=clear)
+    # Front bezel.
+    d.rounded_rectangle(front, radius=3.0 * u, fill=black)
+    # Eyes punched out of the top of the bezel.
+    for ex in (6.4, 8.7):
+        d.ellipse(U(ex - 0.95, 3.0, ex + 0.95, 4.9), fill=clear)
+    # Screen.
+    screen = U(5.6, 5.9, 18.6, 12.4)
+    d.rounded_rectangle(screen, radius=1.0 * u, fill=clear)
     if active:
-        d = ImageDraw.Draw(icon)
-        r = px * 0.17
-        cx, cy = px - r - px * 0.02, px - r - px * 0.02
-        d.ellipse((cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1), fill=(255, 255, 255, 255))
-        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(46, 204, 113, 255))
-    return icon
+        d.rounded_rectangle(U(6.9, 7.2, 17.3, 11.1), radius=0.4 * u, fill=black)
+    return img.resize((px, px), Image.LANCZOS)
 
 
 def main():
@@ -181,13 +161,13 @@ def main():
     EMBED.mkdir(parents=True, exist_ok=True)
     big = app_icon(1024)
     for s in (16, 32, 48, 64, 128, 256, 512, 1024):
-        (big if s == 1024 else big.resize((s, s), Image.LANCZOS)).save(APP / f"sard-{s}.png")
+        (big if s == 1024 else big.resize((s, s), Image.LANCZOS)).save(APP / f"sard-{s}.png", optimize=True)
     for s in (22, 44):
-        tray_mono(s, False).save(TRAY / f"mono-{s}.png")
-        tray_mono(s, True).save(TRAY / f"mono-active-{s}.png")
+        tray_mono(s, False).save(TRAY / f"mono-{s}.png", optimize=True)
+        tray_mono(s, True).save(TRAY / f"mono-active-{s}.png", optimize=True)
     for s in (22, 44, 64):
-        tray_color(s, False).save(TRAY / f"color-{s}.png")
-        tray_color(s, True).save(TRAY / f"color-active-{s}.png")
+        tray_color(s, False).save(TRAY / f"color-{s}.png", optimize=True)
+        tray_color(s, True).save(TRAY / f"color-active-{s}.png", optimize=True)
     # Raw RGBA for embedding (no PNG decoder in the binary).
     for name, img in (
         ("mono.rgba", tray_mono(44, False)),
