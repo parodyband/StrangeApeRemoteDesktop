@@ -285,20 +285,48 @@ fn info() -> Result<()> {
 }
 
 /// Hidden diagnostic: open the real screen capture and encode for a while.
+/// `--codec`, `--display <n>`, `--fps`; `--decode` also decodes every frame
+/// with this machine's viewer decoder (`--snapshot <file.png>` saves one);
+/// `--input-test` moves the pointer and checks the cursor follows.
 fn selftest_capture(args: &Args) -> Result<()> {
     use sard_core::media::{CursorMode, SourceOptions};
     use std::time::Instant;
     let secs: u64 = args.positional(0).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let codec = match args.value("codec") {
+        Some(c) => sard_core::proto::Codec::parse(c).ok_or_else(|| format!("unknown codec {c}"))?,
+        None => sard_core::proto::Codec::Hevc,
+    };
     let opts = SourceOptions {
+        codec,
         fps: args.parse_value("fps")?.unwrap_or(60),
         bitrate_kbps: 30_000,
         cursor: CursorMode::Metadata,
+        display: args.parse_value("display")?.unwrap_or(0),
         test_pattern: args.flag("test-pattern"),
         ..Default::default()
     };
+    println!("sard {} on {}", env!("CARGO_PKG_VERSION"), platform::describe());
+    for line in platform::capabilities() {
+        println!("  {line}");
+    }
     let t0 = Instant::now();
     let (mut src, mut input) = platform::open_host(&opts)?;
     println!("opened in {:.1}s: {}", t0.elapsed().as_secs_f64(), src.describe());
+    for d in src.displays() {
+        let cur = if src.current_display() == Some(d.id) { " (capturing)" } else { "" };
+        println!("  display {}: {} {}x{} at {},{}{cur}", d.id, d.name, d.width, d.height, d.x, d.y);
+    }
+    let mut sink = if args.flag("decode") || args.value("snapshot").is_some() {
+        let mut s = platform::create_headless_sink()?;
+        if let Some(p) = args.value("snapshot") {
+            s.snapshot_next(std::path::Path::new(p))?;
+        }
+        Some(s)
+    } else {
+        None
+    };
+    let mut dec = sard_core::stats::Samples::default();
+    let mut decoded = 0u64;
     if args.flag("input-test") {
         input_roundtrip(src.as_mut(), input.as_mut())?;
     }
@@ -311,6 +339,11 @@ fn selftest_capture(args: &Args) -> Result<()> {
             bytes += f.data.len();
             keys += f.keyframe as u32;
             lat.add((sard_core::clock::now_us() - f.capture_us) as u32);
+            if let Some(s) = sink.as_mut() {
+                let st = s.present(opts.codec, &f.data, f.keyframe)?;
+                dec.add(st.decode_us);
+                decoded += 1;
+            }
         }
         if src.take_cursor().is_some() {
             cursors += 1;
@@ -326,6 +359,15 @@ fn selftest_capture(args: &Args) -> Result<()> {
         l.p95 as f64 / 1000.0,
         l.max as f64 / 1000.0
     );
+    if let Some(s) = &sink {
+        let d = dec.take();
+        println!(
+            "decoded {decoded} frames with {}: p50 {:.2} ms p95 {:.2} ms",
+            s.describe(),
+            d.p50 as f64 / 1000.0,
+            d.p95 as f64 / 1000.0
+        );
+    }
     Ok(())
 }
 

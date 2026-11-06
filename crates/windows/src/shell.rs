@@ -301,8 +301,14 @@ pub fn prompt_text(title: &str, message: &str) -> Option<String> {
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Sard";
 
+/// `sardw.exe` (the windowless launcher next to sard.exe) if it is there, else `sard.exe app`
+/// (which briefly shows a console window at login).
 fn run_command() -> media::Result<String> {
     let exe = std::env::current_exe()?;
+    let launcher = exe.with_file_name("sardw.exe");
+    if launcher.is_file() {
+        return Ok(format!("\"{}\"", launcher.display()));
+    }
     Ok(format!("\"{}\" app", exe.display()))
 }
 

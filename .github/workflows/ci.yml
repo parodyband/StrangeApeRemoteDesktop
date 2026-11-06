@@ -31,6 +31,12 @@ jobs:
       - run: cargo fmt --all --check
       - name: Shell scripts parse
         run: for f in scripts/*.sh packaging/linux/install.sh; do sh -n "$f"; done
+      - name: PowerShell installer parses
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
 
   test:
     name: clippy + test (${{ matrix.os }})
@@ -46,9 +52,22 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # GPU / PipeWire / D-Bus / VideoToolbox / D3D11 hardware tests skip themselves on runners without them.
       - run: cargo test --workspace --locked
-      - name: Smoke test the Windows binary
+      - name: Smoke test the Windows binary, package and installer
         if: runner.os == 'Windows'
         run: |
           cargo build --locked -p sard
           ./target/debug/sard.exe version
           ./target/debug/sard.exe info
+          version=$(./target/debug/sard.exe version | tr -d '\r' | cut -d' ' -f2)
+          scripts/package-windows.sh target/debug dist
+          scripts/release-manifest.sh dist "$version" http://127.0.0.1:8765
+          python -m http.server 8765 --bind 127.0.0.1 --directory dist > /dev/null 2>&1 &
+          server=$!
+          sleep 2
+          SARD_RELEASE_URL=http://127.0.0.1:8765 SARD_NO_START=1 pwsh -NoProfile -File install.ps1
+          installed="$(cygpath -u "$LOCALAPPDATA")/Programs/Sard"
+          test "$("$installed/sard.exe" version | tr -d '\r')" = "sard $version"
+          test -f "$installed/sardw.exe"
+          kill $server
+          SARD_UNINSTALL=1 pwsh -NoProfile -File install.ps1
+          test ! -e "$installed/sard.exe"

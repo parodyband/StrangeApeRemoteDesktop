@@ -230,11 +230,12 @@ pub fn restart() -> ! {
 pub fn remove_replaced() {
     #[cfg(windows)]
     if let Ok(exe) = std::env::current_exe() {
-        let old = exe.with_extension("exe.old");
-        if old.exists() {
-            match fs::remove_file(&old) {
-                Ok(()) => sard_core::debug!("removed {}", old.display()),
-                Err(e) => sard_core::debug!("cannot remove {} yet: {e}", old.display()),
+        for old in [exe.with_extension("exe.old"), exe.with_file_name("sardw.exe.old")] {
+            if old.exists() {
+                match fs::remove_file(&old) {
+                    Ok(()) => sard_core::debug!("removed {}", old.display()),
+                    Err(e) => sard_core::debug!("cannot remove {} yet: {e}", old.display()),
+                }
             }
         }
     }
@@ -640,9 +641,9 @@ fn check_runs(bin: &Path, version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Windows: unpack `sard-<version>-windows-x86_64/sard.exe` from the zip and put it in place of the running
-/// executable, which Windows lets us rename (not overwrite or delete) while it runs. The old one is left as
-/// `sard.exe.old` and removed at the next start ([`remove_replaced`]).
+/// Windows: unpack `sard-<version>-windows-x86_64/sard.exe` (and the `sardw.exe` launcher) from the zip and
+/// put it in place of the running executable, which Windows lets us rename (not overwrite or delete) while it
+/// runs. The old one is left as `sard.exe.old` and removed at the next start ([`remove_replaced`]).
 #[cfg(windows)]
 fn install_windows(info: &UpdateInfo, exe: &Path) -> Result<()> {
     let dir = exe.parent().ok_or("executable has no parent directory")?;
@@ -668,6 +669,18 @@ fn install_windows(info: &UpdateInfo, exe: &Path) -> Result<()> {
         let _ = fs::rename(&old, exe);
         let _ = fs::remove_file(&staged);
         return Err(format!("cannot replace {}: {e}", exe.display()).into());
+    }
+    // The windowless launcher (Start menu / login item), best effort: it only runs for a moment.
+    let launcher = new.with_file_name("sardw.exe");
+    if launcher.is_file() {
+        let target = exe.with_file_name("sardw.exe");
+        let aside = target.with_extension("exe.old");
+        let _ = fs::remove_file(&aside);
+        let _ = fs::rename(&target, &aside);
+        if let Err(e) = fs::copy(&launcher, &target) {
+            sard_core::warn!("cannot update {}: {e}", target.display());
+            let _ = fs::rename(&aside, &target);
+        }
     }
     Ok(())
 }

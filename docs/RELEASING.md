@@ -7,6 +7,7 @@ when a `v*` tag is pushed. Each release has these assets:
 |---|---|
 | `sard-<version>-linux-x86_64.tar.gz` | Linux binary + `install.sh` + desktop entry + icons |
 | `sard-<version>-macos-arm64.zip` | `Sard.app` (Developer ID signed, notarized, stapled) |
+| `sard-<version>-windows-x86_64.zip` | `sard.exe`, the windowless launcher `sardw.exe`, `LICENSE` (not code-signed) |
 | `latest.txt`, `latest.txt.sig` | Signed update manifest read by `sard update` and the tray |
 | `SHA256SUMS` | Checksums of everything above |
 
@@ -64,7 +65,13 @@ git tag -d v0.0.0-test.1                              # and the local tag
      the release notes start with a warning (Gatekeeper blocks first launch, and macOS
      forgets the permission grants on every update). With the certificate but no API key,
      the app is Developer ID signed but not notarized, and the notes warn about that too.
-4. **release**: writes `latest.txt` (`scripts/release-manifest.sh`) and signs it with the
+4. **windows** (`windows-latest`): `cargo build --release`, then
+   `scripts/package-windows.sh` (icon and manifest are embedded by `crates/sard/build.rs`).
+   It unpacks the zip with Windows' own `tar.exe` (as the updater does) and runs
+   `install.ps1` against a local copy of the release as a smoke test. The binaries are
+   not Authenticode-signed: browser downloads get a SmartScreen warning; the PowerShell
+   installer and the self-updater are not affected.
+5. **release**: writes `latest.txt` (`scripts/release-manifest.sh`) and signs it with the
    `UPDATE_SIGNING_KEY` secret, using the freshly built Linux binary
    (`sard release-sign - latest.txt`). That command refuses to write a signature that
    doesn't verify against the public keys compiled into sard. The job then runs

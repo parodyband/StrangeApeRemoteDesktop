@@ -2,7 +2,7 @@
 
 <h1 align="center">Sard</h1>
 
-<p align="center"><b>Low-latency, GPU-accelerated remote desktop for Linux ⇄ macOS.</b><br>
+<p align="center"><b>Low-latency, GPU-accelerated remote desktop for Linux, macOS and Windows.</b><br>
 Built for driving Unity, Unreal, Godot and Blender on another machine across the room.</p>
 
 ---
@@ -11,14 +11,14 @@ Built for driving Unity, Unreal, Godot and Blender on another machine across the
   3–4 ms from capture to decode on a wired LAN, about 8 ms Linux → Mac over Wi-Fi,
   up to 240 fps.
 - **Made for 3D work.** It switches to relative mouse automatically when a viewport
-  hides the cursor, and maps Cmd ⇄ Ctrl between macOS and Linux. Clipboard and
-  audio are shared.
+  hides the cursor, and maps Cmd ⇄ Ctrl between macOS and Linux / Windows. Clipboard
+  and audio are shared.
 - **Any screen.** Pick which remote monitor you're looking at from the menu, or with
   <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Shift</kbd>+<kbd>1</kbd>…<kbd>9</kbd>.
 - **Private.** Devices pair once with a 6-digit one-time code. After that every connection
   is mutually authenticated and end-to-end encrypted (Noise IK). There are no
   accounts and no cloud.
-- **Small.** One Rust binary with six crates of dependencies. A clean build takes
+- **Small.** One Rust binary (plus a tiny launcher on Windows) with six crates of dependencies. A clean build takes
   about 11 s.
 
 ## Install
@@ -29,11 +29,22 @@ Paste this into a terminal, on Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/parodyband/StrangeApeRemoteDesktop/main/install.sh | sh
 ```
 
+On Windows 10 or 11, paste this into PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/parodyband/StrangeApeRemoteDesktop/main/install.ps1 | iex
+```
+
 It downloads the latest release, checks it against the SHA-256 in the release
 manifest, installs it and starts Sard. On Linux it goes into `~/.local` (no root),
 with a launcher entry and a system tray icon. On macOS it installs **Sard.app**
-into Applications, with an icon in the menu bar. Run the same command again to
-update, or use **Check for Updates…** in the menu.
+into Applications, with an icon in the menu bar. On Windows it goes into
+`%LOCALAPPDATA%\Programs\Sard` (no administrator rights), with a Start menu entry,
+`sard` on your PATH and an icon in the notification area. Run the same command again
+to update, or use **Check for Updates…** in the menu.
+
+> **Windows support is new and has not been tested on real hardware yet.** See
+> [Windows](#windows) for what to try first.
 
 <details>
 <summary>Manual install, uninstall, requirements</summary>
@@ -44,10 +55,16 @@ Download from [Releases](https://github.com/parodyband/StrangeApeRemoteDesktop/r
   **Sard.app** to Applications and open it.
 - **Linux** (x86-64, NVIDIA GPU, PipeWire, KDE Plasma or GNOME on Wayland or X11):
   `tar xf sard-*-linux-x86_64.tar.gz && cd sard-*-linux-x86_64 && ./install.sh`
+- **Windows** (10/11 x64; NVIDIA, AMD or Intel GPU): unzip `sard-<version>-windows-x86_64.zip`
+  anywhere and run `sardw.exe` (the tray app) or `sard.exe` in a terminal. The files
+  aren't code-signed, so a browser download triggers SmartScreen (*More info → Run
+  anyway*); the PowerShell installer doesn't.
 
 To uninstall on Linux, run
 `curl -fsSL https://raw.githubusercontent.com/parodyband/StrangeApeRemoteDesktop/main/install.sh | sh -s -- --uninstall`.
-On macOS, quit Sard and move it to the Trash. Pairings stay in `~/.config/sard`.
+On macOS, quit Sard and move it to the Trash. On Windows, run
+`$env:SARD_UNINSTALL=1; irm https://raw.githubusercontent.com/parodyband/StrangeApeRemoteDesktop/main/install.ps1 | iex`.
+Pairings stay in `~/.config/sard` (Windows: `%APPDATA%\sard`).
 </details>
 
 ## Getting started
@@ -65,6 +82,8 @@ The first time a Linux computer is viewed, the desktop asks which screens to sha
 and whether to allow remote control. Select **all** monitors there to be able to
 switch between them. The answer is remembered; use **Choose Screens to Share…** to
 be asked again. On macOS, grant the permissions described [below](#macos-permissions).
+On Windows, allow Sard through Windows Firewall when it asks (the first time the PC is
+shared); all screens are always available.
 
 ### Shortcuts in a viewer window
 
@@ -126,15 +145,15 @@ does not include the display's scan-out.
  └────────────┘
 ```
 
-| | Linux (NVIDIA) | macOS (Apple Silicon) |
-|---|---|---|
-| Capture | xdg-desktop-portal + PipeWire, DMA-BUF | ScreenCaptureKit (IOSurface) |
-| Encode / decode | NVENC / NVDEC: AV1, HEVC, H.264 | VideoToolbox: HEVC, H.264 encode; AV1 (M3+), HEVC, H.264 decode |
-| Present | EGL + OpenGL via CUDA/GL interop | Metal (`CAMetalLayer`) |
-| Input | RemoteDesktop portal | CGEvent |
-| Audio | PipeWire | ScreenCaptureKit / CoreAudio |
-| Clipboard | Klipper (D-Bus), wl-clipboard | NSPasteboard |
-| Tray | StatusNotifierItem + dbusmenu | NSStatusItem |
+| | Linux (NVIDIA) | macOS (Apple Silicon) | Windows (new, untested) |
+|---|---|---|---|
+| Capture | xdg-desktop-portal + PipeWire, DMA-BUF | ScreenCaptureKit (IOSurface) | DXGI Desktop Duplication |
+| Encode / decode | NVENC / NVDEC: AV1, HEVC, H.264 | VideoToolbox: HEVC, H.264 encode; AV1 (M3+), HEVC, H.264 decode | NVENC / NVDEC; AMD, Intel: Media Foundation hardware codecs |
+| Present | EGL + OpenGL via CUDA/GL interop | Metal (`CAMetalLayer`) | Direct3D 11 flip model (CUDA/D3D11 interop) |
+| Input | RemoteDesktop portal | CGEvent | SendInput |
+| Audio | PipeWire | ScreenCaptureKit / CoreAudio | WASAPI (loopback) |
+| Clipboard | Klipper (D-Bus), wl-clipboard | NSPasteboard | Win32 clipboard |
+| Tray | StatusNotifierItem + dbusmenu | NSStatusItem | Notification area icon |
 
 **Transport** (`crates/core`): one UDP socket and one network thread; there is no
 async runtime.
@@ -158,11 +177,13 @@ async runtime.
 - **Control:** a reliable ordered channel carries input and control messages.
   Clock sync gives true end-to-end latency figures.
 
-**Dependencies:** GPU and OS libraries are loaded with `dlopen` and bound by hand,
-with no bindgen, no `-sys` crates and no FFmpeg. Exact C struct layouts come from
-small generators in `tools/`, and the D-Bus client is about 800 lines of Rust. The
-crates used are `libc`, `chacha20poly1305`, `x25519-dalek`, `sha2`, `winit` and
-`raw-window-handle`, plus `objc2`/`block2` on macOS.
+**Dependencies:** GPU and OS libraries are loaded with `dlopen` (`LoadLibrary` on
+Windows) and bound by hand, with no bindgen, no `-sys` crates, no `windows` crate and
+no FFmpeg. Exact C struct layouts come from small generators in `tools/`
+(`tools/winabi/check.py` checks the hand-written Win32/COM declarations against the
+SDK headers), and the D-Bus client is about 800 lines of Rust. The crates used are
+`libc`, `chacha20poly1305`, `x25519-dalek`, `sha2`, `winit` and `raw-window-handle`,
+plus `objc2`/`block2` on macOS.
 
 ## Building from source
 
@@ -173,8 +194,37 @@ packaging/linux/install.sh            # Linux: install binary, icon and launcher
 ```
 
 Linux needs the NVIDIA driver (NVENC/NVDEC/CUDA), PipeWire and xdg-desktop-portal.
-macOS needs the Xcode command line tools. Releases are built by GitHub Actions; see
+macOS needs the Xcode command line tools. Windows needs the MSVC build tools (Visual
+Studio Build Tools, "Desktop development with C++"); `scripts/package-windows.sh`
+makes the release zip. Releases are built by GitHub Actions; see
 [docs/RELEASING.md](docs/RELEASING.md).
+
+### Windows
+
+Windows support (host and viewer) is a first version that compiles and passes CI but
+**has not run on real hardware yet**. What to try first on a PC:
+
+1. `sard info`: lists the GPUs, which encoder and decoder each codec would use and
+   why (NVENC/NVDEC on NVIDIA, the GPU's Media Foundation codecs otherwise), the
+   shader/Media Foundation checks and the screens Desktop Duplication sees.
+2. `cargo test -p sard-windows --test gpu_roundtrip -- --nocapture`: encodes a test
+   pattern on the GPU and decodes it again, for each codec.
+3. `sard selftest-capture 10 --decode --snapshot shot.png` (add `--codec h264|av1`,
+   `--display 2`, `--input-test`): captures the real screen, encodes, decodes every
+   frame and saves one as a PNG; prints timings.
+4. `sard host --test-pattern 2560x1440` on the PC and `sard connect` from another
+   machine, then the real screen; then the other direction.
+
+`SARD_ENCODER=mf` / `SARD_DECODER=mf` force Media Foundation on NVIDIA GPUs (to test
+the AMD/Intel path); `SARD_LOG=debug` adds per-stage timings. The tray app logs to
+`%LOCALAPPDATA%\Sard\app.log`.
+
+Known limits: the secure desktop (UAC prompts, the lock screen, Ctrl+Alt+Del) can't be
+captured or controlled by a normal process, and nor can windows of elevated apps unless
+Sard runs as administrator; Desktop Duplication doesn't work over Remote Desktop or as
+a service; rotated displays are streamed unrotated; HDR desktops are tone-mapped to
+SDR by Windows. HEVC and AV1 decoding with Media Foundation need Microsoft's (free)
+*HEVC Video Extensions* / *AV1 Video Extension* from the Store.
 
 ### macOS permissions
 
@@ -206,6 +256,7 @@ keychain); with an ad-hoc signature, macOS forgets the grants on every rebuild.
 ## Roadmap
 
 - [x] Linux and macOS hosts and viewers, audio, clipboard, multi-monitor switching
+- [ ] Windows host and viewer (written, builds and passes CI; not yet tested on hardware)
 - [x] Menu bar / tray app, pairing from the UI, start at login, self-update
 - [x] AV1 by default when both ends have hardware for it (Mac viewers: M3 and later), else HEVC
 - [x] Connect Anywhere: reach paired computers across the internet (hole punching, TURN relay fallback)

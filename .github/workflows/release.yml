@@ -229,8 +229,38 @@ jobs:
           path: dist/sard-*-macos-arm64.zip
           if-no-files-found: error
 
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build --release --locked -p sard
+      - name: Package
+        run: scripts/package-windows.sh target/release dist
+      - name: Smoke test the zip (the updater's unpack, and install.ps1)
+        run: |
+          mkdir -p "$RUNNER_TEMP/x"
+          /c/Windows/System32/tar.exe -xf "dist/sard-$VERSION-windows-x86_64.zip" -C "$RUNNER_TEMP/x"
+          test "$("$RUNNER_TEMP/x/sard-$VERSION-windows-x86_64/sard.exe" version)" = "sard $VERSION"
+          scripts/release-manifest.sh dist "$VERSION" http://127.0.0.1:8765
+          python -m http.server 8765 --bind 127.0.0.1 --directory dist > /dev/null 2>&1 &
+          server=$!
+          sleep 2
+          SARD_RELEASE_URL=http://127.0.0.1:8765 SARD_NO_START=1 pwsh -NoProfile -File install.ps1
+          test "$("$(cygpath -u "$LOCALAPPDATA")/Programs/Sard/sard.exe" version | tr -d '\r')" = "sard $VERSION"
+          kill $server
+          rm dist/latest.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/sard-*-windows-x86_64.zip
+          if-no-files-found: error
+
   release:
-    needs: [meta, linux, linux-compat, macos]
+    needs: [meta, linux, linux-compat, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -294,6 +324,7 @@ jobs:
             echo
             echo "- **Linux x86_64**: \`tar -xzf sard-$VERSION-linux-x86_64.tar.gz && sard-$VERSION-linux-x86_64/install.sh\` (installs into \`~/.local\`, no root)"
             echo "- **macOS 13+ (Apple Silicon)**: unzip \`sard-$VERSION-macos-arm64.zip\` and move **Sard.app** to /Applications"
+            echo "- **Windows 10/11 (x64)**: \`irm https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/install.ps1 | iex\` in PowerShell, or unzip \`sard-$VERSION-windows-x86_64.zip\` and run \`sardw.exe\` (the binaries are not code-signed: a browser download triggers SmartScreen; \"More info → Run anyway\")"
             echo "- Already installed: \`sard update\`"
             echo
             echo "Verify downloads with \`SHA256SUMS\`. \`latest.txt\` (+ \`.sig\`) is the signed manifest the built-in updater reads."
@@ -315,4 +346,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "$title" \
             --notes-file "$RUNNER_TEMP/notes.md" --generate-notes "${flags[@]}" \
             dist/sard-"$VERSION"-linux-x86_64.tar.gz dist/sard-"$VERSION"-macos-arm64.zip \
+            dist/sard-"$VERSION"-windows-x86_64.zip \
             dist/latest.txt dist/latest.txt.sig dist/SHA256SUMS
