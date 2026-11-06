@@ -1179,6 +1179,7 @@ dependencies = [
  "sard-core",
  "sard-linux",
  "sard-macos",
+ "sard-windows",
  "winit",
 ]
 
@@ -1214,6 +1215,14 @@ dependencies = [
  "raw-window-handle",
  "sard-core",
  "winit",
+]
+
+[[package]]
+name = "sard-windows"
+version = "0.1.8"
+dependencies = [
+ "raw-window-handle",
+ "sard-core",
 ]
 
 [[package]]

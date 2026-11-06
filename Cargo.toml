@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/linux", "crates/macos", "crates/sard"]
+members = ["crates/core", "crates/linux", "crates/macos", "crates/windows", "crates/sard"]
 
 [workspace.package]
 version = "0.1.8"
@@ -14,6 +14,7 @@ repository = "https://github.com/parodyband/StrangeApeRemoteDesktop"
 sard-core = { path = "crates/core" }
 sard-linux = { path = "crates/linux" }
 sard-macos = { path = "crates/macos" }
+sard-windows = { path = "crates/windows" }
 libc = "0.2"
 
 # Fast incremental dev builds: our code lightly optimized, dependencies fully optimized

@@ -79,7 +79,29 @@ impl Settings {
 
 /// Without a terminal (launcher, login item, app bundle), log to a file
 /// instead of nowhere: Linux `~/.local/state/sard/app.log`, macOS
-/// `~/Library/Logs/Sard/app.log`.
+/// `~/Library/Logs/Sard/app.log`, Windows `%LOCALAPPDATA%\Sard\app.log`.
+#[cfg(windows)]
+fn log_to_file() {
+    // Started from the desktop: close the console window Windows opened for us.
+    if sard_windows::os::console_is_ours() {
+        sard_windows::os::detach_console();
+    }
+    if sard_windows::os::stderr_is_console() {
+        return;
+    }
+    let Some(base) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) else { return };
+    let dir = base.join("Sard");
+    let path = dir.join("app.log");
+    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2 << 20) {
+        let _ = std::fs::rename(&path, dir.join("app.log.1"));
+    }
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        sard_windows::os::redirect_stderr(f);
+    }
+}
+
+#[cfg(unix)]
 fn log_to_file() {
     // SAFETY: isatty on a standard descriptor.
     if unsafe { libc::isatty(2) } == 1 {
@@ -108,7 +130,17 @@ fn log_to_file() {
 pub fn run(args: &Args) -> Result<()> {
     log_to_file();
     info!("Sard {} starting", env!("CARGO_PKG_VERSION"));
-    let Some(_lock) = crate::lock_file("app.lock")? else {
+    crate::update::remove_replaced();
+    // After an update, the new process starts while the old one is still exiting.
+    let mut lock = crate::lock_file("app.lock")?;
+    if lock.is_none() && std::env::var_os(crate::update::RESTARTED_ENV).is_some() {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while lock.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            lock = crate::lock_file("app.lock")?;
+        }
+    }
+    let Some(_lock) = lock else {
         println!("Sard is already running (look for it in the menu bar / system tray).");
         return Ok(());
     };

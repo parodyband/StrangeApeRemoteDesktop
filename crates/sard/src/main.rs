@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 const USAGE: &str = "\
-sard — low-latency GPU remote desktop (Linux ⇄ macOS)
+sard — low-latency GPU remote desktop (Linux, macOS, Windows)
 
 USAGE:
   sard app                       Menu bar / system tray app (default when launched from the desktop)
@@ -129,24 +129,47 @@ fn has_desktop() -> bool {
     if std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
         return true;
     }
-    // SAFETY: isatty on a standard descriptor.
-    let tty = unsafe { libc::isatty(0) == 1 || libc::isatty(1) == 1 };
-    let display = cfg!(target_os = "macos")
-        || std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("DISPLAY").is_some();
-    display && !tty
+    // Windows: double-clicked / Start menu / Run key, i.e. not typed into a terminal.
+    #[cfg(windows)]
+    let desktop = sard_windows::os::console_is_ours();
+    #[cfg(unix)]
+    let desktop = {
+        // SAFETY: isatty on a standard descriptor.
+        let tty = unsafe { libc::isatty(0) == 1 || libc::isatty(1) == 1 };
+        let display = cfg!(target_os = "macos")
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("DISPLAY").is_some();
+        display && !tty
+    };
+    desktop
 }
 
 /// Take an exclusive lock on `<config dir>/<name>` (released when the file is
 /// dropped or the process exits). `None` if another process holds it.
 pub fn lock_file(name: &str) -> Result<Option<std::fs::File>> {
-    use std::os::fd::AsRawFd;
     let dir = config::config_dir();
     std::fs::create_dir_all(&dir)?;
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(name))?;
-    // SAFETY: flock on a file descriptor we own.
-    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    Ok((r == 0).then_some(f))
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).truncate(false).write(true);
+    #[cfg(windows)]
+    {
+        // No sharing: while we hold the handle, every other open fails with a sharing violation.
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut o, 0);
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        match o.open(dir.join(name)) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let f = o.open(dir.join(name))?;
+        // SAFETY: flock on a file descriptor we own.
+        let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        Ok((r == 0).then_some(f))
+    }
 }
 
 /// The winit event loop shared by `connect` and the tray app.

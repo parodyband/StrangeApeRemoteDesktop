@@ -1,6 +1,6 @@
 [package]
 name = "sard"
-description = "StrangeApeRemoteDesktop: low-latency GPU remote desktop for Linux and macOS"
+description = "StrangeApeRemoteDesktop: low-latency GPU remote desktop for Linux, macOS and Windows"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,3 +19,6 @@ sard-linux.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sard-macos.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sard-windows.workspace = true

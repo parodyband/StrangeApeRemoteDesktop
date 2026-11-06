@@ -347,9 +347,10 @@ impl Session {
                     s.host_name,
                     s.host_platform
                 );
+                // Cmd on a Mac is Ctrl on Linux and Windows: swap only across that divide.
                 self.swap_mods = self.opts.swap_mods
                     && s.host_platform != Platform::Unknown
-                    && s.host_platform != Platform::current();
+                    && (s.host_platform == Platform::MacOs) != (Platform::current() == Platform::MacOs);
                 let resized = self.stream.as_ref().is_none_or(|o| (o.width, o.height) != (s.width, s.height));
                 if resized && self.window.fullscreen().is_none() {
                     fit_window(&self.window, s.width as u32, s.height as u32);
