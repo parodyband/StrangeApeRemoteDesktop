@@ -40,6 +40,8 @@ fn notify(title: &str, message: &str) {
 /// `settings.txt`: `key=value` lines.
 struct Settings {
     share: bool,
+    /// An update the user chose "Skip This Version" for.
+    skip_version: Option<String>,
 }
 
 impl Settings {
@@ -48,13 +50,15 @@ impl Settings {
     }
 
     fn load() -> Settings {
-        let mut s = Settings { share: true };
+        let mut s = Settings { share: true, skip_version: None };
         if let Ok(text) = std::fs::read_to_string(Self::path()) {
             for line in text.lines() {
                 if let Some((k, v)) = line.split_once('=') {
                     let on = matches!(v.trim(), "on" | "true" | "1" | "yes");
-                    if k.trim() == "share" {
-                        s.share = on;
+                    match k.trim() {
+                        "share" => s.share = on,
+                        "skip_version" if !v.trim().is_empty() => s.skip_version = Some(v.trim().to_string()),
+                        _ => {}
                     }
                 }
             }
@@ -63,7 +67,10 @@ impl Settings {
     }
 
     fn save(&self) {
-        let text = format!("# sard app settings\nshare={}\n", if self.share { "on" } else { "off" });
+        let mut text = format!("# sard app settings\nshare={}\n", if self.share { "on" } else { "off" });
+        if let Some(v) = &self.skip_version {
+            text += &format!("skip_version={v}\n");
+        }
         if let Err(e) = config::write_private_file(&config::config_dir(), "settings.txt", &text) {
             warn!("cannot save settings: {e}");
         }
@@ -123,6 +130,8 @@ pub fn run(args: &Args) -> Result<()> {
         next_refresh: None,
         update: None,
         update_busy: false,
+        update_installing: false,
+        offered: Vec::new(),
         // First check shortly after start, then twice a day.
         next_update_check: Instant::now() + Duration::from_secs(15),
         missing_permissions: Vec::new(),
@@ -179,6 +188,9 @@ struct App {
     /// A newer release, once a check found one.
     update: Option<crate::update::UpdateInfo>,
     update_busy: bool,
+    update_installing: bool,
+    /// Versions already offered in a dialog this run (background checks ask once).
+    offered: Vec<String>,
     next_update_check: Instant,
     /// Host permissions not granted yet (macOS), re-checked while any are missing.
     missing_permissions: Vec<&'static str>,
@@ -457,6 +469,12 @@ impl App {
         let login = self.check("Start at Login", platform::launch_at_login(), Action::ToggleLogin);
         m.push(login);
         let upd = match (&self.update, self.update_busy) {
+            (Some(u), true) if self.update_installing => MenuEntry::Item {
+                id: 0,
+                label: format!("Installing Sard {}…", u.version),
+                enabled: false,
+                checked: None,
+            },
             (_, true) => {
                 MenuEntry::Item { id: 0, label: "Checking for Updates…".into(), enabled: false, checked: None }
             }
@@ -699,6 +717,7 @@ impl App {
             return;
         }
         self.update_busy = true;
+        self.update_installing = true;
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             info!("installing Sard {}", info.version);
@@ -706,6 +725,30 @@ impl App {
             let _ = proxy.send_event(AppEvent::UpdateInstalled(r));
         });
         self.refresh();
+    }
+
+    /// One dialog: Install and Restart / Later / Skip This Version.
+    fn offer_update(&mut self, u: crate::update::UpdateInfo) {
+        self.offered.push(u.version.clone());
+        let installable = crate::update::install_target().map_err(|e| e.to_string());
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let current = env!("CARGO_PKG_VERSION");
+            if let Err(e) = installable {
+                platform::show_message(
+                    "Sard Update",
+                    &format!(
+                        "Sard {} is available (you have {current}), but this copy can't update itself: {e}",
+                        u.version
+                    ),
+                );
+                return;
+            }
+            let notes = u.notes.as_deref().map(|n| format!("\n\nWhat's new: {n}")).unwrap_or_default();
+            let msg = format!("Sard {} is available — you have {current}.{notes}", u.version);
+            let choice = platform::choose("Sard Update", &msg, &["Install and Restart", "Later", "Skip This Version"]);
+            let _ = proxy.send_event(AppEvent::UpdateChoice { version: u.version, choice });
+        });
     }
 
     fn show_pairing(&self) {
@@ -779,16 +822,12 @@ impl ApplicationHandler<AppEvent> for App {
                 match result {
                     Ok(Some(u)) => {
                         info!("update available: Sard {}", u.version);
-                        if manual {
-                            notify(
-                                "Sard update",
-                                &format!(
-                                    "Sard {} is available. Choose “Install Sard {} and Restart” in the menu.",
-                                    u.version, u.version
-                                ),
-                            );
+                        let skipped = self.settings.skip_version.as_deref() == Some(u.version.as_str());
+                        // Asked for, or new and not skipped: offer it right away.
+                        if manual || (!skipped && !self.offered.contains(&u.version)) {
+                            self.offer_update(u.clone());
                         }
-                        self.update = Some(u);
+                        self.update = (manual || !skipped).then_some(u);
                     }
                     Ok(None) if manual => notify("Sard", &format!("Sard {} is up to date.", env!("CARGO_PKG_VERSION"))),
                     Ok(None) => {}
@@ -800,8 +839,25 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 self.refresh();
             }
+            AppEvent::UpdateChoice { version, choice } => {
+                let current = self.update.as_ref().is_some_and(|u| u.version == version);
+                match choice {
+                    Some(0) if current => self.install_update(),
+                    Some(2) => {
+                        info!("skipping Sard {version}");
+                        self.settings.skip_version = Some(version);
+                        self.settings.save();
+                        if current {
+                            self.update = None;
+                        }
+                    }
+                    _ => {}
+                }
+                self.refresh();
+            }
             AppEvent::UpdateInstalled(r) => {
                 self.update_busy = false;
+                self.update_installing = false;
                 match r {
                     Ok(()) => {
                         info!("update installed; restarting");

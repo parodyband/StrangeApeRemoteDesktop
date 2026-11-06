@@ -70,6 +70,42 @@ pub fn prompt_text(title: &str, message: &str) -> Option<String> {
     }
 }
 
+/// A dialog with up to three buttons; returns the index of the one chosen.
+/// `buttons[0]` is the default (rightmost), `buttons[1]` also answers Escape.
+/// Blocks until answered (any thread).
+pub fn choose(title: &str, message: &str, buttons: &[&str]) -> Option<usize> {
+    let n = buttons.len().clamp(1, 3);
+    // Right to left on screen: default last.
+    let list: Vec<String> = (0..n).rev().map(|i| format!("(item {} of argv)", i + 3)).collect();
+    let cancel = if n >= 2 { " cancel button (item 4 of argv)" } else { "" };
+    let script = [
+        "on run argv".to_string(),
+        "activate".to_string(),
+        format!(
+            "set r to display dialog (item 2 of argv) with title (item 1 of argv) buttons {{{}}} default button (item 3 of argv){cancel}",
+            list.join(", ")
+        ),
+        "return button returned of r".to_string(),
+        "end run".to_string(),
+    ];
+    let lines: Vec<&str> = script.iter().map(String::as_str).collect();
+    let mut args = vec![title, message];
+    args.extend_from_slice(&buttons[..n]);
+    match osascript(&lines, &args) {
+        Ok(out) if out.status.success() => {
+            let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            buttons[..n].iter().position(|b| *b == chosen)
+        }
+        // Escape / the cancel button: the second choice.
+        Ok(_) if n >= 2 => Some(1),
+        Ok(_) => None,
+        Err(e) => {
+            sard_core::warn!("cannot run osascript: {e}");
+            None
+        }
+    }
+}
+
 /// Ask before doing something; `true` if the user chose `action`. Blocks
 /// until answered (any thread).
 pub fn confirm(title: &str, message: &str, action: &str) -> bool {

@@ -34,6 +34,55 @@ pub fn prompt_text(title: &str, message: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// A dialog with two or three buttons; returns the index of the one chosen.
+/// `buttons[0]` is the default, `buttons[1]` also answers Escape / closing.
+/// Blocks until answered: call from a background thread.
+pub fn choose(title: &str, message: &str, buttons: &[&str]) -> Option<usize> {
+    let (b0, b1, b2) = (buttons.first()?, buttons.get(1).copied().unwrap_or("Cancel"), buttons.get(2));
+    match dialog_tool()? {
+        "kdialog" => {
+            let mut c = Command::new("kdialog");
+            c.args(["--title", title]);
+            match b2 {
+                // yes / no / cancel → buttons 0 / 2 / 1 (cancel = Escape).
+                Some(b2) => {
+                    c.args(["--yesnocancel", message, "--yes-label", b0, "--no-label", b2, "--cancel-label", b1])
+                }
+                None => c.args(["--yesno", message, "--yes-label", b0, "--no-label", b1]),
+            };
+            match c.status().ok()?.code()? {
+                0 => Some(0),
+                1 if b2.is_some() => Some(2),
+                _ => Some(1),
+            }
+        }
+        _ => {
+            let mut c = Command::new("zenity");
+            c.args([
+                "--question",
+                "--no-wrap",
+                "--title",
+                title,
+                "--text",
+                message,
+                "--ok-label",
+                b0,
+                "--cancel-label",
+                b1,
+            ]);
+            if let Some(b2) = b2 {
+                c.args(["--extra-button", b2]);
+            }
+            let out = c.output().ok()?;
+            if out.status.success() {
+                return Some(0);
+            }
+            let pressed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Some(if b2.is_some_and(|b| *b == pressed) { 2 } else { 1 })
+        }
+    }
+}
+
 /// Ask before doing something; `true` if the user chose `action`. Blocks
 /// until answered: call from a background thread.
 pub fn confirm(title: &str, message: &str, action: &str) -> bool {

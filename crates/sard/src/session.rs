@@ -58,6 +58,8 @@ pub enum AppEvent {
     Refresh,
     /// An update check finished (`manual`: the user asked, so report "up to date" too).
     UpdateChecked { manual: bool, result: std::result::Result<Option<crate::update::UpdateInfo>, String> },
+    /// The update dialog was answered: 0 install, 1 later, 2 skip (None: closed).
+    UpdateChoice { version: String, choice: Option<usize> },
     /// Downloading and installing an update finished.
     UpdateInstalled(std::result::Result<(), String>),
 }
