@@ -32,7 +32,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not instal
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) platform=linux-x86_64 ;;
     Darwin-arm64) platform=macos-arm64 ;;
-    *) die "there is no prebuilt Sard for $(uname -s) $(uname -m) yet; see https://github.com/$repo#building-from-source" ;;
+    *) die "there is no prebuilt Sard for $(uname -s) $(uname -m) yet; see https://github.com/$repo/blob/main/docs/TECHNICAL.md#building-from-source" ;;
 esac
 
 if [ "$mode" = uninstall ]; then
