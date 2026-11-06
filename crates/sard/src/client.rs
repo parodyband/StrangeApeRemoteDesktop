@@ -256,6 +256,7 @@ fn run_headless(
         std::thread::Builder::new().name("sard-events".into()).spawn(move || {
             let mut audio: Option<Box<dyn sard_core::media::AudioSink>> = None;
             let (mut packets, mut gaps, mut last_seq) = (0u64, 0u64, None::<u32>);
+            let (mut cursor_moves, mut cursor_shapes) = (0u64, 0u64);
             for ev in events {
                 match ev {
                     Event::Control(Control::AudioConfig { sample_rate, channels }) if !dry => {
@@ -303,6 +304,11 @@ fn run_headless(
                         info!("host displays: {}", names.join(", "));
                         *displays.lock().unwrap() = (list.iter().map(|d| d.id).collect(), current);
                     }
+                    Event::Control(Control::CursorShape { width, height, hot_x, hot_y, .. }) => {
+                        cursor_shapes += 1;
+                        info!("cursor shape {width}x{height} (hotspot {hot_x},{hot_y})");
+                    }
+                    Event::CursorPos { .. } => cursor_moves += 1,
                     Event::Disconnected(r) => {
                         info!("disconnected: {r}");
                         break;
@@ -312,6 +318,9 @@ fn run_headless(
             }
             if packets > 0 {
                 info!("audio: {packets} packets received, {gaps} gaps");
+            }
+            if cursor_moves + cursor_shapes > 0 {
+                info!("cursor: {cursor_shapes} shapes, {cursor_moves} position updates");
             }
             stop.store(true, Ordering::Relaxed);
         })?;

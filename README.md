@@ -209,7 +209,7 @@ keychain); with an ad-hoc signature, macOS forgets the grants on every rebuild.
 - [x] Menu bar / tray app, pairing from the UI, start at login, self-update
 - [x] AV1 by default when both ends have hardware for it (Mac viewers: M3 and later), else HEVC
 - [x] Connect Anywhere: reach paired computers across the internet (hole punching, TURN relay fallback)
-- [ ] Viewer-drawn cursor for macOS hosts
+- [x] Viewer-drawn cursor for macOS hosts (instant pointer; the video no longer carries the cursor)
 - [x] Bitrate control that tells Wi-Fi stalls (AWDL / power save) from real congestion
 - [ ] Optional: pause AWDL (AirDrop/Handoff radio) while viewing from a Mac on Wi-Fi
 

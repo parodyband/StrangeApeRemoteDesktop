@@ -13,6 +13,7 @@ pub mod audio_capture;
 pub mod capture;
 pub mod cf;
 pub mod clipboard;
+pub mod cursor;
 pub mod ffi;
 pub mod input;
 pub mod metal;

@@ -11,7 +11,7 @@
 
 use crate::cf::{self, CfRef};
 use crate::ffi::*;
-use crate::input::{CgInput, DisplayBounds};
+use crate::input::{Bounds, CgInput, DisplayBounds};
 use crate::objc::{error_string, ns_string, to_string};
 use crate::vt::{EncoderConfig, RateControl, VtEncoder};
 use block2::RcBlock;
@@ -19,7 +19,9 @@ use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, ClassBuilder, NSObject, Sel};
 use objc2::{ClassType, class, msg_send, sel};
 use sard_core::clock;
-use sard_core::media::{self, CursorMode, DisplayInfo, EncodedFrame, InputSink, SourceOptions, VideoSource};
+use sard_core::media::{
+    self, CursorMode, CursorUpdate, DisplayInfo, EncodedFrame, InputSink, SourceOptions, VideoSource,
+};
 use sard_core::proto::Codec;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -332,8 +334,9 @@ struct Capture {
 unsafe impl Send for Capture {}
 
 impl Capture {
-    /// Start capturing `display` (an `SCDisplay`) at `w`x`h` NV12.
-    fn start(display: &AnyObject, w: u32, h: u32, fps: u32) -> Result<Capture, String> {
+    /// Start capturing `display` (an `SCDisplay`) at `w`x`h` NV12; the cursor
+    /// is drawn into the video only if `shows_cursor`.
+    fn start(display: &AnyObject, w: u32, h: u32, fps: u32, shows_cursor: bool) -> Result<Capture, String> {
         let shared = Arc::new(Shared::default());
         // SAFETY: standard SCK object setup; `output` stays registered until Drop.
         unsafe {
@@ -344,6 +347,9 @@ impl Capture {
             let f: Allocated<AnyObject> = msg_send![class!(SCContentFilter), alloc];
             let filter: Retained<AnyObject> = msg_send![f, initWithDisplay: display, excludingWindows: &*empty];
             let cfg = stream_config(w, h, fps);
+            if !shows_cursor {
+                let _: () = msg_send![&*cfg, setShowsCursor: false];
+            }
             let s: Allocated<AnyObject> = msg_send![class!(SCStream), alloc];
             let stream: Retained<AnyObject> =
                 msg_send![s, initWithFilter: &*filter, configuration: &*cfg, delegate: &*output];
@@ -411,6 +417,8 @@ pub struct ScreenSource {
     display: DisplayBounds,
     max_size: (u32, u32),
     fps: u32,
+    /// Viewer-drawn cursor: tracked here instead of drawn into the video.
+    cursor: Option<crate::cursor::CursorTracker>,
 }
 
 pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
@@ -447,7 +455,8 @@ impl ScreenSource {
             bitrate_kbps: opts.bitrate_kbps.max(1000),
             rate_control: RateControl::for_preset(opts.codec, opts.preset),
         })?;
-        let cap = Capture::start(&display, w, h, fps)?;
+        let metadata_cursor = opts.cursor == CursorMode::Metadata;
+        let cap = Capture::start(&display, w, h, fps, !metadata_cursor)?;
         sard_core::info!(
             "ScreenCaptureKit: display {} \"{}\" ({}x{} px) captured at {w}x{h} @ {fps} fps",
             info.id,
@@ -464,6 +473,7 @@ impl ScreenSource {
             display: DisplayBounds::new(info.id),
             max_size,
             fps,
+            cursor: metadata_cursor.then(crate::cursor::CursorTracker::default),
         })
     }
 
@@ -480,12 +490,15 @@ impl ScreenSource {
         } else {
             None
         };
-        let cap = Capture::start(&display, w, h, self.fps)?;
+        let cap = Capture::start(&display, w, h, self.fps, self.cursor.is_none())?;
         drop(std::mem::replace(&mut self.cap, cap)); // stops the old stream
         if let Some(enc) = enc {
             self.enc = enc;
         }
         self.display.set(id);
+        if let Some(c) = &mut self.cursor {
+            c.reset();
+        }
         self.seen = 0;
         self.last = None;
         self.force_key = true;
@@ -525,7 +538,16 @@ impl VideoSource for ScreenSource {
             if left.is_zero() || (self.force_key && self.last.is_some()) {
                 break;
             }
-            g = self.cap.shared.cv.wait_timeout(g, left).unwrap().0;
+            // Nothing new on screen: still look at the cursor every 8 ms, so
+            // its movements go out promptly (the caller then takes them).
+            let slice = if self.cursor.is_some() { left.min(Duration::from_millis(8)) } else { left };
+            g = self.cap.shared.cv.wait_timeout(g, slice).unwrap().0;
+            if let Some(c) = &self.cursor
+                && g.seq == self.seen
+                && c.moved(self.display.rect())
+            {
+                return Ok(None);
+            }
         }
         drop(g);
         // Static screen but the client needs a keyframe: re-encode the last image.
@@ -554,7 +576,14 @@ impl VideoSource for ScreenSource {
     }
 
     fn cursor_mode(&self) -> CursorMode {
-        CursorMode::Embedded
+        if self.cursor.is_some() { CursorMode::Metadata } else { CursorMode::Embedded }
+    }
+
+    fn take_cursor(&mut self) -> Option<CursorUpdate> {
+        let rect = self.display.rect();
+        // Stream pixels per point: the cursor is drawn at the video's scale.
+        let scale = self.enc.config().width as f64 / rect.size.width.max(1.0);
+        self.cursor.as_mut()?.poll(rect, scale)
     }
 
     fn describe(&self) -> String {
