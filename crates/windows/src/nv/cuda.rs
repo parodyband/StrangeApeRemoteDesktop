@@ -15,7 +15,6 @@ pub type CUarray = *mut c_void;
 pub type CUgraphicsResource = *mut c_void;
 
 pub const CU_GRAPHICS_REGISTER_FLAGS_NONE: u32 = 0;
-pub const CU_GRAPHICS_MAP_RESOURCE_FLAGS_WRITE_DISCARD: u32 = 2;
 
 dylib! {
     pub struct CudaApi ["nvcuda.dll"] {
@@ -34,7 +33,6 @@ dylib! {
         fn cuGetErrorName(CUresult, *mut *const c_char) -> CUresult;
         fn cuD3D11GetDevice(*mut CUdevice, *mut c_void) -> CUresult;
         fn cuGraphicsD3D11RegisterResource(*mut CUgraphicsResource, *mut c_void, u32) -> CUresult;
-        fn cuGraphicsResourceSetMapFlags_v2(CUgraphicsResource, u32) -> CUresult;
         fn cuGraphicsUnregisterResource(CUgraphicsResource) -> CUresult;
         fn cuGraphicsMapResources(u32, *mut CUgraphicsResource, CUstream) -> CUresult;
         fn cuGraphicsUnmapResources(u32, *mut CUgraphicsResource, CUstream) -> CUresult;
@@ -137,8 +135,6 @@ impl Cuda {
         let rc =
             unsafe { (self.api.cuGraphicsD3D11RegisterResource)(&mut r, resource, CU_GRAPHICS_REGISTER_FLAGS_NONE) };
         self.check(rc, "cuGraphicsD3D11RegisterResource")?;
-        // SAFETY: freshly registered resource; we only ever write it.
-        unsafe { (self.api.cuGraphicsResourceSetMapFlags_v2)(r, CU_GRAPHICS_MAP_RESOURCE_FLAGS_WRITE_DISCARD) };
         Ok(r)
     }
 

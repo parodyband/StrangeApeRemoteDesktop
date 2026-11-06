@@ -372,8 +372,14 @@ com_interface! {
 
 com_interface! {
     pub struct IDXGIAdapter1(0x29038f61_3839_4626_91fd_086879011a05);
+    6 fn GetParent(iid: *const GUID, out: *mut *mut c_void) -> HRESULT;
     7 fn EnumOutputs(index: u32, out: *mut *mut c_void) -> HRESULT;
     10 fn GetDesc1(desc: *mut DXGI_ADAPTER_DESC1) -> HRESULT;
+}
+
+com_interface! {
+    pub struct IDXGIOutput(0xae02eedb_c735_4690_8d52_5a8dc20213aa);
+    7 fn GetDesc(desc: *mut DXGI_OUTPUT_DESC) -> HRESULT;
 }
 
 com_interface! {

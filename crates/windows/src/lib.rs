@@ -12,10 +12,22 @@
 // FFI wrappers take raw GPU/window handles by design; callers are this app.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub mod audio;
+pub mod capture;
+pub mod clipboard;
 pub mod com;
 pub mod d3d;
+pub mod decode;
 pub mod dl;
+pub mod encode;
+pub mod gpu;
+pub mod input;
+pub mod mf;
 pub mod nv;
 pub mod os;
 pub mod platform;
+pub mod shell;
+pub mod sink;
 pub mod sys;
+pub mod test_source;
+pub mod tray;

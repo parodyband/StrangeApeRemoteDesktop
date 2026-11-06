@@ -33,7 +33,7 @@ SRC = os.path.join(ROOT, "crates", "windows", "src")
 INCLUDES = """
 #define COBJMACROS
 #define CINTERFACE
-#define INITGUID_NOT
+#include <winsock2.h>
 #include <windows.h>
 #include <stddef.h>
 #include <shellapi.h>
@@ -56,6 +56,7 @@ INCLUDES = """
 
 # Rust name -> C name, where they differ.
 ALIASES = {"ID3DBlob": "ID3D10Blob"}
+GUID_ALIASES = {"D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0": "DXVA_ModeAV1_VLD_Profile0"}
 
 
 def rust_files():
@@ -107,18 +108,19 @@ def rust_int_to_c(v):
 
 def header_guids(hdr_dir):
     guids = {}
-    pat = re.compile(
-        r"DEFINE_GUID\(\s*(\w+)\s*,\s*(0x[0-9A-Fa-f]+)L?\s*,\s*(0x[0-9A-Fa-f]+)\s*,\s*(0x[0-9A-Fa-f]+)\s*,"
-        + r"\s*(0x[0-9A-Fa-f]+)\s*," * 7
-        + r"\s*(0x[0-9A-Fa-f]+)\s*\)"
-    )
+    nums = r"\s*(0x[0-9A-Fa-f]+)L?\s*,\s*(0x[0-9A-Fa-f]+)\s*,\s*(0x[0-9A-Fa-f]+)\s*," + r"\s*(0x[0-9A-Fa-f]+)\s*," * 7
+    pats = [
+        re.compile(r"(?:DEFINE_GUID|EXTERN_GUID)\s*\(\s*(\w+)\s*," + nums + r"\s*(0x[0-9A-Fa-f]+)\s*\)"),
+        # codecapi.h: #define STATIC_CODECAPI_AVLowLatencyMode 0x9c27891a, 0xed7a, ...
+        re.compile(r"#define STATIC_(CODECAPI_\w+)" + nums + r"\s*(0x[0-9A-Fa-f]+)"),
+    ]
     for d in ("include",):
         base = os.path.join(hdr_dir, d)
         for f in os.listdir(base):
             if not f.endswith(".h"):
                 continue
             text = open(os.path.join(base, f), encoding="latin-1").read()
-            for m in pat.finditer(text):
+            for m in (m for pat in pats for m in pat.finditer(text)):
                 g = [int(x, 16) for x in m.groups()[1:]]
                 val = (g[0] << 96) | (g[1] << 80) | (g[2] << 64)
                 for i, b in enumerate(g[3:]):
@@ -181,7 +183,7 @@ def main():
     for name, val, rel in consts:
         add(f"(unsigned)({name}) == {val}", f"{rel}: const {name}")
     for name, val, rel in guids:
-        hg = hguids.get(name)
+        hg = hguids.get(GUID_ALIASES.get(name, name))
         if hg is None:
             skipped.append(f"{name} (GUID not in headers)")
         elif hg != val:
