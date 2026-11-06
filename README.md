@@ -150,8 +150,11 @@ async runtime.
 - **Video:** frames are split into shards protected by Reed-Solomon FEC
   (GF(2⁸), Cauchy) and interleaved. The viewer NACKs what FEC can't repair and
   resynchronizes on keyframes.
-- **Adaptation:** FEC follows measured loss, while bitrate follows *congestion*
-  (queueing delay, unrecoverable frames). Random Wi-Fi loss doesn't lower quality.
+- **Adaptation:** FEC follows measured loss, while bitrate follows *congestion*:
+  unrecoverable frames, or a standing queue (even the best round trip of the
+  last 0.6 s is late). Random Wi-Fi loss and brief radio stalls (a Mac's AWDL
+  for AirDrop pauses Wi-Fi ~70 ms every half second while active) don't lower
+  quality.
 - **Control:** a reliable ordered channel carries input and control messages.
   Clock sync gives true end-to-end latency figures.
 
@@ -207,7 +210,8 @@ keychain); with an ad-hoc signature, macOS forgets the grants on every rebuild.
 - [x] AV1 by default when both ends have hardware for it (Mac viewers: M3 and later), else HEVC
 - [x] Connect Anywhere: reach paired computers across the internet (hole punching, TURN relay fallback)
 - [ ] Viewer-drawn cursor for macOS hosts
-- [ ] Bitrate control that tells Wi-Fi delay spikes from real congestion
+- [x] Bitrate control that tells Wi-Fi stalls (AWDL / power save) from real congestion
+- [ ] Optional: pause AWDL (AirDrop/Handoff radio) while viewing from a Mac on Wi-Fi
 
 ## License
 

@@ -622,13 +622,25 @@ struct RateControl {
 }
 
 impl RateControl {
-    fn on_report(&mut self, received: u32, lost: u32, frames_lost: u32, rtt_us: u64, min_rtt_us: u64) -> Option<u32> {
+    /// `recent_min_rtt_us`: best RTT of the last ~0.6 s; `base_rtt_us`: best
+    /// of the last 30 s. Congestion shows as a standing queue, so *every*
+    /// recent packet is late; brief radio stalls (Wi-Fi AWDL / power save)
+    /// delay only some, and must not cut the bitrate.
+    fn on_report(
+        &mut self,
+        received: u32,
+        lost: u32,
+        frames_lost: u32,
+        recent_min_rtt_us: u64,
+        base_rtt_us: u64,
+    ) -> Option<u32> {
         let total = received + lost;
         if total < 20 && frames_lost == 0 {
             return None;
         }
         let loss = lost as f32 / total.max(1) as f32;
-        let queueing = min_rtt_us > 0 && rtt_us > min_rtt_us + (2 * min_rtt_us).max(4_000);
+        let queueing =
+            base_rtt_us > 0 && recent_min_rtt_us > 0 && recent_min_rtt_us > base_rtt_us + base_rtt_us.max(4_000);
         let before = self.current;
         if frames_lost > 0 || loss > 0.25 {
             self.current = (self.current as f32 * 0.75) as u32;
@@ -696,15 +708,16 @@ fn input_loop(
             Event::Report(r) => {
                 let st = conn.stats();
                 if let Some(kbps) =
-                    rc.on_report(r.packets_received, r.packets_lost, r.frames_lost, st.rtt_us, st.min_rtt_us)
+                    rc.on_report(r.packets_received, r.packets_lost, r.frames_lost, st.recent_min_rtt_us, st.min_rtt_us)
                 {
                     info!(
-                        "bitrate -> {:.1} Mbps (loss {}/{}, frames lost {}, rtt {:.1}/{:.1} ms)",
+                        "bitrate -> {:.1} Mbps (loss {}/{}, frames lost {}, rtt {:.1} ms, best recent/base {:.1}/{:.1} ms)",
                         kbps as f32 / 1000.0,
                         r.packets_lost,
                         r.packets_received,
                         r.frames_lost,
                         st.rtt_us as f64 / 1000.0,
+                        st.recent_min_rtt_us as f64 / 1000.0,
                         st.min_rtt_us as f64 / 1000.0
                     );
                     shared.bitrate_kbps.store(kbps, Ordering::Relaxed);
@@ -801,8 +814,10 @@ mod tests {
         assert_eq!(rc.on_report(1000, 100, 0, 400, 300), None);
         // Unrecoverable frames: back off.
         assert_eq!(rc.on_report(1000, 100, 2, 400, 300), Some(37_500));
-        // Queueing delay: back off a little.
+        // A standing queue (even the best recent RTT is late): back off a little.
         assert_eq!(rc.on_report(1000, 0, 0, 9_000, 300), Some(33_750));
+        // Brief stalls leave the best recent RTT at the baseline: no change.
+        assert_eq!(rc.on_report(1000, 0, 0, 900, 300), None);
         rc.last_change = Instant::now() - Duration::from_secs(5);
         let mut up = None;
         for _ in 0..8 {

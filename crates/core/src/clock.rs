@@ -48,7 +48,8 @@ pub struct ClockSync {
 }
 
 impl ClockSync {
-    const WINDOW: usize = 32;
+    /// ~8 s of pings (one per 50 ms).
+    const WINDOW: usize = 160;
 
     pub fn new() -> Self {
         Self::default()

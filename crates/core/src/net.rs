@@ -28,7 +28,13 @@ use std::time::{Duration, Instant};
 const IK_PROLOGUE: &[u8] = b"sard/1 connect";
 const PAIR_PROLOGUE: &[u8] = b"sard/2 pair";
 
-const PING_INTERVAL_US: u64 = 250_000;
+/// Pings measure RTT for congestion control (tiny: ~1 KB/s at this rate).
+const PING_INTERVAL_US: u64 = 50_000;
+/// "Recent" RTT window: its *best* sample shows standing queues (congestion)
+/// while ignoring brief stalls, such as Wi-Fi pausing for AWDL (AirDrop).
+const RTT_RECENT_US: u64 = 600_000;
+/// Baseline (uncongested) RTT: minimum over this long.
+const RTT_BASE_US: u64 = 30_000_000;
 const REPORT_INTERVAL_US: u64 = 250_000;
 const KEEPALIVE_US: u64 = 1_000_000;
 const TIMEOUT_US: u64 = 10_000_000;
@@ -118,8 +124,11 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnStats {
     pub rtt_us: u64,
-    /// Minimum RTT over the recent ping window (baseline without queueing).
+    /// Minimum RTT over the last 30 s (baseline without queueing).
     pub min_rtt_us: u64,
+    /// Minimum RTT over the last ~0.6 s: above the baseline only when every
+    /// packet waited, i.e. a standing queue.
+    pub recent_min_rtt_us: u64,
     pub clock_offset_us: Option<i64>,
     pub tx_bps: f64,
     pub rx_bps: f64,
@@ -139,6 +148,8 @@ struct ConnState {
     video_rx: VideoReceiver,
     clock: ClockSync,
     srtt_us: f64,
+    /// Ping RTT samples (time, rtt) over the last [`RTT_BASE_US`].
+    rtt_samples: std::collections::VecDeque<(u64, u64)>,
     last_ping_us: u64,
     last_report_us: u64,
     last_kf_req_us: u64,
@@ -251,6 +262,7 @@ impl Conn {
                 video_rx: VideoReceiver::new(),
                 clock: ClockSync::new(),
                 srtt_us: 5_000.0,
+                rtt_samples: std::collections::VecDeque::new(),
                 last_ping_us: 0,
                 last_report_us: now,
                 last_kf_req_us: 0,
@@ -407,6 +419,10 @@ impl Conn {
                     st.clock.add(t0, t1, t2, now);
                     let rtt = (now.saturating_sub(t0)).saturating_sub(t2.saturating_sub(t1));
                     st.srtt_us = st.srtt_us * 0.875 + rtt as f64 * 0.125;
+                    st.rtt_samples.push_back((now, rtt));
+                    while st.rtt_samples.front().is_some_and(|&(at, _)| now.saturating_sub(at) > RTT_BASE_US) {
+                        st.rtt_samples.pop_front();
+                    }
                 }
             }
             msg::MOUSE_ABS => {
@@ -567,7 +583,14 @@ impl Conn {
         let mut st = lock(&self.state);
         let mut s = st.totals;
         s.rtt_us = st.srtt_us as u64;
-        s.min_rtt_us = st.clock.min_rtt_us().unwrap_or(0);
+        s.min_rtt_us = st.rtt_samples.iter().map(|&(_, r)| r).min().unwrap_or(0);
+        s.recent_min_rtt_us = st
+            .rtt_samples
+            .iter()
+            .filter(|&&(at, _)| now.saturating_sub(at) <= RTT_RECENT_US)
+            .map(|&(_, r)| r)
+            .min()
+            .unwrap_or(0);
         s.clock_offset_us = st.clock.offset_us();
         s.tx_packets = self.tx_packets.load(Ordering::Relaxed);
         s.reliable_retransmits = st.reliable.retransmits;
