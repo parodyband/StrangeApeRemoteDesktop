@@ -31,7 +31,7 @@ impl Gpu {
         let a = d3d::preferred_adapter(&list);
         let dev = Device::new(a.map(|a| &a.adapter))?;
         let name = a.map_or_else(|| "default GPU".to_string(), |a| a.name.clone());
-        let force_mf = std::env::var("SARD_DECODER").is_ok_and(|v| v.eq_ignore_ascii_case("mf"));
+        let force_mf = crate::decode::force_mf();
         let (cuda, cuda_error) = match a {
             Some(a) if a.vendor == d3d::VENDOR_NVIDIA && !force_mf => match Cuda::new(a.adapter.as_raw()) {
                 Ok(c) => (Some(c), None),

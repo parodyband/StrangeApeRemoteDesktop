@@ -67,6 +67,11 @@ pub fn dxva_supports(dev: &Device, c: Codec) -> bool {
     false
 }
 
+/// `SARD_DECODER=mf`: decode with Media Foundation even on NVIDIA (testing).
+pub fn force_mf() -> bool {
+    std::env::var("SARD_DECODER").is_ok_and(|v| v.eq_ignore_ascii_case("mf"))
+}
+
 /// Which decode path a device would use, and the codecs it decodes in hardware.
 #[derive(Clone, Debug)]
 pub struct DecodeCaps {
@@ -79,7 +84,9 @@ pub struct DecodeCaps {
 /// else DXVA through Media Foundation).
 pub fn hardware_decoders(dev: &Device, nvidia: bool, adapter: *mut c_void) -> DecodeCaps {
     let mut notes = Vec::new();
-    if nvidia {
+    if nvidia && force_mf() {
+        notes.push("SARD_DECODER=mf: not using NVDEC".into());
+    } else if nvidia {
         match Cuda::new(adapter) {
             Ok(cuda) => {
                 let mut mask = 0;

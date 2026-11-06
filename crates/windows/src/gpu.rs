@@ -12,7 +12,7 @@ use crate::com::Interface;
 use crate::d3d::{self, Device, ID3D11Buffer, ID3D11PixelShader, ID3D11SamplerState, ID3D11VertexShader};
 use std::sync::OnceLock;
 
-const HLSL: &str = r#"
+const COMMON: &str = r#"
 struct VsOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 
 // One triangle covering the viewport: (0,0) (2,0) (0,2) in uv.
@@ -25,8 +25,10 @@ VsOut vs_main(uint id : SV_VertexID) {
 }
 
 SamplerState smp : register(s0);
+"#;
 
-// ---- RGB -> NV12, BT.709 limited range ----
+/// RGB -> NV12, BT.709 limited range.
+const CSC: &str = r#"
 Texture2D src : register(t0);
 static const float3 KY = float3(0.2126, 0.7152, 0.0722);
 
@@ -42,8 +44,10 @@ float2 ps_chroma(VsOut i) : SV_Target {
     float y = dot(c, KY);
     return float2((128.0 + 224.0 * (c.b - y) / 1.8556) / 255.0, (128.0 + 224.0 * (c.r - y) / 1.5748) / 255.0);
 }
+"#;
 
-// ---- YUV -> RGB for display ----
+/// YUV -> RGB for display.
+const PRESENT: &str = r#"
 Texture2D<float> t_y : register(t0);
 Texture2D<float2> t_c : register(t1);
 Texture2D<float> t_v : register(t2);
@@ -73,11 +77,13 @@ struct Bytecode {
 fn bytecode() -> Result<&'static Bytecode, String> {
     static B: OnceLock<Result<Bytecode, String>> = OnceLock::new();
     B.get_or_init(|| {
+        let csc = format!("{COMMON}{CSC}");
+        let present = format!("{COMMON}{PRESENT}");
         Ok(Bytecode {
-            vs: d3d::compile(HLSL, "vs_main", "vs_4_0")?,
-            luma: d3d::compile(HLSL, "ps_luma", "ps_4_0")?,
-            chroma: d3d::compile(HLSL, "ps_chroma", "ps_4_0")?,
-            present: d3d::compile(HLSL, "ps_present", "ps_4_0")?,
+            vs: d3d::compile(COMMON, "vs_main", "vs_4_0")?,
+            luma: d3d::compile(&csc, "ps_luma", "ps_4_0")?,
+            chroma: d3d::compile(&csc, "ps_chroma", "ps_4_0")?,
+            present: d3d::compile(&present, "ps_present", "ps_4_0")?,
         })
     })
     .as_ref()
