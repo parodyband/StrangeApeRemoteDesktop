@@ -19,8 +19,13 @@ pub fn console_is_ours() -> bool {
 
 /// Close the console window Windows opened for us (tray app started from the desktop).
 pub fn detach_console() {
-    // SAFETY: plain call; harmless without a console.
-    unsafe { sys::FreeConsole() };
+    // SAFETY: plain calls; harmless without a console. Clearing the standard
+    // handles makes later prints no-ops instead of writes to a dead console.
+    unsafe {
+        sys::FreeConsole();
+        sys::SetStdHandle(sys::STD_OUTPUT_HANDLE, std::ptr::null_mut());
+        sys::SetStdHandle(sys::STD_ERROR_HANDLE, std::ptr::null_mut());
+    }
 }
 
 /// Whether this process has a console window (to decide how children are spawned).

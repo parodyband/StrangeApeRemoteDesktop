@@ -225,6 +225,25 @@ pub struct MONITORINFOEXW {
     pub szDevice: [u16; 32],
 }
 
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<GUID>() == 16);
+    assert!(size_of::<POINT>() == 8);
+    assert!(size_of::<RECT>() == 16);
+    assert!(size_of::<MSG>() == 48);
+    assert!(size_of::<WNDCLASSEXW>() == 80);
+    assert!(size_of::<ICONINFO>() == 32);
+    assert!(size_of::<BITMAPV5HEADER>() == 124);
+    assert!(size_of::<NOTIFYICONDATAW>() == 976);
+    assert!(offset_of!(NOTIFYICONDATAW, szTip) == 40);
+    assert!(offset_of!(NOTIFYICONDATAW, uVersion) == 816);
+    assert!(offset_of!(NOTIFYICONDATAW, guidItem) == 952);
+    assert!(size_of::<MOUSEINPUT>() == 32);
+    assert!(size_of::<KEYBDINPUT>() == 24);
+    assert!(size_of::<INPUT>() == 40);
+    assert!(size_of::<MONITORINFOEXW>() == 104);
+};
+
 // ---- window messages / styles ----
 pub const WM_NULL: u32 = 0x0000;
 pub const WM_CREATE: u32 = 0x0001;

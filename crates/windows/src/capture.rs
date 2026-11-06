@@ -641,6 +641,14 @@ impl DuplSource {
         let mut desc = d3d::D3D11_TEXTURE2D_DESC::default();
         // SAFETY: valid out pointer.
         unsafe { tex.GetDesc(&mut desc) };
+        // Shader views need a typed format.
+        let view_format = match desc.Format {
+            90 => d3d::DXGI_FORMAT_B8G8R8A8_UNORM,    // B8G8R8A8_TYPELESS
+            27 => d3d::DXGI_FORMAT_R8G8B8A8_UNORM,    // R8G8B8A8_TYPELESS
+            23 => d3d::DXGI_FORMAT_R10G10B10A2_UNORM, // R10G10B10A2_TYPELESS
+            9 => d3d::DXGI_FORMAT_R16G16B16A16_FLOAT, // R16G16B16A16_TYPELESS
+            f => f,
+        };
         if self.desktop.as_ref().is_none_or(|d| (d.2, d.3, d.4) != (desc.Width, desc.Height, desc.Format)) {
             let copy = self.gpu.dev.texture(
                 &d3d::D3D11_TEXTURE2D_DESC::new(
@@ -653,7 +661,7 @@ impl DuplSource {
                 ),
                 None,
             )?;
-            let srv = self.gpu.dev.srv(&copy, desc.Format)?;
+            let srv = self.gpu.dev.srv(&copy, view_format)?;
             debug!("desktop image {}x{} format {}", desc.Width, desc.Height, desc.Format);
             self.desktop = Some((copy, srv, desc.Width, desc.Height, desc.Format));
         }

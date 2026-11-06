@@ -418,14 +418,28 @@ fn capture_loop(
     let parsed = mix_format(mix as *const u8);
     let flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
     // SAFETY: the mix format the device gave us.
-    let hr = unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, mix, std::ptr::null()) };
+    let mut hr = unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, mix, std::ptr::null()) };
+    let mut client = client;
+    let mut evented = hr >= 0;
+    if hr < 0 {
+        // Older Windows 10 builds: no event-driven loopback; poll instead (needs a fresh client).
+        sard_core::debug!("{}; polling loopback", sys::hr_error("event-driven loopback", hr));
+        client = activate_client(&dev)?;
+        // SAFETY: as above.
+        hr = unsafe {
+            client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, mix, std::ptr::null())
+        };
+        evented = false;
+    }
     // SAFETY: allocated by GetMixFormat.
     unsafe { sys::CoTaskMemFree(mix) };
     let (fmt, channels, rate, block) = parsed?;
     sys::check(hr, "IAudioClient::Initialize (loopback)")?;
     let event = Event::new()?;
-    // SAFETY: valid event handle.
-    sys::check(unsafe { client.SetEventHandle(event.0) }, "SetEventHandle")?;
+    if evented {
+        // SAFETY: valid event handle.
+        sys::check(unsafe { client.SetEventHandle(event.0) }, "SetEventHandle")?;
+    }
     let cap: IAudioCaptureClient =
         com::out(|p| unsafe { client.GetService(&IAudioCaptureClient::IID, p) }, "GetService(IAudioCaptureClient)")?;
     // SAFETY: plain call.
@@ -434,7 +448,7 @@ fn capture_loop(
     let mut conv = Converter::new(fmt, channels, rate, block);
     while !stop.load(Ordering::Relaxed) {
         // Loopback can stay silent (nothing playing): poll anyway.
-        event.wait(20);
+        event.wait(if evented { 20 } else { 5 });
         loop {
             let mut next = 0u32;
             // SAFETY: valid out pointer.
