@@ -44,6 +44,8 @@ pub enum AppEvent {
     Menu(u32),
     /// A background connect attempt finished.
     Connected { id: u64, label: String, result: std::result::Result<Connection, String> },
+    /// The Connect Anywhere token was set or cleared.
+    AnywhereChanged,
     /// The user confirmed forgetting a paired host (by key).
     ForgetHost([u8; 32]),
     /// The user confirmed revoking a device allowed to view this computer.

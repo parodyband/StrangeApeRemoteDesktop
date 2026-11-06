@@ -26,8 +26,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// The hosted Connect Anywhere service.
+pub const DEFAULT_URL: &str = "https://sard-anywhere.ape-proxy.workers.dev";
+
 /// How the service is reached: `anywhere.txt` in the config directory,
-/// lines `url <https://...>` and `token <account token>`.
+/// lines `token <account token>` and optionally `url <https://...>` (a
+/// self-hosted service; default [`DEFAULT_URL`]).
 #[derive(Clone, Debug)]
 pub struct Service {
     pub url: Url,
@@ -46,7 +50,40 @@ impl Service {
             }
         }
         let token = token.filter(|t| !t.is_empty())?;
-        Some(Service { url: url?, token })
+        let url = match url {
+            Some(u) => u,
+            None => Url::parse(DEFAULT_URL).ok()?,
+        };
+        Some(Service { url, token })
+    }
+
+    /// Save an account token (keeping a custom `url` line if there is one);
+    /// an empty token removes the configuration.
+    pub fn save_token(dir: &Path, token: &str) -> std::io::Result<()> {
+        let path = dir.join("anywhere.txt");
+        let token = token.trim();
+        if token.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+        }
+        if token.len() > 256 || !token.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "that doesn't look like an account token",
+            ));
+        }
+        let url = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| t.lines().find(|l| l.trim_start().starts_with("url ")).map(str::to_string));
+        let mut text = String::from("# Sard Connect Anywhere\n");
+        if let Some(u) = url {
+            text += &u;
+            text += "\n";
+        }
+        text += &format!("token {token}\n");
+        crate::config::write_private_file(dir, "anywhere.txt", &text)
     }
 
     fn auth(&self) -> String {
@@ -263,6 +300,14 @@ mod tests {
         std::fs::write(dir.join("anywhere.txt"), "# test\nurl http://127.0.0.1:8787\ntoken abc\n").unwrap();
         let s = Service::load(&dir).unwrap();
         assert_eq!((s.url.port, s.token.as_str()), (8787, "abc"));
+        // A new token keeps the custom URL; without a url line the default is used.
+        Service::save_token(&dir, " def ").unwrap();
+        let s = Service::load(&dir).unwrap();
+        assert_eq!((s.url.port, s.token.as_str()), (8787, "def"));
+        std::fs::write(dir.join("anywhere.txt"), "token xyz\n").unwrap();
+        assert_eq!(Service::load(&dir).unwrap().url, Url::parse(DEFAULT_URL).unwrap());
+        Service::save_token(&dir, "").unwrap();
+        assert!(Service::load(&dir).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
             parse_addrs(" 1.2.3.4:5 junk [::1]:9"),

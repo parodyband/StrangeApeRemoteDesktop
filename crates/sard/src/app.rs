@@ -150,6 +150,7 @@ enum Action {
     CheckUpdates,
     InstallUpdate,
     OpenPermission(&'static str),
+    SetUpAnywhere,
     ForgetHost([u8; 32], String),
     RemoveDevice([u8; 32], String),
     Quit,
@@ -450,6 +451,9 @@ impl App {
         }
         m.push(MenuEntry::Submenu { label: "Allowed Devices".into(), enabled: true, items: allowed });
         m.push(MenuEntry::Separator);
+        let configured = sard_core::anywhere::Service::load(&config::config_dir()).is_some();
+        let anywhere = self.check("Connect Anywhere…", configured, Action::SetUpAnywhere);
+        m.push(anywhere);
         let login = self.check("Start at Login", platform::launch_at_login(), Action::ToggleLogin);
         m.push(login);
         let upd = match (&self.update, self.update_busy) {
@@ -610,6 +614,24 @@ impl App {
                 }
                 notify("Sard", "The next time someone connects, this computer will ask which screens to share.");
             }
+            Action::SetUpAnywhere => {
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let Some(token) = platform::prompt_text(
+                        "Connect Anywhere",
+                        "Account token (connect to this computer's paired devices from any network).\n\
+                         Leave empty to turn Connect Anywhere off:",
+                    ) else {
+                        return;
+                    };
+                    match sard_core::anywhere::Service::save_token(&config::config_dir(), &token) {
+                        Ok(()) => {
+                            let _ = proxy.send_event(AppEvent::AnywhereChanged);
+                        }
+                        Err(e) => platform::show_message("Connect Anywhere", &e.to_string()),
+                    }
+                });
+            }
             Action::ToggleLogin => {
                 let on = !platform::launch_at_login();
                 if let Err(e) = platform::set_launch_at_login(on) {
@@ -725,6 +747,13 @@ impl ApplicationHandler<AppEvent> for App {
         match ev {
             AppEvent::Menu(id) => self.on_menu(el, id),
             AppEvent::HostChanged | AppEvent::Refresh => self.refresh(),
+            AppEvent::AnywhereChanged => {
+                // The host service reads the configuration when it starts.
+                if self.host.take().is_some() {
+                    self.start_host();
+                }
+                self.refresh();
+            }
             AppEvent::ForgetHost(key) => {
                 if let Err(e) = forget_host(&key) {
                     notify("Sard", &format!("Could not forget that computer: {e}"));
