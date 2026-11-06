@@ -14,4 +14,7 @@ chacha20poly1305 = { version = "0.11", default-features = false }
 curve25519-dalek = { version = "5", default-features = false, features = ["zeroize"] }
 libc.workspace = true
 sha2 = { version = "0.11", default-features = false }
+# TURN authentication (HMAC-SHA1, MD5 long-term key); same digest family as sha2.
+sha1 = { version = "0.11", default-features = false }
+md-5 = { version = "0.11", default-features = false }
 x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }

@@ -160,8 +160,25 @@ struct ConnState {
 struct ConnIo {
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
-    /// `socket` is connected to `peer`: use send(), not send_to().
+    /// `socket` is connected (to `peer`, or to the relay server): use send(), not send_to().
     connected: bool,
+    /// Packets go through this TURN server in ChannelData framing.
+    relay: Option<SocketAddr>,
+}
+
+/// Datagram size toward peers outside the LAN: leaves room for tunnels,
+/// carrier networks and TURN framing without IP fragmentation.
+pub const WAN_MAX_DATAGRAM: usize = 1200;
+
+/// Private, loopback and link-local addresses (full-size packets are safe).
+pub fn is_lan(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => a.is_private() || a.is_loopback() || a.is_link_local(),
+        std::net::IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+            None => a.is_loopback() || a.segments()[0] & 0xfe00 == 0xfc00 || a.segments()[0] & 0xffc0 == 0xfe80,
+        },
+    }
 }
 
 struct Conn {
@@ -213,7 +230,12 @@ impl Conn {
         let (events_tx, events_rx) = mpsc::sync_channel(4096);
         let (frames_tx, frames_rx) = mpsc::sync_channel(64);
         let now = clock::now_us();
-        let mp = cfg.max_payload();
+        let datagram = if is_lan(io.peer.ip()) && io.relay.is_none() {
+            cfg.max_datagram
+        } else {
+            cfg.max_datagram.min(WAN_MAX_DATAGRAM)
+        };
+        let mp = datagram - packet::DATA_OVERHEAD;
         Arc::new(Conn {
             io: Mutex::new(io),
             local_index,
@@ -279,8 +301,19 @@ impl Conn {
         let total = packet::DATA_HEADER_LEN + n + 16;
         {
             let io = lock(&self.io);
-            let r =
-                if io.connected { io.socket.send(&pkt[..total]) } else { io.socket.send_to(&pkt[..total], io.peer) };
+            let r = match io.relay {
+                Some(server) => {
+                    // ChannelData: channel number, length, packet.
+                    let mut framed = [0u8; 2048 + 4];
+                    framed[..2].copy_from_slice(&crate::turn::CHANNEL.to_be_bytes());
+                    framed[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+                    framed[4..4 + total].copy_from_slice(&pkt[..total]);
+                    let f = &framed[..4 + total];
+                    if io.connected { io.socket.send(f) } else { io.socket.send_to(f, server) }
+                }
+                None if io.connected => io.socket.send(&pkt[..total]),
+                None => io.socket.send_to(&pkt[..total], io.peer),
+            };
             if let Err(e) = r {
                 // ENOBUFS / EAGAIN under bursts: drop, FEC/NACK will cover it.
                 debug!("send to {}: {e}", io.peer);
@@ -799,6 +832,10 @@ struct Shared {
     connected: AtomicBool,
     /// A STUN query in flight on this socket: transaction id and the reply channel.
     stun_wait: Mutex<Option<StunWait>>,
+    /// Viewer through a TURN relay: (server, host's public address).
+    relay_addrs: std::sync::OnceLock<(SocketAddr, SocketAddr)>,
+    relay: Mutex<Option<crate::turn::Allocation>>,
+    relay_refresh_at: AtomicU64,
     identity: Keypair,
     cfg: NetConfig,
     sessions: Mutex<HashMap<u32, Arc<Conn>>>,
@@ -874,6 +911,9 @@ impl Shared {
             socket: Arc::new(socket),
             connected: AtomicBool::new(connected),
             stun_wait: Mutex::new(None),
+            relay_addrs: std::sync::OnceLock::new(),
+            relay: Mutex::new(None),
+            relay_refresh_at: AtomicU64::new(u64::MAX),
             identity,
             cfg,
             sessions: Mutex::new(HashMap::new()),
@@ -965,6 +1005,15 @@ impl Shared {
                 }
             }
             let now = clock::now_us();
+            if now >= self.relay_refresh_at.load(Ordering::Relaxed)
+                && let Some(&(server, _)) = self.relay_addrs.get()
+            {
+                self.relay_refresh_at.store(now + crate::turn::REFRESH_EVERY.as_micros() as u64, Ordering::Relaxed);
+                let msgs = lock(&self.relay).as_mut().map(|a| a.refresh()).unwrap_or_default();
+                for m in msgs {
+                    self.send_relay_control(&m, server);
+                }
+            }
             if now - last_tick >= 1_000 {
                 last_tick = now;
                 let sessions: Vec<Arc<Conn>> = lock(&self.sessions).values().cloned().collect();
@@ -983,6 +1032,20 @@ impl Shared {
             return;
         }
         if self.sim_loss > 0.0 && pkt[0] == packet::DATA && lock(&self.sim_rng).chance(self.sim_loss) {
+            return;
+        }
+        if let Some(&(server, peer)) = self.relay_addrs.get()
+            && from == server
+        {
+            if crate::stun::is_stun(pkt) {
+                // TURN replies (refreshes; stale nonce → resend).
+                let resend = lock(&self.relay).as_mut().map(|a| a.on_response(pkt)).unwrap_or_default();
+                for m in resend {
+                    self.send_relay_control(&m, server);
+                }
+            } else if let Some(inner) = crate::turn::channel_payload(pkt) {
+                self.on_packet(inner, peer);
+            }
             return;
         }
         if crate::stun::is_stun(pkt) {
@@ -1142,8 +1205,8 @@ impl Shared {
         let display = if hello.name.is_empty() { peer_name } else { hello.name.clone() };
         let session_socket = self.session_socket(from);
         let io = match &session_socket {
-            Some(s) => ConnIo { socket: Arc::clone(s), peer: from, connected: true },
-            None => ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: false },
+            Some(s) => ConnIo { socket: Arc::clone(s), peer: from, connected: true, relay: None },
+            None => ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: false, relay: None },
         };
         let conn = Conn::new(io, local_index, sender_index, rs, display, out.send, out.recv, &self.cfg);
         lock(&self.sessions).insert(local_index, Arc::clone(&conn));
@@ -1199,7 +1262,8 @@ impl Shared {
             // Several candidate addresses were tried: settle on the one that
             // answered (a connected socket is cheaper, and required for speed
             // on macOS).
-            if !self.connected.load(Ordering::Relaxed) && self.socket.connect(from).is_ok() {
+            let relay = self.relay_addrs.get().map(|(server, _)| *server);
+            if !self.connected.load(Ordering::Relaxed) && self.socket.connect(relay.unwrap_or(from)).is_ok() {
                 self.connected.store(true, Ordering::Relaxed);
             }
             let conn = Conn::new(
@@ -1207,6 +1271,7 @@ impl Shared {
                     socket: Arc::clone(&self.socket),
                     peer: from,
                     connected: self.connected.load(Ordering::Relaxed),
+                    relay,
                 },
                 receiver_index,
                 sender_index,
@@ -1221,6 +1286,14 @@ impl Shared {
         };
         let _ = p.result.send(result);
         *pending = None;
+    }
+
+    fn send_relay_control(&self, m: &[u8], server: SocketAddr) {
+        let r =
+            if self.connected.load(Ordering::Relaxed) { self.socket.send(m) } else { self.socket.send_to(m, server) };
+        if let Err(e) = r {
+            debug!("relay refresh: {e}");
+        }
     }
 
     fn on_stun(&self, pkt: &[u8], from: SocketAddr) {
@@ -1566,7 +1639,7 @@ impl Client {
         // A connected socket: cheaper per packet everywhere, and on macOS it
         // avoids a per-datagram policy check that otherwise throttles UDP.
         socket.connect(peer)?;
-        Self::handshake(socket, true, vec![peer], None, host_key, identity, cfg, timeout)
+        Self::handshake(socket, true, vec![peer], None, None, host_key, identity, cfg, timeout)
     }
 
     /// Connect over a not-yet-connected `socket`, trying several addresses at
@@ -1584,7 +1657,20 @@ impl Client {
         cfg: NetConfig,
         timeout: Duration,
     ) -> Result<Connection, NetError> {
-        Self::handshake(socket, false, candidates, more, host_key, identity, cfg, timeout)
+        Self::handshake(socket, false, candidates, more, None, host_key, identity, cfg, timeout)
+    }
+
+    /// Connect through a TURN relay allocated on `socket` (see [`crate::turn::allocate`]),
+    /// with its channel bound to the host's public address.
+    pub fn connect_relay(
+        socket: UdpSocket,
+        relay: crate::turn::Allocation,
+        host_key: [u8; 32],
+        identity: Keypair,
+        cfg: NetConfig,
+        timeout: Duration,
+    ) -> Result<Connection, NetError> {
+        Self::handshake(socket, false, Vec::new(), None, Some(relay), host_key, identity, cfg, timeout)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1593,12 +1679,21 @@ impl Client {
         connected: bool,
         mut candidates: Vec<SocketAddr>,
         more: Option<Receiver<Vec<SocketAddr>>>,
+        relay: Option<crate::turn::Allocation>,
         host_key: [u8; 32],
         identity: Keypair,
         cfg: NetConfig,
         timeout: Duration,
     ) -> Result<Connection, NetError> {
         let shared = Shared::new(socket, identity.clone(), cfg.clone(), connected)?;
+        let relay_server = relay.as_ref().map(|a| a.server);
+        if let Some(a) = relay {
+            let _ = shared.relay_addrs.set((a.server, a.peer));
+            *lock(&shared.relay) = Some(a);
+            shared
+                .relay_refresh_at
+                .store(clock::now_us() + crate::turn::REFRESH_EVERY.as_micros() as u64, Ordering::Relaxed);
+        }
         let local_index = shared.new_index();
         let mut ini = IkInitiator::new(&identity, host_key, IK_PROLOGUE);
         let hello = HelloPayload { version: PROTOCOL_VERSION, timestamp: clock::unix_ns(), name: cfg.name.clone() };
@@ -1625,8 +1720,11 @@ impl Client {
                 let _ = shared.socket.send_to(&pkt, a);
             }
         };
+        let framed = lock(&shared.relay).as_ref().map(|a| a.wrap(&pkt));
         loop {
-            if connected {
+            if let (Some(server), Some(f)) = (relay_server, &framed) {
+                let _ = shared.socket.send_to(f, server);
+            } else if connected {
                 if let Err(e) = shared.socket.send(&pkt) {
                     return fail(e.into());
                 }

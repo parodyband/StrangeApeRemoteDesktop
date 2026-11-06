@@ -10,9 +10,10 @@ use sard_core::net::{Client, Connection, Event};
 use sard_core::proto::{AudioPacket, ClientHello, Codec, Control, Platform, client_flags};
 use sard_core::stats::Samples;
 use sard_core::video::{CompleteFrame, FrameMeta, frame_flags};
-use sard_core::{anywhere, stun};
+use sard_core::{anywhere, stun, turn};
 use sard_core::{error, info, warn};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -61,22 +62,65 @@ pub fn dial(host: &KnownHost, addr: &str, args: &Args) -> Result<Connection> {
     let public = stun::resolve(stun::DEFAULT_SERVER, false)
         .and_then(|server| stun::query(&socket, server, Duration::from_millis(1500)));
     let (tx, rx) = std::sync::mpsc::channel();
-    let (host_key, me, name) = (host.key, identity.public(), host.name.clone());
-    std::thread::spawn(move || match service.introduce(&host_key, &me, public.as_slice()) {
-        Ok(Some(addrs)) => {
-            info!("Connect Anywhere: {name} is at {addrs:?}");
-            let _ = tx.send(addrs);
-        }
-        Ok(None) => info!("Connect Anywhere: {name} is not online"),
-        Err(e) => warn!("{e}"),
-    });
-    Client::connect_candidates(socket, lan, Some(rx), host.key, identity, cfg, Duration::from_secs(10)).map_err(|e| {
-        match e {
-            sard_core::net::NetError::Timeout => {
-                format!("{} didn't answer on this network or through Connect Anywhere", host.name).into()
+    let host_addrs: Arc<Mutex<Option<Vec<std::net::SocketAddr>>>> = Arc::default();
+    {
+        let (service, found) = (service.clone(), Arc::clone(&host_addrs));
+        let (host_key, me, name) = (host.key, identity.public(), host.name.clone());
+        std::thread::spawn(move || match service.introduce(&host_key, &me, public.as_slice()) {
+            Ok(Some(addrs)) => {
+                info!("Connect Anywhere: {name} is at {addrs:?}");
+                *found.lock().unwrap() = Some(addrs.clone());
+                let _ = tx.send(addrs);
             }
-            e => e.into(),
+            Ok(None) => info!("Connect Anywhere: {name} is not online"),
+            Err(e) => warn!("{e}"),
+        });
+    }
+    // 1. Directly: LAN address, or the host's public address with hole punching.
+    //    (SARD_FORCE_RELAY=1 skips this, to test the relay.)
+    let force_relay = std::env::var_os("SARD_FORCE_RELAY").is_some();
+    if force_relay {
+        for _ in 0..50 {
+            if host_addrs.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
+    }
+    let direct = if force_relay {
+        Err(sard_core::net::NetError::Timeout)
+    } else {
+        Client::connect_candidates(
+            socket,
+            lan,
+            Some(rx),
+            host.key,
+            identity.clone(),
+            cfg.clone(),
+            Duration::from_secs(3),
+        )
+    };
+    match direct {
+        Ok(c) => return Ok(c),
+        Err(sard_core::net::NetError::Timeout) => {}
+        Err(e) => return Err(e.into()),
+    }
+    // 2. Through the relay, for networks that can't be punched through.
+    let not_reached = || format!("{} didn't answer on this network or through Connect Anywhere", host.name);
+    let Some(addrs) = host_addrs.lock().unwrap().clone() else { return Err(not_reached().into()) };
+    let Some(host_public) = addrs.iter().copied().find(|a| !sard_core::net::is_lan(a.ip())) else {
+        return Err(not_reached().into());
+    };
+    let Some(creds) = service.relay_credentials()? else { return Err(not_reached().into()) };
+    info!("Connect Anywhere: no direct path to {}; using the relay", host.name);
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let relay = turn::allocate(&socket, &creds, host_public, Duration::from_secs(4))?;
+    info!("Connect Anywhere: relay address {}", relay.relayed);
+    // The host punches toward the relay so its router lets the relay's packets in.
+    service.introduce(&host.key, &identity.public(), &[relay.relayed])?;
+    Client::connect_relay(socket, relay, host.key, identity, cfg, Duration::from_secs(6)).map_err(|e| match e {
+        sard_core::net::NetError::Timeout => not_reached().into(),
+        e => e.into(),
     })
 }
 

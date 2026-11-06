@@ -670,6 +670,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "sard"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -1174,18 +1184,20 @@ dependencies = [
 
 [[package]]
 name = "sard-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
  "libc",
+ "md-5",
+ "sha1",
  "sha2",
  "x25519-dalek",
 ]
 
 [[package]]
 name = "sard-linux"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "raw-window-handle",
@@ -1194,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "sard-macos"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "block2 0.6.2",
  "libc",
@@ -1243,6 +1255,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

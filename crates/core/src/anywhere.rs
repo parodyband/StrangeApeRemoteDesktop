@@ -123,6 +123,38 @@ impl Service {
     }
 }
 
+impl Service {
+    /// Short-lived credentials for the TURN relay (for networks where hole
+    /// punching fails). `Ok(None)` if the service has no relay configured.
+    pub fn relay_credentials(&self) -> std::io::Result<Option<crate::turn::Credentials>> {
+        let auth = self.auth();
+        let (status, reply) = web::request(
+            "POST",
+            &self.url.join("/v1/relay"),
+            &[("Authorization", &auth)],
+            b"",
+            Duration::from_secs(8),
+        )?;
+        match status {
+            200 => {}
+            503 => return Ok(None),
+            s => return Err(std::io::Error::other(format!("Connect Anywhere relay: service error {s}"))),
+        }
+        let text = String::from_utf8_lossy(&reply);
+        let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix(' ')).map(str::trim);
+        let (Some(server), Some(username), Some(password)) = (field("server"), field("username"), field("password"))
+        else {
+            return Err(std::io::Error::other("Connect Anywhere relay: bad credentials reply"));
+        };
+        use std::net::ToSocketAddrs;
+        let server = server
+            .to_socket_addrs()?
+            .find(SocketAddr::is_ipv4)
+            .ok_or_else(|| std::io::Error::other("relay server has no IPv4 address"))?;
+        Ok(Some(crate::turn::Credentials { server, username: username.into(), password: password.into() }))
+    }
+}
+
 fn join(addrs: &[SocketAddr]) -> String {
     addrs.iter().map(SocketAddr::to_string).collect::<Vec<_>>().join(" ")
 }
