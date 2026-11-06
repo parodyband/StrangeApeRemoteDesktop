@@ -300,6 +300,13 @@ impl CgInput {
 
     fn mouse_move(&mut self, to: CGPoint, delta: (f64, f64)) {
         let to = self.clamp(to);
+        // Button packets include an absolute position on both press and release.
+        // The host applies that position before the button transition. Emitting
+        // a dragged event for the unchanged release position turns an ordinary
+        // click (including the second click of a double-click) into a drag.
+        if !pointer_moved(self.pos, to) && delta == (0.0, 0.0) {
+            return;
+        }
         let (kind, btn) = if self.buttons & (1 << button::LEFT) != 0 {
             (kCGEventLeftMouseDragged, 0)
         } else if self.buttons & (1 << button::RIGHT) != 0 {
@@ -428,6 +435,12 @@ impl CgInput {
     }
 }
 
+/// Compare positions as well as deltas when suppressing stationary updates.
+/// Nonzero relative deltas must still reach games at the screen edge.
+fn pointer_moved(from: CGPoint, to: CGPoint) -> bool {
+    from.x != to.x || from.y != to.y
+}
+
 /// (down type, up type, CG button number) for a wire button.
 fn cg_button(b: u8) -> (u32, u32, u32) {
     match b {
@@ -497,6 +510,18 @@ impl InputSink for LogInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_positions_do_not_generate_stationary_drags() {
+        let pos = CGPoint { x: 100.0, y: 200.0 };
+        // Each down/up in a double-click carries the same absolute position.
+        // None should insert a motion/drag event between button transitions.
+        for _ in 0..4 {
+            assert!(!pointer_moved(pos, pos));
+        }
+        assert!(pointer_moved(pos, CGPoint { x: 100.5, y: 200.0 }));
+        assert!(pointer_moved(pos, CGPoint { x: 100.0, y: 200.5 }));
+    }
 
     #[test]
     fn keycode_table_sanity() {
