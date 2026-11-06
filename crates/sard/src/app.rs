@@ -71,20 +71,38 @@ impl Settings {
     }
 }
 
-/// Keep a second copy of the app from starting (it would fight over the port
-/// and show two tray icons). The lock is released when the process exits.
-fn single_instance() -> Result<Option<std::fs::File>> {
-    use std::os::fd::AsRawFd;
-    let dir = config::config_dir();
-    std::fs::create_dir_all(&dir)?;
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("app.lock"))?;
-    // SAFETY: flock on a file descriptor we own.
-    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    Ok((r == 0).then_some(f))
+/// Without a terminal (launcher, login item, app bundle), log to a file
+/// instead of nowhere: Linux `~/.local/state/sard/app.log`, macOS
+/// `~/Library/Logs/Sard/app.log`.
+fn log_to_file() {
+    // SAFETY: isatty on a standard descriptor.
+    if unsafe { libc::isatty(2) } == 1 {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let dir = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/Sard")
+    } else {
+        std::env::var_os("XDG_STATE_HOME").map_or_else(|| home.join(".local/state"), Into::into).join("sard")
+    };
+    let path = dir.join("app.log");
+    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2 << 20) {
+        let _ = std::fs::rename(&path, dir.join("app.log.1"));
+    }
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: duplicate our log file onto stderr; both descriptors are valid.
+        unsafe {
+            libc::dup2(f.as_raw_fd(), 2);
+        }
+    }
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    let Some(_lock) = single_instance()? else {
+    log_to_file();
+    info!("Sard {} starting", env!("CARGO_PKG_VERSION"));
+    let Some(_lock) = crate::lock_file("app.lock")? else {
         println!("Sard is already running (look for it in the menu bar / system tray).");
         return Ok(());
     };
@@ -110,6 +128,7 @@ pub fn run(args: &Args) -> Result<()> {
         next_update_check: Instant::now() + Duration::from_secs(15),
         missing_permissions: Vec::new(),
         next_permission_check: None,
+        next_share_retry: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -162,6 +181,8 @@ struct App {
     /// Host permissions not granted yet (macOS), re-checked while any are missing.
     missing_permissions: Vec<&'static str>,
     next_permission_check: Option<Instant>,
+    /// Sharing is wanted but couldn't start (port busy...): try again then.
+    next_share_retry: Option<Instant>,
 }
 
 /// (session id, label, [(display id, name)], current display)
@@ -233,16 +254,23 @@ impl App {
                 }
                 self.host = Some(h);
                 self.host_error = None;
+                self.next_share_retry = None;
                 self.check_permissions();
             }
             Err(e) => {
                 let msg = if e.to_string().contains("in use") {
-                    format!("port in use — is `sard host` already running? ({e})")
+                    "another program is using Sard's port".to_string()
+                } else if e.to_string().contains("already sharing") {
+                    "Sard is already sharing from a terminal (`sard host`)".to_string()
                 } else {
                     e.to_string()
                 };
-                error!("cannot share this computer: {msg}");
+                if self.host_error.as_deref() != Some(msg.as_str()) {
+                    error!("cannot share this computer: {e}");
+                }
                 self.host_error = Some(msg);
+                // Keep trying: the other program may go away.
+                self.next_share_retry = Some(Instant::now() + Duration::from_secs(5));
             }
         }
     }
@@ -367,7 +395,7 @@ impl App {
         m.push(MenuEntry::Separator);
 
         // ---- sharing ----
-        let share = self.check("Share This Computer", self.host.is_some(), Action::ToggleShare);
+        let share = self.check("Share This Computer", self.settings.share, Action::ToggleShare);
         m.push(share);
         if let Some(st) = &status {
             if let Some(v) = &st.viewer {
@@ -473,7 +501,7 @@ impl App {
                 let Some(code) = platform::prompt_text(
                     "Pair with a computer",
                     &format!(
-                        "Pairing code for {addr}\n(on that computer choose “Allow a New Device to Pair…”, or run `sard host --pair`):"
+                        "6-digit pairing code for {addr}\n(on that computer choose “Allow a New Device to Pair…”):"
                     ),
                 ) else {
                     return Ok(None);
@@ -515,14 +543,15 @@ impl App {
             }
             Action::PairHost => self.pair_host(),
             Action::ToggleShare => {
-                if self.host.take().is_none() {
-                    self.start_host();
-                }
-                self.settings.share = self.host.is_some();
-                if self.host.is_none() {
-                    self.host_error = None;
-                }
+                self.settings.share = !self.settings.share;
                 self.settings.save();
+                if self.settings.share {
+                    self.start_host();
+                } else {
+                    self.host = None;
+                    self.host_error = None;
+                    self.next_share_retry = None;
+                }
                 self.check_permissions();
                 self.refresh();
             }
@@ -607,9 +636,10 @@ impl App {
         notify(
             "Pair a new device",
             &format!(
-                "On the other computer, open Sard → Connect To → Pair with a New Computer…\n\n\
+                "On the other computer: Sard menu → Connect To → Pair with a New Computer…\n\n\
                  Address:  {addr}\nCode:  {code}\n\n\
-                 Or run:  sard pair {addr} {code}\n\nThe code works once, for 10 minutes."
+                 The code works once, for 10 minutes.\n(Terminal: sard pair {addr} {})",
+                code.replace(' ', "")
             ),
         );
     }
@@ -751,8 +781,15 @@ impl ApplicationHandler<AppEvent> for App {
         if self.next_permission_check.is_some_and(|t| Instant::now() >= t) {
             self.check_permissions();
         }
+        if self.next_share_retry.is_some_and(|t| Instant::now() >= t) {
+            self.next_share_retry = None;
+            if self.settings.share && self.host.is_none() {
+                self.start_host();
+                self.refresh();
+            }
+        }
         let mut wake = self.next_refresh.map_or(self.next_update_check, |t| t.min(self.next_update_check));
-        if let Some(t) = self.next_permission_check {
+        for t in [self.next_permission_check, self.next_share_retry].into_iter().flatten() {
             wake = wake.min(t);
         }
         el.set_control_flow(ControlFlow::WaitUntil(wake));

@@ -5,8 +5,10 @@
 //! ├─ 0x01 HANDSHAKE_INIT  [type][sender_idx u32][noise IK msg1]
 //! ├─ 0x02 HANDSHAKE_RESP  [type][sender_idx u32][receiver_idx u32][noise IK msg2]
 //! ├─ 0x03 DATA            [type][receiver_idx u32][counter u64][AEAD(payload)][tag 16]
-//! ├─ 0x04 PAIR_INIT       [type][sender_idx u32][noise NNpsk0 msg1]
-//! └─ 0x05 PAIR_RESP       [type][sender_idx u32][receiver_idx u32][noise NNpsk0 msg2]
+//! ├─ 0x04 PAIR_INIT       [type][sender_idx u32][sid 16][noise NNpsk0 msg1, psk = CPace key]
+//! ├─ 0x05 PAIR_RESP       [type][sender_idx u32][receiver_idx u32][noise NNpsk0 msg2]
+//! ├─ 0x06 PAKE_INIT       [type][sender_idx u32][sid 16][CPace share 32]
+//! └─ 0x07 PAKE_RESP       [type][sender_idx u32][receiver_idx u32][sid 16][CPace share 32]
 //! ```
 //!
 //! Every DATA packet is addressed by the *receiver's* session index (chosen by
@@ -24,6 +26,8 @@ pub mod packet {
     pub const DATA: u8 = 0x03;
     pub const PAIR_INIT: u8 = 0x04;
     pub const PAIR_RESP: u8 = 0x05;
+    pub const PAKE_INIT: u8 = 0x06;
+    pub const PAKE_RESP: u8 = 0x07;
     /// type + receiver index + counter
     pub const DATA_HEADER_LEN: usize = 1 + 4 + 8;
     /// Bytes added to every payload by the DATA framing.

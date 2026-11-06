@@ -39,6 +39,7 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some((code, _)) = &st.pairing {
         println!();
         println!("  Pairing code:  {code}   (single use, valid for 10 minutes)");
+        let code = code.replace(' ', "");
         println!(
             "  On the other machine run:  sard pair {} {code}",
             st.ips.first().map_or("<this-ip>", |s| s.as_str())
@@ -83,6 +84,8 @@ struct ServiceState {
 /// The host side running inside a process: listens, pairs, and serves one
 /// viewer at a time (a new viewer takes over). Stops when dropped.
 pub struct HostService {
+    /// Held while sharing: one host per user (two would split the port).
+    _lock: std::fs::File,
     host: Arc<Host>,
     state: Arc<ServiceState>,
     accept: Option<std::thread::JoinHandle<()>>,
@@ -92,6 +95,8 @@ const PAIRING_TTL: Duration = Duration::from_secs(600);
 
 impl HostService {
     pub fn start(args: &Args, pair: bool, on_change: ChangeFn) -> Result<HostService> {
+        let lock = crate::lock_file("host.lock")?
+            .ok_or("Sard is already sharing this computer (the Sard app or a `sard host` in a terminal)")?;
         let dir = config::config_dir();
         let identity = config::load_or_create_identity(&dir)?;
         let trust = TrustStore::load(&dir)?;
@@ -133,7 +138,7 @@ impl HostService {
             },
         )?;
         let host = Arc::new(host);
-        let mut svc = HostService { host: Arc::clone(&host), state: Arc::clone(&state), accept: None };
+        let mut svc = HostService { _lock: lock, host: Arc::clone(&host), state: Arc::clone(&state), accept: None };
         let _ = std::fs::remove_file(dir.join("pairing-code.txt"));
         if pair {
             svc.new_pairing_code();
@@ -166,7 +171,7 @@ impl HostService {
         let _ = config::write_private_file(
             &config::config_dir(),
             "pairing-code.txt",
-            &format!("{code}\n# single use, valid for 10 minutes\n"),
+            &format!("{}\n# single use, valid for 10 minutes\n", code.replace(' ', "")),
         );
         self.state.status.lock().unwrap().pairing = Some((code.clone(), Instant::now() + PAIRING_TTL));
         (self.state.on_change)();

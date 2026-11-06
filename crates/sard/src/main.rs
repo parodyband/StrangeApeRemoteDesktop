@@ -137,6 +137,18 @@ fn has_desktop() -> bool {
     display && !tty
 }
 
+/// Take an exclusive lock on `<config dir>/<name>` (released when the file is
+/// dropped or the process exits). `None` if another process holds it.
+pub fn lock_file(name: &str) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let dir = config::config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(name))?;
+    // SAFETY: flock on a file descriptor we own.
+    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    Ok((r == 0).then_some(f))
+}
+
 /// The winit event loop shared by `connect` and the tray app.
 pub fn event_loop() -> Result<winit::event_loop::EventLoop<session::AppEvent>> {
     #[allow(unused_mut)]
@@ -173,9 +185,11 @@ pub fn net_config(args: &Args) -> Result<NetConfig> {
 }
 
 fn pair(args: &Args) -> Result<()> {
-    let (Some(arg), Some(code)) = (args.positional(0), args.positional(1)) else {
+    let (Some(arg), Some(first)) = (args.positional(0), args.positional(1)) else {
         return Err("usage: sard pair <host | alias> <code> [--alias <name>]".into());
     };
+    // "123 456" typed without quotes arrives as two arguments.
+    let code = &format!("{first}{}", args.positional(2).unwrap_or(""));
     let dir = config::config_dir();
     let mut aliases = config::Aliases::load(&dir)?;
     let new_alias = args.value("alias");

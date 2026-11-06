@@ -3,9 +3,12 @@
 //! * Connection: `Noise_IK_25519_ChaChaPoly_SHA256`. The client already knows
 //!   the host's static key (learned during pairing); the host checks the
 //!   client's static key against its trust store. One round trip.
-//! * Pairing: `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, PSK derived from a
-//!   100-bit one-time pairing code shown by the host. Both sides exchange
-//!   static public keys inside the encrypted payloads and persist them.
+//! * Pairing: a 6-digit one-time code shown by the host. The code is first run
+//!   through CPace (a balanced PAKE on ristretto255), so an attacker gets one
+//!   guess per attempt and nothing to brute-force offline even when the code
+//!   is short; the host closes pairing after a few wrong guesses. The CPace
+//!   key is then the PSK of `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, inside
+//!   which both sides exchange static public keys and persist them.
 //! * Transport: ChaCha20-Poly1305 with an explicit 64-bit packet counter as
 //!   nonce (carried in the clear packet header, authenticated as AAD) and a
 //!   sliding replay window, WireGuard style, so UDP loss/reordering is fine.
@@ -14,7 +17,9 @@
 //! state machine (a few dozen lines, per the spec) is implemented here.
 
 use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
-use sha2::{Digest, Sha256};
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::scalar::Scalar;
+use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const KEY_LEN: usize = 32;
@@ -536,33 +541,78 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // Pairing codes
 // ---------------------------------------------------------------------------
 
-const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+/// Digits in a pairing code.
+pub const PAIRING_CODE_DIGITS: usize = 6;
 
-/// Generate a 20-symbol (100-bit) pairing code, formatted `XXXXX-XXXXX-XXXXX-XXXXX`.
+/// Generate a uniformly random 6-digit pairing code, formatted `123 456`.
 pub fn generate_pairing_code() -> String {
-    let raw: [u8; 20] = crate::rand::bytes();
-    let mut s = String::with_capacity(23);
-    for (i, b) in raw.iter().enumerate() {
-        if i > 0 && i % 5 == 0 {
-            s.push('-');
+    let n = loop {
+        let x = crate::rand::u32();
+        // Rejection sampling: no bias towards low codes.
+        if x < u32::MAX - u32::MAX % 1_000_000 {
+            break x % 1_000_000;
         }
-        s.push(CODE_ALPHABET[(b & 31) as usize] as char);
-    }
-    s
+    };
+    format!("{:03} {:03}", n / 1000, n % 1000)
 }
 
-/// Normalize user input (case, dashes, spaces). `None` if invalid.
+/// Normalize user input ("123 456", "123-456", "123456"). `None` if invalid.
 pub fn normalize_pairing_code(input: &str) -> Option<String> {
-    let s: String = input.chars().filter(|c| !c.is_whitespace() && *c != '-').map(|c| c.to_ascii_uppercase()).collect();
-    if s.len() != 20 || !s.bytes().all(|b| CODE_ALPHABET.contains(&b)) {
+    let input = input.trim();
+    if !input.chars().all(|c| c.is_ascii_digit() || c == ' ' || c == '-') {
         return None;
     }
-    Some(s)
+    let s: String = input.chars().filter(char::is_ascii_digit).collect();
+    (s.len() == PAIRING_CODE_DIGITS).then_some(s)
 }
 
-/// Derive the 32-byte PSK from a (normalized) pairing code.
-pub fn pairing_psk(normalized_code: &str) -> [u8; 32] {
-    sha256(&[b"sard-pair-v1", normalized_code.as_bytes()])
+fn sha512(parts: &[&[u8]]) -> [u8; 64] {
+    let mut h = Sha512::new();
+    for p in parts {
+        h.update((p.len() as u32).to_le_bytes()); // length-prefixed: unambiguous
+        h.update(p);
+    }
+    let mut r = [0u8; 64];
+    r.copy_from_slice(&h.finalize());
+    r
+}
+
+/// One side of a CPace exchange (draft-irtf-cfrg-cpace, ristretto255) keyed by
+/// a pairing code. Both sides derive the same 32-byte key only if they used the
+/// same code; a wrong guess teaches an attacker nothing beyond "wrong".
+pub struct Cpace {
+    secret: Scalar,
+    sid: [u8; 16],
+    /// Our public share, sent to the peer.
+    pub share: [u8; 32],
+}
+
+impl Cpace {
+    /// `sid` is a fresh random session id chosen by the initiator.
+    pub fn start(normalized_code: &str, sid: [u8; 16]) -> Cpace {
+        let g = RistrettoPoint::from_uniform_bytes(&sha512(&[
+            b"sard-cpace-v1-generator",
+            normalized_code.as_bytes(),
+            &sid,
+        ]));
+        let secret = Scalar::from_bytes_mod_order_wide(&crate::rand::bytes::<64>());
+        let share = (g * secret).compress().to_bytes();
+        Cpace { secret, sid, share }
+    }
+
+    /// Combine with the peer's share. `initiator` orders the transcript.
+    pub fn finish(&self, peer: &[u8; 32], initiator: bool) -> Result<[u8; 32]> {
+        let p = CompressedRistretto(*peer).decompress().ok_or(CryptoError::WeakKey)?;
+        let k = (p * self.secret).compress();
+        if k == RistrettoPoint::default().compress() {
+            return Err(CryptoError::WeakKey); // degenerate share
+        }
+        let (a, b) = if initiator { (&self.share, peer) } else { (peer, &self.share) };
+        let isk = sha512(&[b"sard-cpace-v1-isk", &self.sid, k.as_bytes(), a, b]);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&isk[..32]);
+        Ok(out)
+    }
 }
 
 /// Short human-readable fingerprint of a public key, e.g. `3f2a-91bc-0d44-7e10`.
@@ -652,9 +702,27 @@ mod tests {
     }
 
     #[test]
+    fn cpace_agrees_only_on_same_code() {
+        let sid = [7u8; 16];
+        let a = Cpace::start("123456", sid);
+        let b = Cpace::start("123456", sid);
+        let ka = a.finish(&b.share, true).unwrap();
+        let kb = b.finish(&a.share, false).unwrap();
+        assert_eq!(ka, kb);
+        let wrong = Cpace::start("123457", sid);
+        assert_ne!(a.finish(&wrong.share, true).unwrap(), wrong.finish(&a.share, false).unwrap());
+        // Same code, different session: different key.
+        let c = Cpace::start("123456", [8u8; 16]);
+        let d = Cpace::start("123456", [8u8; 16]);
+        assert_ne!(c.finish(&d.share, true).unwrap(), ka);
+        // Identity / invalid encodings are rejected.
+        assert!(a.finish(&[0u8; 32], true).is_err());
+        assert!(a.finish(&[0xffu8; 32], true).is_err());
+    }
+
+    #[test]
     fn pairing_roundtrip_and_wrong_code() {
-        let code = normalize_pairing_code(&generate_pairing_code()).unwrap();
-        let psk = pairing_psk(&code);
+        let psk = [3u8; 32];
         let mut ini = PairInitiator::new(&psk, b"pair");
         let m1 = ini.write_message1(b"client-static");
         let (resp, p1) = PairResponder::read_message1(&psk, b"pair", &m1).unwrap();
@@ -662,7 +730,7 @@ mod tests {
         let m2 = resp.write_message2(b"host-static").unwrap();
         assert_eq!(ini.read_message2(&m2).unwrap(), b"host-static");
 
-        let wrong = pairing_psk("AAAAAAAAAAAAAAAAAAAA");
+        let wrong = [4u8; 32];
         let mut ini2 = PairInitiator::new(&psk, b"pair");
         let m1 = ini2.write_message1(b"x");
         assert!(PairResponder::read_message1(&wrong, b"pair", &m1).is_err());
@@ -671,11 +739,12 @@ mod tests {
     #[test]
     fn pairing_code_format() {
         let c = generate_pairing_code();
-        assert_eq!(c.len(), 23);
-        let n = normalize_pairing_code(&c.to_lowercase().replace('-', " ")).unwrap();
-        assert_eq!(n, c.replace('-', ""));
-        assert!(normalize_pairing_code("ABC").is_none());
-        assert!(normalize_pairing_code("IIIIIOOOOOIIIIIOOOOO").is_none());
+        assert_eq!(c.len(), 7);
+        assert_eq!(normalize_pairing_code(&c).unwrap(), c.replace(' ', ""));
+        assert_eq!(normalize_pairing_code(" 012-345 ").as_deref(), Some("012345"));
+        assert!(normalize_pairing_code("12345").is_none());
+        assert!(normalize_pairing_code("1234567").is_none());
+        assert!(normalize_pairing_code("12345a").is_none());
     }
 
     #[test]

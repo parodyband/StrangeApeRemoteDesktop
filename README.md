@@ -15,7 +15,7 @@ Built for driving Unity, Unreal, Godot and Blender on another machine across the
   audio are shared.
 - **Any screen.** Pick which remote monitor you're looking at from the menu, or with
   <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Shift</kbd>+<kbd>1</kbd>…<kbd>9</kbd>.
-- **Private.** Devices pair once with a one-time code. After that every connection
+- **Private.** Devices pair once with a 6-digit one-time code. After that every connection
   is mutually authenticated and end-to-end encrypted (Noise IK). There are no
   accounts and no cloud.
 - **Small.** One Rust binary with six crates of dependencies. A clean build takes
@@ -54,7 +54,7 @@ On macOS, quit Sard and move it to the Trash. Pairings stay in `~/.config/sard`.
 
 1. Open Sard on both computers.
 2. On the computer you want to **control**, choose **Allow a New Device to Pair…**
-   from its menu. It shows the address and a one-time code.
+   from its menu. It shows the address and a 6-digit code.
 3. On the computer you're **sitting at**, choose **Connect To → Pair with a New
    Computer…** and enter that address and code.
 
@@ -83,7 +83,7 @@ Everything in the menu also works from a terminal:
 
 ```sh
 sard host --pair                         # share this computer; prints a pairing code
-sard pair 192.168.1.77 <code> --alias linux
+sard pair 192.168.1.77 123456 --alias linux
 sard connect linux                       # open a viewer window
 sard alias 192.168.1.131 mac             # name a paired computer; `sard alias` lists them
 sard info                                # identity, paired devices, encoders/decoders
@@ -138,9 +138,12 @@ does not include the display's scan-out.
 
 **Transport** (`crates/core`): one UDP socket and one network thread; there is no
 async runtime.
-- **Handshake:** Noise IK (X25519, ChaCha20-Poly1305, SHA-256). Pairing uses Noise
-  NNpsk0 with a single-use 10-minute code. Handshakes carry a WireGuard-style *mac1*
-  and are rate-limited.
+- **Handshake:** Noise IK (X25519, ChaCha20-Poly1305, SHA-256). Handshakes carry a
+  WireGuard-style *mac1* and are rate-limited.
+- **Pairing:** a 6-digit, single-use, 10-minute code. It goes through CPace (a PAKE
+  on ristretto255), so the code can't be brute-forced offline, even by an attacker
+  in the middle of the exchange. The host withdraws a code after 5 wrong tries. The
+  PAKE key then seeds a Noise NNpsk0 exchange of static keys.
 - **Packets:** per-packet AEAD with explicit counters and a replay window. A
   session index routes every packet, so peers can roam and a future relay can
   forward without decrypting.

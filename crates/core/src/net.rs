@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const IK_PROLOGUE: &[u8] = b"sard/1 connect";
-const PAIR_PROLOGUE: &[u8] = b"sard/1 pair";
+const PAIR_PROLOGUE: &[u8] = b"sard/2 pair";
 
 const PING_INTERVAL_US: u64 = 250_000;
 const REPORT_INTERVAL_US: u64 = 250_000;
@@ -736,10 +736,34 @@ struct HandshakeCache {
 /// How long a pairing code stays valid.
 pub const PAIRING_TTL: Duration = Duration::from_secs(600);
 
-#[derive(Clone, Copy)]
+/// Wrong guesses after which a pairing code is withdrawn.
+pub const MAX_PAIRING_FAILURES: u32 = 5;
+
+#[derive(Clone)]
 struct PairingWindow {
-    psk: [u8; 32],
+    /// Normalized code (digits only).
+    code: String,
     expires_us: u64,
+    failures: u32,
+}
+
+impl PairingWindow {
+    fn new(code: &str) -> Self {
+        PairingWindow {
+            code: code.to_string(),
+            expires_us: clock::now_us() + PAIRING_TTL.as_micros() as u64,
+            failures: 0,
+        }
+    }
+}
+
+/// A CPace exchange answered by the host, waiting for the client's PAIR_INIT.
+struct PakePending {
+    sid: [u8; 16],
+    peer_share: [u8; 32],
+    key: [u8; 32],
+    reply: Vec<u8>,
+    created_us: u64,
 }
 
 struct TokenBucket {
@@ -779,13 +803,14 @@ struct Shared {
     pairing: Mutex<Option<PairingWindow>>,
     /// Last pairing reply, for retransmitted PAIR_INITs after the code was used.
     pair_cache: Mutex<Option<([u8; 32], Vec<u8>)>>,
+    /// CPace exchanges in progress (bounded).
+    pake: Mutex<std::collections::VecDeque<PakePending>>,
     /// Our mac1 key (hash of our public key): only paired clients can compute it.
     mac1_key: [u8; 32],
     /// Recent handshake responses by request hash (retransmits skip the DH).
     recent_handshakes: Mutex<std::collections::VecDeque<([u8; 32], Vec<u8>)>>,
     /// Rate limit for expensive handshake/pairing work.
     handshake_bucket: Mutex<TokenBucket>,
-    last_pair_warn: AtomicU64,
     on_paired: Mutex<Option<PairedFn>>,
     accept_tx: Mutex<Option<Sender<Connection>>>,
     hs_cache: Mutex<HashMap<[u8; 32], HandshakeCache>>,
@@ -849,10 +874,10 @@ impl Shared {
             trusted: Mutex::new(HashMap::new()),
             pairing: Mutex::new(None),
             pair_cache: Mutex::new(None),
+            pake: Mutex::new(std::collections::VecDeque::new()),
             mac1_key: crate::crypto::mac1_key(&identity_public),
             recent_handshakes: Mutex::new(std::collections::VecDeque::new()),
             handshake_bucket: Mutex::new(TokenBucket::new(50.0, 20.0)),
-            last_pair_warn: AtomicU64::new(0),
             on_paired: Mutex::new(None),
             accept_tx: Mutex::new(None),
             hs_cache: Mutex::new(HashMap::new()),
@@ -966,6 +991,7 @@ impl Shared {
                     debug!("pairing attempt from {from} failed: {e}");
                 }
             }
+            packet::PAKE_INIT => self.on_pake_init(pkt, from),
             _ => {}
         }
     }
@@ -1176,6 +1202,63 @@ impl Shared {
         *pending = None;
     }
 
+    /// Pairing allowed right now (code set and not expired)?
+    fn pairing_open(&self, now: u64) -> bool {
+        let mut w = lock(&self.pairing);
+        match w.as_ref() {
+            None => false,
+            Some(win) if now > win.expires_us => {
+                *w = None;
+                info!("pairing code expired");
+                false
+            }
+            Some(_) => true,
+        }
+    }
+
+    /// First pairing step: CPace with the code (no Noise yet).
+    fn on_pake_init(&self, pkt: &[u8], from: SocketAddr) {
+        if pkt.len() != 1 + 4 + 16 + 32 {
+            return;
+        }
+        let sender_index = u32::from_le_bytes(pkt[1..5].try_into().unwrap());
+        let sid: [u8; 16] = pkt[5..21].try_into().unwrap();
+        let share: [u8; 32] = pkt[21..53].try_into().unwrap();
+        let now = clock::now_us();
+        {
+            let mut q = lock(&self.pake);
+            q.retain(|p| now.saturating_sub(p.created_us) < 60_000_000);
+            if let Some(p) = q.iter().find(|p| p.sid == sid) {
+                if p.peer_share == share {
+                    let _ = self.socket.send_to(&p.reply, from); // retransmit
+                }
+                return;
+            }
+        }
+        if !self.pairing_open(now) || !lock(&self.handshake_bucket).take(now) {
+            return;
+        }
+        let Some(code) = lock(&self.pairing).as_ref().map(|w| w.code.clone()) else { return };
+        let cp = crate::crypto::Cpace::start(&code, sid);
+        let Ok(key) = cp.finish(&share, false) else {
+            debug!("bad CPace share from {from}");
+            return;
+        };
+        let mut reply = Vec::with_capacity(1 + 8 + 16 + 32);
+        reply.put_u8(packet::PAKE_RESP);
+        reply.put_u32(0);
+        reply.put_u32(sender_index);
+        reply.put_bytes(&sid);
+        reply.put_bytes(&cp.share);
+        let mut q = lock(&self.pake);
+        if q.len() >= 8 {
+            q.pop_front();
+        }
+        q.push_back(PakePending { sid, peer_share: share, key, reply: reply.clone(), created_us: now });
+        drop(q);
+        let _ = self.socket.send_to(&reply, from);
+    }
+
     fn on_pair_init(&self, pkt: &[u8], from: SocketAddr) -> Result<(), NetError> {
         if pkt.len() < 5 {
             return Ok(());
@@ -1188,25 +1271,32 @@ impl Shared {
             return Ok(());
         }
         let now = clock::now_us();
-        let Some(window) = *lock(&self.pairing) else {
-            debug!("pairing request from {from} but pairing is not enabled");
-            return Ok(());
-        };
-        if now > window.expires_us {
-            *lock(&self.pairing) = None;
-            info!("pairing code expired; restart with `sard host --pair` for a new one");
-            return Ok(());
-        }
-        if !lock(&self.handshake_bucket).take(now) {
+        if !self.pairing_open(now) || pkt.len() < 21 {
             return Ok(());
         }
         let sender_index = u32::from_le_bytes(pkt[1..5].try_into().unwrap());
-        let (resp, payload) = match PairResponder::read_message1(&window.psk, PAIR_PROLOGUE, &pkt[5..]) {
+        let sid: [u8; 16] = pkt[5..21].try_into().unwrap();
+        // One Noise attempt per CPace exchange: one guess per attempt.
+        let pending = {
+            let mut q = lock(&self.pake);
+            let i = q.iter().position(|p| p.sid == sid);
+            i.and_then(|i| q.remove(i))
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let (resp, payload) = match PairResponder::read_message1(&pending.key, PAIR_PROLOGUE, &pkt[21..]) {
             Ok(v) => v,
-            Err(e) => {
-                if now.saturating_sub(self.last_pair_warn.load(Ordering::Relaxed)) > 5_000_000 {
-                    self.last_pair_warn.store(now, Ordering::Relaxed);
-                    warn!("pairing attempt from {from} failed ({e}): wrong code?");
+            Err(_) => {
+                let mut w = lock(&self.pairing);
+                if let Some(win) = w.as_mut() {
+                    win.failures += 1;
+                    if win.failures >= MAX_PAIRING_FAILURES {
+                        *w = None;
+                        warn!("pairing closed after {MAX_PAIRING_FAILURES} wrong codes (last from {from})");
+                    } else {
+                        warn!("wrong pairing code from {from} ({} of {MAX_PAIRING_FAILURES} tries)", win.failures);
+                    }
                 }
                 return Ok(());
             }
@@ -1276,10 +1366,7 @@ impl Host {
         let socket = UdpSocket::bind(addr)?;
         let shared = Shared::new(socket, identity, cfg, false)?;
         *lock(&shared.trusted) = opts.trusted;
-        *lock(&shared.pairing) = opts.pairing_code.as_deref().map(|c| PairingWindow {
-            psk: crate::crypto::pairing_psk(c),
-            expires_us: clock::now_us() + PAIRING_TTL.as_micros() as u64,
-        });
+        *lock(&shared.pairing) = opts.pairing_code.as_deref().map(PairingWindow::new);
         *lock(&shared.on_paired) = opts.on_paired;
         let (tx, rx) = mpsc::channel::<Connection>();
         *lock(&shared.accept_tx) = Some(tx);
@@ -1291,11 +1378,10 @@ impl Host {
         self.shared.socket.local_addr()
     }
 
+    /// Open (or close, with None) a pairing window for a normalized code.
     pub fn set_pairing_code(&self, code: Option<&str>) {
-        *lock(&self.shared.pairing) = code.map(|c| PairingWindow {
-            psk: crate::crypto::pairing_psk(c),
-            expires_us: clock::now_us() + PAIRING_TTL.as_micros() as u64,
-        });
+        lock(&self.shared.pake).clear();
+        *lock(&self.shared.pairing) = code.map(PairingWindow::new);
     }
 
     /// Wait for the next client connection.
@@ -1447,22 +1533,62 @@ impl Client {
         timeout: Duration,
     ) -> Result<([u8; 32], String, SocketAddr), NetError> {
         let normalized = crate::crypto::normalize_pairing_code(code)
-            .ok_or_else(|| NetError::Rejected("invalid pairing code format".into()))?;
-        let psk = crate::crypto::pairing_psk(&normalized);
+            .ok_or_else(|| NetError::Rejected("the pairing code is 6 digits".into()))?;
         let peer = resolve(addr)?;
         let socket = bind_for(&peer)?;
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(300)))?;
         let local_index = crate::rand::u32();
+        let deadline = Instant::now() + timeout;
+        let mut buf = [0u8; 2048];
+
+        // 1. CPace: turn the short code into a strong shared key.
+        let sid: [u8; 16] = crate::rand::bytes();
+        let cp = crate::crypto::Cpace::start(&normalized, sid);
+        let mut pkt = Vec::new();
+        pkt.put_u8(packet::PAKE_INIT);
+        pkt.put_u32(local_index);
+        pkt.put_bytes(&sid);
+        pkt.put_bytes(&cp.share);
+        let mut host_share = None;
+        'pake: while Instant::now() < deadline {
+            socket.send(&pkt)?;
+            let until = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < until {
+                match socket.recv_from(&mut buf) {
+                    Ok((n, _)) if n == 1 + 8 + 16 + 32 && buf[0] == packet::PAKE_RESP => {
+                        let ri = u32::from_le_bytes(buf[5..9].try_into().unwrap());
+                        if ri == local_index && buf[9..25] == sid {
+                            host_share = Some(<[u8; 32]>::try_from(&buf[25..57]).unwrap());
+                            break 'pake;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        let Some(host_share) = host_share else {
+            return Err(NetError::Rejected(format!(
+                "no answer from {addr}: is Sard running there, with “Allow a New Device to Pair…” \
+                 (or `sard host --pair`) and a code from the last 10 minutes?"
+            )));
+        };
+        let psk = cp.finish(&host_share, true).map_err(|_| NetError::Rejected("invalid pairing reply".into()))?;
+
+        // 2. Noise NNpsk0 keyed by the CPace result; exchanges static keys.
         let mut ini = PairInitiator::new(&psk, PAIR_PROLOGUE);
         let payload = PairPayload { version: PROTOCOL_VERSION, static_key: identity.public(), name: cfg.name.clone() };
         let msg1 = ini.write_message1(&payload.encode());
         let mut pkt = Vec::new();
         pkt.put_u8(packet::PAIR_INIT);
         pkt.put_u32(local_index);
+        pkt.put_bytes(&sid);
         pkt.put_bytes(&msg1);
-        let deadline = Instant::now() + timeout;
-        let mut buf = [0u8; 2048];
+        // The host answers at once if the code was right; silence means wrong.
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(3));
         while Instant::now() < deadline {
             socket.send(&pkt)?;
             let until = Instant::now() + Duration::from_millis(300);
@@ -1486,10 +1612,6 @@ impl Client {
                 }
             }
         }
-        Err(NetError::Rejected(
-            "no valid reply: check the code and that the host runs `sard host --pair` \
-             (codes are single-use and expire after 10 minutes)"
-                .into(),
-        ))
+        Err(NetError::Rejected("wrong pairing code (or it was already used)".into()))
     }
 }
