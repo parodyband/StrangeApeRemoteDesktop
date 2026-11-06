@@ -411,6 +411,9 @@ pub struct DuplSource {
     target: Arc<Mutex<InputTarget>>,
     timing: Timing,
     warned_rotation: bool,
+    /// A newer picture than the last encoded one, held back for the frame rate (its capture time).
+    pending: Option<u64>,
+    last_encode: Instant,
 }
 
 // SAFETY: created on the host thread, then used only by the video thread.
@@ -484,6 +487,8 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
         target: Arc::clone(&target),
         timing: Timing::default(),
         warned_rotation: false,
+        pending: None,
+        last_encode: Instant::now() - Duration::from_secs(1),
     };
     Ok((Box::new(src), Box::new(SendInputSink::new(target))))
 }
@@ -724,6 +729,7 @@ impl DuplSource {
             i
         };
         let t1 = Instant::now();
+        self.last_encode = t0;
         let key = std::mem::take(&mut self.force_key);
         let packets = self.enc.encode(&self.targets[idx].texture, capture_us, key)?;
         self.last_target = Some(idx);
@@ -761,7 +767,17 @@ impl VideoSource for DuplSource {
             return Ok(Some(f));
         }
         let deadline = Instant::now() + timeout;
+        // Desktop Duplication delivers at the monitor's refresh rate (144-240 Hz on
+        // gaming PCs); the encoder's rate control assumes the stream's fps.
+        let interval = Duration::from_secs_f64(1.0 / self.opts.fps.max(1) as f64);
         loop {
+            if let Some(capture_us) = self.pending
+                && self.last_encode.elapsed() >= interval
+            {
+                self.pending = None;
+                self.encode(capture_us, false)?;
+                return Ok(self.queue.pop_front());
+            }
             if self.dupl.is_none() && !self.reopen() {
                 if self.force_key && self.last_target.is_some() {
                     // Paused (secure desktop): the viewer still gets a decodable picture.
@@ -775,9 +791,15 @@ impl VideoSource for DuplSource {
                 std::thread::sleep(left.min(Duration::from_millis(20)));
                 continue;
             }
-            let left = deadline.saturating_duration_since(Instant::now()).as_millis() as u32;
-            match self.acquire(left) {
+            let mut left = deadline.saturating_duration_since(Instant::now());
+            if self.pending.is_some() {
+                left = left.min(interval.saturating_sub(self.last_encode.elapsed()));
+            }
+            match self.acquire(left.as_millis() as u32) {
                 Acquired::Timeout => {
+                    if self.pending.is_some() {
+                        continue; // its time has come
+                    }
                     if self.force_key && self.last_target.is_some() {
                         // Static screen: re-encode the last picture as a keyframe.
                         self.encode(clock::now_us(), true)?;
@@ -789,6 +811,7 @@ impl VideoSource for DuplSource {
                     debug!("duplication lost: {e}");
                     self.dupl = None;
                     self.desktop = None;
+                    self.pending = None;
                     self.force_key = true;
                 }
                 Acquired::Frame { image, capture_us } => {
@@ -796,12 +819,21 @@ impl VideoSource for DuplSource {
                         warn!("this display is rotated; the stream shows it unrotated (not supported yet)");
                         self.warned_rotation = true;
                     }
-                    if image {
+                    if !image {
+                        // Pointer-only update: let the caller send the cursor now.
+                        return Ok(None);
+                    }
+                    // 0.5 ms slack so a monitor at exactly the stream's rate isn't halved by jitter.
+                    if self.force_key || self.last_encode.elapsed() + Duration::from_micros(500) >= interval {
+                        self.pending = None;
                         self.encode(capture_us, false)?;
                         return Ok(self.queue.pop_front());
                     }
-                    // Pointer-only update: let the caller send the cursor now.
-                    return Ok(None);
+                    // Too soon: the newest picture (already copied) is encoded when due.
+                    self.pending = Some(capture_us);
+                    if self.cursor.dirty {
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -903,6 +935,7 @@ impl VideoSource for DuplSource {
         }
         self.dupl = Some(dupl);
         self.desktop_size = size;
+        self.pending = None;
         self.current = idx;
         self.target.lock().unwrap().screen = s.rect;
         self.cursor.dirty = true;
