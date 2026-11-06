@@ -69,6 +69,8 @@ pub struct HostStatus {
     pub pairing: Option<(String, Instant)>,
     /// Permissions the OS still needs granted before capture works.
     pub missing_permissions: Vec<String>,
+    /// Connect Anywhere (None: not set up on this device).
+    pub anywhere: Option<sard_core::anywhere::AgentStatus>,
 }
 
 type ChangeFn = Box<dyn Fn() + Send + Sync>;
@@ -86,6 +88,8 @@ struct ServiceState {
 pub struct HostService {
     /// Held while sharing: one host per user (two would split the port).
     _lock: std::fs::File,
+    /// Registration with the Connect Anywhere service, if set up.
+    anywhere: Option<sard_core::anywhere::HostAgent>,
     host: Arc<Host>,
     trust: Arc<Mutex<TrustStore>>,
     state: Arc<ServiceState>,
@@ -100,6 +104,7 @@ impl HostService {
             .ok_or("Sard is already sharing this computer (the Sard app or a `sard host` in a terminal)")?;
         let dir = config::config_dir();
         let identity = config::load_or_create_identity(&dir)?;
+        let identity_public = identity.public();
         let trust = TrustStore::load(&dir)?;
         let trusted: HashMap<[u8; 32], String> = trust.peers.iter().map(|p| (p.key, p.name.clone())).collect();
         let pair = pair || trust.peers.is_empty();
@@ -140,8 +145,31 @@ impl HostService {
             },
         )?;
         let host = Arc::new(host);
-        let mut svc =
-            HostService { _lock: lock, host: Arc::clone(&host), trust, state: Arc::clone(&state), accept: None };
+        let anywhere = sard_core::anywhere::Service::load(&dir).map(|service| {
+            let (h1, h2, st) = (Arc::clone(&host), Arc::clone(&host), Arc::clone(&state));
+            sard_core::anywhere::HostAgent::start(
+                service,
+                identity_public,
+                sard_core::anywhere::HostHooks {
+                    addrs: Box::new(move || {
+                        let public = sard_core::stun::resolve(sard_core::stun::DEFAULT_SERVER, false)
+                            .and_then(|s| h1.stun(s, Duration::from_secs(2)));
+                        let lan = local_ips().iter().filter_map(|ip| format!("{ip}:{port}").parse().ok()).collect();
+                        (public, lan)
+                    }),
+                    punch: Box::new(move |to| h2.punch(to)),
+                    changed: Box::new(move || (st.on_change)()),
+                },
+            )
+        });
+        let mut svc = HostService {
+            _lock: lock,
+            anywhere,
+            host: Arc::clone(&host),
+            trust,
+            state: Arc::clone(&state),
+            accept: None,
+        };
         let _ = std::fs::remove_file(dir.join("pairing-code.txt"));
         if pair {
             svc.new_pairing_code();
@@ -158,7 +186,9 @@ impl HostService {
     }
 
     pub fn status(&self) -> HostStatus {
+        let anywhere = self.anywhere.as_ref().map(sard_core::anywhere::HostAgent::status);
         let mut s = self.state.status.lock().unwrap();
+        s.anywhere = anywhere;
         if s.pairing.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
             s.pairing = None;
         }

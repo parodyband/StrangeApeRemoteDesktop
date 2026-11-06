@@ -9,7 +9,6 @@ use crate::session::{AppEvent, Outcome, Session, SessionEvent, SessionOpts};
 use crate::{Result, platform};
 use sard_core::config::{self, Aliases, KnownHosts, TrustStore};
 use sard_core::media::{MenuEntry, Rgba, Tray, TrayIcons};
-use sard_core::net::Client;
 use sard_core::proto::Control;
 use sard_core::{error, info, warn};
 use std::time::{Duration, Instant};
@@ -335,6 +334,15 @@ impl App {
                 if let Some(v) = &st.viewer {
                     m.push(Self::text(format!("{v} is viewing this computer")));
                 }
+                match &st.anywhere {
+                    Some(a) if a.online => m.push(Self::text("Reachable from anywhere")),
+                    Some(a) => {
+                        let why = a.error.as_deref().unwrap_or("connecting…");
+                        let why: String = why.chars().take(60).collect();
+                        m.push(Self::text(format!("⚠ Connect Anywhere: {why}")));
+                    }
+                    None => {}
+                }
                 for p in self.missing_permissions.clone() {
                     let e = self.item(format!("⚠ Allow {p}…"), Action::OpenPermission(p));
                     m.push(e);
@@ -505,12 +513,7 @@ impl App {
         self.connecting.push((id, label.clone(), target));
         let (proxy, args) = (self.proxy.clone(), self.args.clone());
         std::thread::spawn(move || {
-            let result = (|| -> Result<_> {
-                let identity = config::load_or_create_identity(&config::config_dir())?;
-                let cfg = crate::net_config(&args)?;
-                Ok(Client::connect(&addr, host.key, identity, cfg, Duration::from_secs(8))?)
-            })()
-            .map_err(|e| e.to_string());
+            let result = client::dial(&host, &addr, &args).map_err(|e| e.to_string());
             let _ = proxy.send_event(AppEvent::Connected { id, label, result });
         });
         self.refresh();

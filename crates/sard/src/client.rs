@@ -10,6 +10,7 @@ use sard_core::net::{Client, Connection, Event};
 use sard_core::proto::{AudioPacket, ClientHello, Codec, Control, Platform, client_flags};
 use sard_core::stats::Samples;
 use sard_core::video::{CompleteFrame, FrameMeta, frame_flags};
+use sard_core::{anywhere, stun};
 use sard_core::{error, info, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +45,41 @@ pub fn resolve(arg: &str) -> Result<(KnownHost, String)> {
     Ok((host, addr))
 }
 
+/// Connect to a paired host: directly at `addr`, and with Connect Anywhere
+/// configured also through the rendezvous service (public addresses, hole
+/// punching). Whichever path answers first is used.
+pub fn dial(host: &KnownHost, addr: &str, args: &Args) -> Result<Connection> {
+    let dir = config::config_dir();
+    let identity = config::load_or_create_identity(&dir)?;
+    let cfg = crate::net_config(args)?;
+    let Some(service) = anywhere::Service::load(&dir) else {
+        return Ok(Client::connect(addr, host.key, identity, cfg, Duration::from_secs(8))?);
+    };
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let lan: Vec<std::net::SocketAddr> = sard_core::net::resolve(addr).into_iter().filter(|a| a.is_ipv4()).collect();
+    // Our public address, learned on the socket the connection will use.
+    let public = stun::resolve(stun::DEFAULT_SERVER, false)
+        .and_then(|server| stun::query(&socket, server, Duration::from_millis(1500)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (host_key, me, name) = (host.key, identity.public(), host.name.clone());
+    std::thread::spawn(move || match service.introduce(&host_key, &me, public.as_slice()) {
+        Ok(Some(addrs)) => {
+            info!("Connect Anywhere: {name} is at {addrs:?}");
+            let _ = tx.send(addrs);
+        }
+        Ok(None) => info!("Connect Anywhere: {name} is not online"),
+        Err(e) => warn!("{e}"),
+    });
+    Client::connect_candidates(socket, lan, Some(rx), host.key, identity, cfg, Duration::from_secs(10)).map_err(|e| {
+        match e {
+            sard_core::net::NetError::Timeout => {
+                format!("{} didn't answer on this network or through Connect Anywhere", host.name).into()
+            }
+            e => e.into(),
+        }
+    })
+}
+
 pub fn opts_from_args(args: &Args) -> Result<SessionOpts> {
     Ok(SessionOpts {
         fps: args.parse_value("fps")?,
@@ -63,10 +99,8 @@ pub fn run(args: &Args) -> Result<()> {
         return Err("usage: sard connect <host | alias>".into());
     };
     let (host, addr) = resolve(arg)?;
-    let identity = config::load_or_create_identity(&config::config_dir())?;
-    let cfg = crate::net_config(args)?;
     println!("Connecting to {} ({addr}) ...", host.name);
-    let conn = Client::connect(&addr, host.key, identity, cfg, Duration::from_secs(8))?;
+    let conn = dial(&host, &addr, args)?;
     if args.flag("headless") {
         let events = conn.take_events().ok_or("events taken")?;
         let frames = conn.take_video().ok_or("video taken")?;

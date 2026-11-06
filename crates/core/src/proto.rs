@@ -8,7 +8,11 @@
 //! ├─ 0x04 PAIR_INIT       [type][sender_idx u32][sid 16][noise NNpsk0 msg1, psk = CPace key]
 //! ├─ 0x05 PAIR_RESP       [type][sender_idx u32][receiver_idx u32][noise NNpsk0 msg2]
 //! ├─ 0x06 PAKE_INIT       [type][sender_idx u32][sid 16][CPace share 32]
-//! └─ 0x07 PAKE_RESP       [type][sender_idx u32][receiver_idx u32][sid 16][CPace share 32]
+//! ├─ 0x07 PAKE_RESP       [type][sender_idx u32][receiver_idx u32][sid 16][CPace share 32]
+//! └─ 0x08 PUNCH           [type]  (opens a NAT mapping; ignored on receipt)
+//!
+//! STUN messages (RFC 8489, magic cookie at bytes 4..8) share the socket and
+//! are told apart before the type byte is looked at.
 //! ```
 //!
 //! Every DATA packet is addressed by the *receiver's* session index (chosen by
@@ -28,6 +32,7 @@ pub mod packet {
     pub const PAIR_RESP: u8 = 0x05;
     pub const PAKE_INIT: u8 = 0x06;
     pub const PAKE_RESP: u8 = 0x07;
+    pub const PUNCH: u8 = 0x08;
     /// type + receiver index + counter
     pub const DATA_HEADER_LEN: usize = 1 + 4 + 8;
     /// Bytes added to every payload by the DATA framing.

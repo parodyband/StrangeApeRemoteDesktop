@@ -134,3 +134,45 @@ fn pair_connect_stream() {
         }
     }
 }
+
+/// Connect Anywhere path: an unconnected socket tries several candidate
+/// addresses (some dead, the real one arriving late) and settles on the one
+/// that answers.
+#[test]
+fn connect_via_candidates() {
+    let host_id = Keypair::generate();
+    let client_id = Keypair::generate();
+    let mut trusted = HashMap::new();
+    trusted.insert(client_id.public(), "viewer".to_string());
+    let host = Host::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        host_id.clone(),
+        NetConfig { name: "test-host".into(), ..Default::default() },
+        HostOptions { trusted, pairing_code: None, on_paired: None },
+    )
+    .unwrap();
+    let real = host.local_addr().unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = tx.send(vec!["127.0.0.1:9".parse().unwrap(), real]);
+    });
+    let ccfg = NetConfig { name: "viewer".into(), ..Default::default() };
+    let client = Client::connect_candidates(
+        socket,
+        vec!["127.0.0.1:7".parse().unwrap()],
+        Some(rx),
+        host_id.public(),
+        client_id,
+        ccfg,
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    let server = host.accept(Duration::from_secs(3)).expect("host accept");
+    assert_eq!(client.peer_addr(), real);
+    client.send_control(&Control::Status { text: "over the chosen path".into() });
+    let ev = server.take_events().unwrap();
+    let got = ev.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(matches!(got, Event::Control(Control::Status { .. })), "{got:?}");
+}

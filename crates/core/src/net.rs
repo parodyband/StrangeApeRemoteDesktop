@@ -789,10 +789,16 @@ impl TokenBucket {
     }
 }
 
+/// A STUN query in flight: transaction id, server, where to send the answer.
+type StunWait = ([u8; 12], SocketAddr, Sender<SocketAddr>);
+
 struct Shared {
     socket: Arc<UdpSocket>,
-    /// Client role: the socket is `connect()`ed to the host.
-    connected: bool,
+    /// Client role: the socket is `connect()`ed to the host (from the start,
+    /// or once the handshake picked one of several candidate addresses).
+    connected: AtomicBool,
+    /// A STUN query in flight on this socket: transaction id and the reply channel.
+    stun_wait: Mutex<Option<StunWait>>,
     identity: Keypair,
     cfg: NetConfig,
     sessions: Mutex<HashMap<u32, Arc<Conn>>>,
@@ -866,7 +872,8 @@ impl Shared {
         socket.set_read_timeout(Some(Duration::from_millis(1)))?;
         Ok(Arc::new(Shared {
             socket: Arc::new(socket),
-            connected,
+            connected: AtomicBool::new(connected),
+            stun_wait: Mutex::new(None),
             identity,
             cfg,
             sessions: Mutex::new(HashMap::new()),
@@ -978,6 +985,10 @@ impl Shared {
         if self.sim_loss > 0.0 && pkt[0] == packet::DATA && lock(&self.sim_rng).chance(self.sim_loss) {
             return;
         }
+        if crate::stun::is_stun(pkt) {
+            self.on_stun(pkt, from);
+            return;
+        }
         match pkt[0] {
             packet::DATA => self.on_data(pkt, from),
             packet::HANDSHAKE_INIT => {
@@ -1023,7 +1034,7 @@ impl Shared {
             if io.peer != from {
                 info!("peer {} moved {} -> {}", conn.remote_name, io.peer, from);
                 io.peer = from;
-                if io.connected && !self.connected {
+                if io.connected && !self.connected.load(Ordering::Relaxed) {
                     // The per-session socket is tied to the old address.
                     io.socket = Arc::clone(&self.socket);
                     io.connected = false;
@@ -1185,8 +1196,18 @@ impl Shared {
         let result = if hello.version != PROTOCOL_VERSION {
             Err(NetError::Rejected(format!("host speaks protocol v{}", hello.version)))
         } else {
+            // Several candidate addresses were tried: settle on the one that
+            // answered (a connected socket is cheaper, and required for speed
+            // on macOS).
+            if !self.connected.load(Ordering::Relaxed) && self.socket.connect(from).is_ok() {
+                self.connected.store(true, Ordering::Relaxed);
+            }
             let conn = Conn::new(
-                ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: self.connected },
+                ConnIo {
+                    socket: Arc::clone(&self.socket),
+                    peer: from,
+                    connected: self.connected.load(Ordering::Relaxed),
+                },
                 receiver_index,
                 sender_index,
                 out.remote_static,
@@ -1200,6 +1221,44 @@ impl Shared {
         };
         let _ = p.result.send(result);
         *pending = None;
+    }
+
+    fn on_stun(&self, pkt: &[u8], from: SocketAddr) {
+        let mut w = lock(&self.stun_wait);
+        if let Some((txid, server, tx)) = w.as_ref()
+            && *server == from
+            && let Some(addr) = crate::stun::parse_response(pkt, txid)
+        {
+            let _ = tx.send(addr);
+            *w = None;
+        }
+    }
+
+    /// Ask a STUN server what our socket looks like from the internet.
+    fn stun(&self, server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
+        let (tx, rx) = mpsc::channel();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let (txid, req) = crate::stun::request();
+            *lock(&self.stun_wait) = Some((txid, server, tx.clone()));
+            if self.socket.send_to(&req, server).is_err() {
+                break;
+            }
+            let wait = Duration::from_millis(400).min(deadline.saturating_duration_since(Instant::now()));
+            if let Ok(a) = rx.recv_timeout(wait) {
+                return Some(a);
+            }
+        }
+        *lock(&self.stun_wait) = None;
+        None
+    }
+
+    /// Open our NAT toward a peer about to connect (its replies to our
+    /// packets are let back in). The packets themselves are ignored.
+    fn punch(&self, to: &[SocketAddr]) {
+        for a in to {
+            let _ = self.socket.send_to(&[packet::PUNCH], a);
+        }
     }
 
     /// Pairing allowed right now (code set and not expired)?
@@ -1378,6 +1437,24 @@ impl Host {
         self.shared.socket.local_addr()
     }
 
+    /// Our public address as seen by a STUN server (this keeps the NAT
+    /// mapping of the listening socket alive, too).
+    pub fn stun(&self, server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
+        self.shared.stun(server, timeout)
+    }
+
+    /// Punch toward a viewer that is about to connect: a few small packets
+    /// over ~1 s, from the listening socket.
+    pub fn punch(&self, to: Vec<SocketAddr>) {
+        let shared = Arc::clone(&self.shared);
+        let _ = std::thread::Builder::new().name("sard-punch".into()).spawn(move || {
+            for wait_ms in [0, 50, 150, 300, 500] {
+                std::thread::sleep(Duration::from_millis(wait_ms));
+                shared.punch(&to);
+            }
+        });
+    }
+
     /// Stop accepting a paired client (its sessions are not closed here).
     pub fn untrust(&self, key: &[u8; 32]) {
         lock(&self.shared.trusted).remove(key);
@@ -1404,7 +1481,8 @@ impl Drop for Host {
 /// Client side: connect to (or pair with) a host.
 pub struct Client;
 
-fn resolve(addr: &str) -> io::Result<SocketAddr> {
+/// `host`, `host:port` or `[v6]:port` → socket address (default port if none).
+pub fn resolve(addr: &str) -> io::Result<SocketAddr> {
     let with_port = if addr.parse::<SocketAddr>().is_ok()
         || addr.rsplit_once(':').is_some_and(|(h, p)| !h.contains(':') && p.parse::<u16>().is_ok())
         || addr.starts_with('[')
@@ -1488,7 +1566,39 @@ impl Client {
         // A connected socket: cheaper per packet everywhere, and on macOS it
         // avoids a per-datagram policy check that otherwise throttles UDP.
         socket.connect(peer)?;
-        let shared = Shared::new(socket, identity.clone(), cfg.clone(), true)?;
+        Self::handshake(socket, true, vec![peer], None, host_key, identity, cfg, timeout)
+    }
+
+    /// Connect over a not-yet-connected `socket`, trying several addresses at
+    /// once (LAN, public addresses from the rendezvous service, ...); `more`
+    /// delivers candidates found later. The first address that answers wins
+    /// and the socket is connected to it. Use the socket the public address
+    /// was learned on (STUN), so the host's hole punching lines up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_candidates(
+        socket: UdpSocket,
+        candidates: Vec<SocketAddr>,
+        more: Option<Receiver<Vec<SocketAddr>>>,
+        host_key: [u8; 32],
+        identity: Keypair,
+        cfg: NetConfig,
+        timeout: Duration,
+    ) -> Result<Connection, NetError> {
+        Self::handshake(socket, false, candidates, more, host_key, identity, cfg, timeout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handshake(
+        socket: UdpSocket,
+        connected: bool,
+        mut candidates: Vec<SocketAddr>,
+        more: Option<Receiver<Vec<SocketAddr>>>,
+        host_key: [u8; 32],
+        identity: Keypair,
+        cfg: NetConfig,
+        timeout: Duration,
+    ) -> Result<Connection, NetError> {
+        let shared = Shared::new(socket, identity.clone(), cfg.clone(), connected)?;
         let local_index = shared.new_index();
         let mut ini = IkInitiator::new(&identity, host_key, IK_PROLOGUE);
         let hello = HelloPayload { version: PROTOCOL_VERSION, timestamp: clock::unix_ns(), name: cfg.name.clone() };
@@ -1502,27 +1612,50 @@ impl Client {
         let (tx, rx) = mpsc::channel();
         *lock(&shared.pending) = Some(PendingConnect { local_index, initiator: Some(ini), result: tx });
         shared.spawn();
+        let fail = |e: NetError| {
+            shared.stop.store(true, Ordering::Relaxed);
+            Err(e)
+        };
 
         let deadline = Instant::now() + timeout;
-        loop {
-            if let Err(e) = shared.socket.send(&pkt) {
-                shared.stop.store(true, Ordering::Relaxed);
-                return Err(e.into());
+        let send_to = |addrs: &[SocketAddr]| {
+            // Some candidates may be unreachable (other address family, no
+            // route): keep trying the rest.
+            for a in addrs {
+                let _ = shared.socket.send_to(&pkt, a);
             }
-            match rx.recv_timeout(Duration::from_millis(300)) {
-                Ok(Ok(conn)) => {
-                    info!("connected to {} at {peer}", conn.remote_name);
-                    let guard = Some(Arc::new(StopGuard(Arc::clone(&shared))));
-                    return Ok(Connection { conn, endpoint: shared, _guard: guard });
+        };
+        loop {
+            if connected {
+                if let Err(e) = shared.socket.send(&pkt) {
+                    return fail(e.into());
                 }
-                Ok(Err(e)) => {
-                    shared.stop.store(true, Ordering::Relaxed);
-                    return Err(e);
+            } else {
+                send_to(&candidates);
+            }
+            // Resend every 300 ms; try newly found candidates right away.
+            let resend = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < resend {
+                if let Some(more) = &more {
+                    while let Ok(found) = more.try_recv() {
+                        let new: Vec<SocketAddr> = found.into_iter().filter(|a| !candidates.contains(a)).collect();
+                        for a in &new {
+                            debug!("trying {a}");
+                        }
+                        send_to(&new);
+                        candidates.extend(new);
+                    }
                 }
-                Err(_) if Instant::now() < deadline => continue,
-                Err(_) => {
-                    shared.stop.store(true, Ordering::Relaxed);
-                    return Err(NetError::Timeout);
+                let step = if more.is_some() { Duration::from_millis(25) } else { Duration::from_millis(300) };
+                match rx.recv_timeout(step.min(resend.saturating_duration_since(Instant::now()))) {
+                    Ok(Ok(conn)) => {
+                        info!("connected to {} at {}", conn.remote_name, lock(&conn.io).peer);
+                        let guard = Some(Arc::new(StopGuard(Arc::clone(&shared))));
+                        return Ok(Connection { conn, endpoint: shared, _guard: guard });
+                    }
+                    Ok(Err(e)) => return fail(e),
+                    Err(_) if Instant::now() < deadline => {}
+                    Err(_) => return fail(NetError::Timeout),
                 }
             }
         }
