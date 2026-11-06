@@ -27,6 +27,26 @@ pub fn fill(buf: &mut [u8]) {
             assert_eq!(r, 0, "getentropy failed: {}", std::io::Error::last_os_error());
         }
     }
+    #[cfg(windows)]
+    {
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(alg: *mut std::ffi::c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+        }
+        for chunk in buf.chunks_mut(1 << 20) {
+            // SAFETY: chunk is a valid writable buffer of the given length.
+            let r = unsafe {
+                BCryptGenRandom(
+                    std::ptr::null_mut(),
+                    chunk.as_mut_ptr(),
+                    chunk.len() as u32,
+                    BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+                )
+            };
+            assert_eq!(r, 0, "BCryptGenRandom failed: NTSTATUS {r:#x}");
+        }
+    }
 }
 
 pub fn bytes<const N: usize>() -> [u8; N] {

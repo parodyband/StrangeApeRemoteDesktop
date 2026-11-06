@@ -108,6 +108,7 @@ pub enum Platform {
     Unknown = 0,
     Linux = 1,
     MacOs = 2,
+    Windows = 3,
 }
 
 impl Platform {
@@ -116,6 +117,8 @@ impl Platform {
             Platform::Linux
         } else if cfg!(target_os = "macos") {
             Platform::MacOs
+        } else if cfg!(target_os = "windows") {
+            Platform::Windows
         } else {
             Platform::Unknown
         }
@@ -124,6 +127,7 @@ impl Platform {
         match v {
             1 => Platform::Linux,
             2 => Platform::MacOs,
+            3 => Platform::Windows,
             _ => Platform::Unknown,
         }
     }

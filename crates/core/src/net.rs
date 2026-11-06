@@ -888,34 +888,116 @@ struct Shared {
     pending: Mutex<Option<PendingConnect>>,
 }
 
-fn configure_socket(sock: &UdpSocket, buf: usize) {
+#[cfg(unix)]
+mod sockopt {
+    use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
-    let fd = sock.as_raw_fd();
-    let set = |level: libc::c_int, opt: libc::c_int, v: libc::c_int| {
+
+    pub const SOL_SOCKET: i32 = libc::SOL_SOCKET;
+    pub const SO_RCVBUF: i32 = libc::SO_RCVBUF;
+    pub const SO_SNDBUF: i32 = libc::SO_SNDBUF;
+    pub const IPPROTO_IP: i32 = libc::IPPROTO_IP;
+    pub const IP_TOS: i32 = libc::IP_TOS;
+
+    pub fn set(sock: &UdpSocket, level: i32, opt: i32, v: i32) {
         // SAFETY: fd is a valid socket; value pointer/len are correct.
         unsafe {
             libc::setsockopt(
-                fd,
+                sock.as_raw_fd(),
                 level,
                 opt,
                 (&v as *const libc::c_int).cast(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
-        }
-    };
-    set(libc::SOL_SOCKET, libc::SO_RCVBUF, buf as libc::c_int);
-    set(libc::SOL_SOCKET, libc::SO_SNDBUF, buf as libc::c_int);
-    // DSCP EF-ish (0xB8): Wi-Fi WMM maps it to the video/voice access category.
-    set(libc::IPPROTO_IP, libc::IP_TOS, 0xB8);
-    let get = |opt: libc::c_int| -> i32 {
+        };
+    }
+
+    pub fn get(sock: &UdpSocket, level: i32, opt: i32) -> i32 {
         let mut v: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: as above.
-        unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, opt, (&mut v as *mut libc::c_int).cast(), &mut len) };
+        unsafe { libc::getsockopt(sock.as_raw_fd(), level, opt, (&mut v as *mut libc::c_int).cast(), &mut len) };
         v
-    };
-    let rcv = get(libc::SO_RCVBUF);
-    debug!("socket buffers: rcv={} snd={}", rcv, get(libc::SO_SNDBUF));
+    }
+}
+
+#[cfg(windows)]
+mod sockopt {
+    use std::ffi::c_void;
+    use std::net::UdpSocket;
+    use std::os::windows::io::AsRawSocket;
+
+    pub const SOL_SOCKET: i32 = 0xffff;
+    pub const SO_RCVBUF: i32 = 0x1002;
+    pub const SO_SNDBUF: i32 = 0x1001;
+    pub const IPPROTO_IP: i32 = 0;
+    pub const IP_TOS: i32 = 3;
+    /// `_WSAIOW(IOC_VENDOR, 12)`: report ICMP "port unreachable" as WSAECONNRESET on recv.
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn setsockopt(s: usize, level: i32, name: i32, val: *const u8, len: i32) -> i32;
+        fn getsockopt(s: usize, level: i32, name: i32, val: *mut u8, len: *mut i32) -> i32;
+        fn WSAIoctl(
+            s: usize,
+            code: u32,
+            inbuf: *const c_void,
+            inlen: u32,
+            outbuf: *mut c_void,
+            outlen: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+            completion: *mut c_void,
+        ) -> i32;
+    }
+
+    pub fn set(sock: &UdpSocket, level: i32, opt: i32, v: i32) {
+        // SAFETY: valid socket; value pointer/len are correct.
+        unsafe { setsockopt(sock.as_raw_socket() as usize, level, opt, (&v as *const i32).cast(), 4) };
+    }
+
+    pub fn get(sock: &UdpSocket, level: i32, opt: i32) -> i32 {
+        let (mut v, mut len) = (0i32, 4i32);
+        // SAFETY: as above.
+        unsafe { getsockopt(sock.as_raw_socket() as usize, level, opt, (&mut v as *mut i32).cast(), &mut len) };
+        v
+    }
+
+    /// Windows reports an ICMP port-unreachable for an earlier send as an
+    /// error on the *next* `recv_from` of an unconnected UDP socket; a peer
+    /// that went away would otherwise make every receive fail.
+    pub fn disable_connreset(sock: &UdpSocket) {
+        let off: u32 = 0;
+        let mut ret = 0u32;
+        // SAFETY: valid socket and in-buffer; no overlapped I/O.
+        unsafe {
+            WSAIoctl(
+                sock.as_raw_socket() as usize,
+                SIO_UDP_CONNRESET,
+                (&off as *const u32).cast(),
+                4,
+                std::ptr::null_mut(),
+                0,
+                &mut ret,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+    }
+}
+
+fn configure_socket(sock: &UdpSocket, buf: usize) {
+    use sockopt::*;
+    set(sock, SOL_SOCKET, SO_RCVBUF, buf as i32);
+    set(sock, SOL_SOCKET, SO_SNDBUF, buf as i32);
+    // DSCP EF-ish (0xB8): Wi-Fi WMM maps it to the video/voice access category.
+    // (Windows ignores IP_TOS unless a QoS policy allows it; harmless.)
+    set(sock, IPPROTO_IP, IP_TOS, 0xB8);
+    #[cfg(windows)]
+    disable_connreset(sock);
+    let rcv = get(sock, SOL_SOCKET, SO_RCVBUF);
+    debug!("socket buffers: rcv={} snd={}", rcv, get(sock, SOL_SOCKET, SO_SNDBUF));
     if (rcv as usize) < buf / 2 {
         warn!(
             "UDP receive buffer is only {} KiB; bursts may drop packets. Raise it with: \
@@ -1486,6 +1568,8 @@ impl Shared {
 }
 
 fn raise_thread_priority() {
+    #[cfg(windows)]
+    win_timing::raise_thread_priority();
     #[cfg(target_os = "macos")]
     // SAFETY: plain libc call on the current thread.
     unsafe {
@@ -1495,6 +1579,61 @@ fn raise_thread_priority() {
     // SAFETY: plain libc call; failure (no permission) is harmless.
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, -10);
+    }
+}
+
+/// Windows timing: the network thread's 1 ms receive timeout and tick need a
+/// 1 ms system timer (the default is 15.6 ms).
+#[cfg(windows)]
+mod win_timing {
+    use std::ffi::c_void;
+
+    const THREAD_PRIORITY_HIGHEST: i32 = 2;
+    const PROCESS_POWER_THROTTLING: i32 = 4;
+    const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION: u32 = 4;
+
+    #[repr(C)]
+    struct PowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+        fn SetProcessInformation(process: *mut c_void, class: i32, info: *const c_void, size: u32) -> i32;
+    }
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(ms: u32) -> u32;
+    }
+
+    pub fn raise_thread_priority() {
+        static TIMER: std::sync::Once = std::sync::Once::new();
+        TIMER.call_once(|| {
+            let st = PowerThrottlingState {
+                version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                control_mask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                state_mask: 0,
+            };
+            // SAFETY: plain process-wide settings; failure (older Windows) is harmless.
+            unsafe {
+                // Keep the 1 ms resolution even while this process has no visible window (Windows 11).
+                SetProcessInformation(
+                    GetCurrentProcess(),
+                    PROCESS_POWER_THROTTLING,
+                    (&st as *const PowerThrottlingState).cast(),
+                    std::mem::size_of::<PowerThrottlingState>() as u32,
+                );
+                timeBeginPeriod(1);
+            }
+        });
+        // SAFETY: pseudo-handle of the calling thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
     }
 }
 

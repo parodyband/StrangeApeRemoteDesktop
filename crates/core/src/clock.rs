@@ -3,7 +3,8 @@
 //! All latency timestamps on the wire are in microseconds of the *sender's*
 //! monotonic clock. Linux uses `CLOCK_MONOTONIC` (same clock PipeWire stamps
 //! buffers with); macOS uses `CLOCK_UPTIME_RAW` (== `mach_absolute_time`,
-//! the CoreMedia host clock). [`ClockSync`] estimates the offset between the
+//! the CoreMedia host clock); Windows uses `QueryPerformanceCounter` (the
+//! clock DXGI and WASAPI stamp frames with). [`ClockSync`] estimates the offset between the
 //! two machines from ping/pong exchanges so end-to-end latency can be shown.
 
 use std::collections::VecDeque;
@@ -20,12 +21,49 @@ pub fn now_us() -> u64 {
 }
 
 /// Monotonic time in nanoseconds.
+#[cfg(unix)]
 #[inline]
 pub fn now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: valid pointer to a timespec; CLOCK is a valid clock id.
     unsafe { libc::clock_gettime(CLOCK, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn QueryPerformanceCounter(count: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
+}
+
+/// `QueryPerformanceCounter` ticks per second (fixed at boot).
+#[cfg(windows)]
+pub fn qpc_frequency() -> u64 {
+    static FREQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FREQ.get_or_init(|| {
+        let mut f = 0i64;
+        // SAFETY: valid out pointer; cannot fail on Windows XP and later.
+        unsafe { QueryPerformanceFrequency(&mut f) };
+        f.max(1) as u64
+    })
+}
+
+/// Convert a `QueryPerformanceCounter` value (as found in DXGI / WASAPI
+/// timestamps) to this module's nanoseconds.
+#[cfg(windows)]
+pub fn qpc_to_ns(ticks: u64) -> u64 {
+    (ticks as u128 * 1_000_000_000 / qpc_frequency() as u128) as u64
+}
+
+/// Monotonic time in nanoseconds.
+#[cfg(windows)]
+#[inline]
+pub fn now_ns() -> u64 {
+    let mut c = 0i64;
+    // SAFETY: valid out pointer.
+    unsafe { QueryPerformanceCounter(&mut c) };
+    qpc_to_ns(c as u64)
 }
 
 /// Wall-clock nanoseconds since the Unix epoch (used only for handshake
