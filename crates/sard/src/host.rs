@@ -776,6 +776,20 @@ fn release_all(pressed: &mut PressedSet, input: &mut Box<dyn InputSink>) {
 }
 
 /// Non-loopback IPv4 addresses of this machine (for the pairing hint).
+#[cfg(windows)]
+fn local_ips() -> Vec<String> {
+    let mut out: Vec<String> = sard_windows::os::local_ipv4()
+        .into_iter()
+        .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
+        .map(|ip| ip.to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Non-loopback IPv4 addresses of this machine (for the pairing hint).
+#[cfg(unix)]
 fn local_ips() -> Vec<String> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();

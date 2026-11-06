@@ -132,9 +132,16 @@ impl Session {
     ) -> Result<Session> {
         let events = conn.take_events().ok_or("events already taken")?;
         let frames = conn.take_video().ok_or("video already taken")?;
-        let attrs = Window::default_attributes()
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title(format!("Sard — connecting to {label}…"))
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
+        // Windows shows a generic icon on the title bar and taskbar otherwise.
+        #[cfg(windows)]
+        {
+            let rgba = include_bytes!("../assets/tray/color.rgba").to_vec();
+            attrs = attrs.with_window_icon(winit::window::Icon::from_rgba(rgba, 64, 64).ok());
+        }
         let window = Arc::new(el.create_window(attrs)?);
         if opts.fullscreen {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -347,9 +354,10 @@ impl Session {
                     s.host_name,
                     s.host_platform
                 );
+                // Cmd on a Mac is Ctrl on Linux and Windows: swap only across that divide.
                 self.swap_mods = self.opts.swap_mods
                     && s.host_platform != Platform::Unknown
-                    && s.host_platform != Platform::current();
+                    && (s.host_platform == Platform::MacOs) != (Platform::current() == Platform::MacOs);
                 let resized = self.stream.as_ref().is_none_or(|o| (o.width, o.height) != (s.width, s.height));
                 if resized && self.window.fullscreen().is_none() {
                     fit_window(&self.window, s.width as u32, s.height as u32);

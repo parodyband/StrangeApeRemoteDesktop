@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 const USAGE: &str = "\
-sard — low-latency GPU remote desktop (Linux ⇄ macOS)
+sard — low-latency GPU remote desktop (Linux, macOS, Windows)
 
 USAGE:
   sard app                       Menu bar / system tray app (default when launched from the desktop)
@@ -129,24 +129,47 @@ fn has_desktop() -> bool {
     if std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
         return true;
     }
-    // SAFETY: isatty on a standard descriptor.
-    let tty = unsafe { libc::isatty(0) == 1 || libc::isatty(1) == 1 };
-    let display = cfg!(target_os = "macos")
-        || std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("DISPLAY").is_some();
-    display && !tty
+    // Windows: double-clicked / Start menu / Run key, i.e. not typed into a terminal.
+    #[cfg(windows)]
+    let desktop = sard_windows::os::console_is_ours();
+    #[cfg(unix)]
+    let desktop = {
+        // SAFETY: isatty on a standard descriptor.
+        let tty = unsafe { libc::isatty(0) == 1 || libc::isatty(1) == 1 };
+        let display = cfg!(target_os = "macos")
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("DISPLAY").is_some();
+        display && !tty
+    };
+    desktop
 }
 
 /// Take an exclusive lock on `<config dir>/<name>` (released when the file is
 /// dropped or the process exits). `None` if another process holds it.
 pub fn lock_file(name: &str) -> Result<Option<std::fs::File>> {
-    use std::os::fd::AsRawFd;
     let dir = config::config_dir();
     std::fs::create_dir_all(&dir)?;
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(name))?;
-    // SAFETY: flock on a file descriptor we own.
-    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    Ok((r == 0).then_some(f))
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).truncate(false).write(true);
+    #[cfg(windows)]
+    {
+        // No sharing: while we hold the handle, every other open fails with a sharing violation.
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut o, 0);
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        match o.open(dir.join(name)) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let f = o.open(dir.join(name))?;
+        // SAFETY: flock on a file descriptor we own.
+        let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        Ok((r == 0).then_some(f))
+    }
 }
 
 /// The winit event loop shared by `connect` and the tray app.
@@ -262,20 +285,48 @@ fn info() -> Result<()> {
 }
 
 /// Hidden diagnostic: open the real screen capture and encode for a while.
+/// `--codec`, `--display <n>`, `--fps`; `--decode` also decodes every frame
+/// with this machine's viewer decoder (`--snapshot <file.png>` saves one);
+/// `--input-test` moves the pointer and checks the cursor follows.
 fn selftest_capture(args: &Args) -> Result<()> {
     use sard_core::media::{CursorMode, SourceOptions};
     use std::time::Instant;
     let secs: u64 = args.positional(0).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let codec = match args.value("codec") {
+        Some(c) => sard_core::proto::Codec::parse(c).ok_or_else(|| format!("unknown codec {c}"))?,
+        None => sard_core::proto::Codec::Hevc,
+    };
     let opts = SourceOptions {
+        codec,
         fps: args.parse_value("fps")?.unwrap_or(60),
         bitrate_kbps: 30_000,
         cursor: CursorMode::Metadata,
+        display: args.parse_value("display")?.unwrap_or(0),
         test_pattern: args.flag("test-pattern"),
         ..Default::default()
     };
+    println!("sard {} on {}", env!("CARGO_PKG_VERSION"), platform::describe());
+    for line in platform::capabilities() {
+        println!("  {line}");
+    }
     let t0 = Instant::now();
     let (mut src, mut input) = platform::open_host(&opts)?;
     println!("opened in {:.1}s: {}", t0.elapsed().as_secs_f64(), src.describe());
+    for d in src.displays() {
+        let cur = if src.current_display() == Some(d.id) { " (capturing)" } else { "" };
+        println!("  display {}: {} {}x{} at {},{}{cur}", d.id, d.name, d.width, d.height, d.x, d.y);
+    }
+    let mut sink = if args.flag("decode") || args.value("snapshot").is_some() {
+        let mut s = platform::create_headless_sink()?;
+        if let Some(p) = args.value("snapshot") {
+            s.snapshot_next(std::path::Path::new(p))?;
+        }
+        Some(s)
+    } else {
+        None
+    };
+    let mut dec = sard_core::stats::Samples::default();
+    let mut decoded = 0u64;
     if args.flag("input-test") {
         input_roundtrip(src.as_mut(), input.as_mut())?;
     }
@@ -288,6 +339,11 @@ fn selftest_capture(args: &Args) -> Result<()> {
             bytes += f.data.len();
             keys += f.keyframe as u32;
             lat.add((sard_core::clock::now_us() - f.capture_us) as u32);
+            if let Some(s) = sink.as_mut() {
+                let st = s.present(opts.codec, &f.data, f.keyframe)?;
+                dec.add(st.decode_us);
+                decoded += 1;
+            }
         }
         if src.take_cursor().is_some() {
             cursors += 1;
@@ -303,6 +359,15 @@ fn selftest_capture(args: &Args) -> Result<()> {
         l.p95 as f64 / 1000.0,
         l.max as f64 / 1000.0
     );
+    if let Some(s) = &sink {
+        let d = dec.take();
+        println!(
+            "decoded {decoded} frames with {}: p50 {:.2} ms p95 {:.2} ms",
+            s.describe(),
+            d.p50 as f64 / 1000.0,
+            d.p95 as f64 / 1000.0
+        );
+    }
     Ok(())
 }
 

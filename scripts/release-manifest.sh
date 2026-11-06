@@ -3,8 +3,8 @@
 #
 #   scripts/release-manifest.sh <dir> <version> <download-base-url> [<notes-url>]
 #
-# Lists sard-<version>-linux-x86_64.tar.gz and sard-<version>-macos-arm64.zip
-# (whichever exist) with their SHA-256 and size. Sign it afterwards with
+# Lists sard-<version>-linux-x86_64.tar.gz, sard-<version>-macos-arm64.zip and
+# sard-<version>-windows-x86_64.zip (whichever exist) with their SHA-256 and size. Sign it afterwards with
 #   sard release-sign <key-file | -> <dir>/latest.txt      (writes latest.txt.sig)
 # Format: see crates/sard/src/update.rs.
 set -eu
@@ -20,10 +20,10 @@ sha256() {
     echo "sard-update 1"
     echo "version $version"
     [ -z "$notes" ] || echo "notes $notes"
-    for platform in linux-x86_64 macos-arm64; do
+    for platform in linux-x86_64 macos-arm64 windows-x86_64; do
         case $platform in
             linux-*) file=sard-$version-$platform.tar.gz ;;
-            macos-*) file=sard-$version-$platform.zip ;;
+            macos-* | windows-*) file=sard-$version-$platform.zip ;;
         esac
         [ -f "$dir/$file" ] || continue
         echo "asset $platform $(sha256 "$dir/$file") $(wc -c < "$dir/$file" | tr -d ' ') $base/$file"

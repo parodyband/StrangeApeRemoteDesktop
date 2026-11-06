@@ -27,10 +27,12 @@
 //! fn choose(title, message, buttons: &[&str]) -> Option<usize>;  // 2–3 buttons; [0] default, [1] = Escape
 //! fn set_launch_at_login(enabled: bool) -> Result<()>;
 //! fn launch_at_login() -> bool;
-//! fn set_dock_visible(visible: bool);  // macOS: Dock icon while a viewer window is open (no-op on Linux)
+//! fn set_dock_visible(visible: bool);  // macOS: Dock icon while a viewer window is open (no-op elsewhere)
 //! ```
 
 #[cfg(target_os = "linux")]
 pub use sard_linux::platform::*;
 #[cfg(target_os = "macos")]
 pub use sard_macos::platform::*;
+#[cfg(target_os = "windows")]
+pub use sard_windows::platform::*;

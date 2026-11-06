@@ -6,31 +6,61 @@
 //! stream, on which this module speaks just enough HTTP/1.1 and WebSocket
 //! (RFC 6455) for short requests and one long-lived signalling socket. No TLS
 //! crates, no async runtime.
+//!
+//! Windows ships no libcurl library, so there the same API is implemented on
+//! WinHTTP (system TLS, proxy settings and its own WebSocket client) in
+//! `web/winhttp.rs`.
 
+#[cfg(windows)]
+mod winhttp;
+#[cfg(windows)]
+pub use winhttp::{WebSocket, request};
+
+#[cfg(not(windows))]
 use std::ffi::{CString, c_char, c_int, c_long, c_void};
 use std::io;
+#[cfg(not(windows))]
 use std::sync::OnceLock;
+#[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 type EasyInit = unsafe extern "C" fn() -> *mut c_void;
+#[cfg(not(windows))]
 type EasySetopt = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
+#[cfg(not(windows))]
 type EasyPerform = unsafe extern "C" fn(*mut c_void) -> c_int;
+#[cfg(not(windows))]
 type EasyIo = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut usize) -> c_int;
+#[cfg(not(windows))]
 type EasyGetinfo = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
+#[cfg(not(windows))]
 type EasyCleanup = unsafe extern "C" fn(*mut c_void);
+#[cfg(not(windows))]
 type EasyStrerror = unsafe extern "C" fn(c_int) -> *const c_char;
+#[cfg(not(windows))]
 type GlobalInit = unsafe extern "C" fn(c_long) -> c_int;
 
+#[cfg(not(windows))]
 const CURLOPT_URL: c_int = 10002;
+#[cfg(not(windows))]
 const CURLOPT_NOSIGNAL: c_int = 99;
+#[cfg(not(windows))]
 const CURLOPT_HTTP_VERSION: c_int = 84;
+#[cfg(not(windows))]
 const CURLOPT_CONNECT_ONLY: c_int = 141;
+#[cfg(not(windows))]
 const CURLOPT_CONNECTTIMEOUT_MS: c_int = 156;
+#[cfg(not(windows))]
 const CURL_HTTP_VERSION_1_1: c_long = 2;
+#[cfg(not(windows))]
 const CURLINFO_ACTIVESOCKET: c_int = 0x50_0000 + 44;
+#[cfg(not(windows))]
 const CURLE_AGAIN: c_int = 81;
+#[cfg(not(windows))]
 const CURL_GLOBAL_DEFAULT: c_long = 3;
 
+#[cfg(not(windows))]
 struct Curl {
     init: EasyInit,
     setopt: EasySetopt,
@@ -42,11 +72,13 @@ struct Curl {
     strerror: EasyStrerror,
 }
 
+#[cfg(not(windows))]
 fn curl() -> io::Result<&'static Curl> {
     static LIB: OnceLock<Result<Curl, String>> = OnceLock::new();
     LIB.get_or_init(load).as_ref().map_err(|e| io::Error::other(e.clone()))
 }
 
+#[cfg(not(windows))]
 fn load() -> Result<Curl, String> {
     let names: &[&str] = if cfg!(target_os = "macos") {
         &["/usr/lib/libcurl.4.dylib"]
@@ -88,6 +120,7 @@ fn load() -> Result<Curl, String> {
     }
 }
 
+#[cfg(not(windows))]
 fn curl_err(c: &Curl, code: c_int, what: &str) -> io::Error {
     // SAFETY: curl_easy_strerror returns a static string.
     let msg = unsafe { std::ffi::CStr::from_ptr((c.strerror)(code)) }.to_string_lossy().into_owned();
@@ -138,6 +171,7 @@ impl Url {
         Ok(Url { tls, host, port, path: path.to_string() })
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn host_header(&self) -> String {
         if self.port == if self.tls { 443 } else { 80 } {
             self.host.clone()
@@ -151,6 +185,7 @@ impl Url {
     }
 }
 
+#[cfg(not(windows))]
 /// A TCP (+TLS) byte stream opened by libcurl.
 pub struct Stream {
     lib: &'static Curl,
@@ -158,10 +193,12 @@ pub struct Stream {
     fd: c_int,
 }
 
+#[cfg(not(windows))]
 // SAFETY: a curl easy handle may be used from any thread, one at a time;
 // `Stream` is not `Sync`, so &mut access is exclusive.
 unsafe impl Send for Stream {}
 
+#[cfg(not(windows))]
 impl Stream {
     pub fn connect(url: &Url, timeout: Duration) -> io::Result<Stream> {
         let lib = curl()?;
@@ -253,6 +290,7 @@ impl Stream {
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for Stream {
     fn drop(&mut self) {
         // SAFETY: the handle came from curl_easy_init and is not used again.
@@ -260,6 +298,7 @@ impl Drop for Stream {
     }
 }
 
+#[cfg(not(windows))]
 fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -277,6 +316,7 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+#[cfg(not(windows))]
 fn request_head(method: &str, url: &Url, headers: &[(&str, &str)], extra: &str) -> String {
     let mut h = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: sard/{}\r\n",
@@ -292,6 +332,7 @@ fn request_head(method: &str, url: &Url, headers: &[(&str, &str)], extra: &str) 
     h
 }
 
+#[cfg(not(windows))]
 /// Read until the end of the HTTP response head; returns (status, head, leftover body bytes).
 fn read_head(s: &mut Stream, until: Instant) -> io::Result<(u16, String, Vec<u8>)> {
     let mut buf = Vec::new();
@@ -318,6 +359,7 @@ fn read_head(s: &mut Stream, until: Instant) -> io::Result<(u16, String, Vec<u8>
     }
 }
 
+#[cfg(not(windows))]
 fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.lines().skip(1).find_map(|l| {
         let (k, v) = l.split_once(':')?;
@@ -325,6 +367,7 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+#[cfg(not(windows))]
 /// One HTTP request (`Connection: close`). Returns status and body.
 pub fn request(
     method: &str,
@@ -363,6 +406,7 @@ pub fn request(
     Ok((status, data))
 }
 
+#[cfg(not(windows))]
 fn dechunk(mut d: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -377,12 +421,14 @@ fn dechunk(mut d: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(not(windows))]
 /// A client WebSocket carrying text messages.
 pub struct WebSocket {
     s: Stream,
     buf: Vec<u8>,
 }
 
+#[cfg(not(windows))]
 impl WebSocket {
     pub fn connect(url: &Url, headers: &[(&str, &str)], timeout: Duration) -> io::Result<WebSocket> {
         let until = Instant::now() + timeout;
@@ -461,6 +507,7 @@ impl WebSocket {
     }
 }
 
+#[cfg(not(windows))]
 /// (opcode, payload, bytes used) of one complete unmasked server frame.
 fn parse_frame(b: &[u8]) -> io::Result<Option<(u8, Vec<u8>, usize)>> {
     if b.len() < 2 {
@@ -510,6 +557,7 @@ mod tests {
         assert!(Url::parse("https://user@x/").is_err());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn base64_rfc4648() {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foobar", "Zm9vYmFy")] {
@@ -524,6 +572,7 @@ mod tests {
         assert_eq!(Url::parse("https://[::1]/").unwrap().port, 443);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn frames() {
         assert_eq!(parse_frame(&[0x81, 0x02, b'h', b'i']).unwrap(), Some((1, b"hi".to_vec(), 4)));
@@ -534,10 +583,11 @@ mod tests {
         assert_eq!(dechunk(b"3\r\nabc\r\n1\r\nd\r\n0\r\n\r\n").unwrap(), b"abcd");
     }
 
-    /// `cargo test -p sard-core web -- --ignored`: real TLS through libcurl.
+    /// `cargo test -p sard-core web -- --ignored`: real TLS through libcurl / WinHTTP.
     #[test]
     #[ignore]
     fn live_https() {
+        use std::time::Duration;
         let u = Url::parse("https://www.cloudflare.com/cdn-cgi/trace").unwrap();
         let (status, body) = request("GET", &u, &[], &[], Duration::from_secs(10)).unwrap();
         let text = String::from_utf8_lossy(&body);

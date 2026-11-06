@@ -11,6 +11,7 @@
 //! notes https://github.com/parodyband/StrangeApeRemoteDesktop/releases/tag/v0.2.0
 //! asset linux-x86_64 <sha256 hex> <size in bytes> https://…/sard-0.2.0-linux-x86_64.tar.gz
 //! asset macos-arm64 <sha256 hex> <size in bytes> https://…/sard-0.2.0-macos-arm64.zip
+//! asset windows-x86_64 <sha256 hex> <size in bytes> https://…/sard-0.2.0-windows-x86_64.zip
 //! ```
 //!
 //! and `latest.txt.sig`: one or more lines, each a hex ed25519 signature over the exact bytes of `latest.txt`.
@@ -20,7 +21,8 @@
 //!
 //! Nothing is trusted before the signature checks out: the download URL, its size and SHA-256 all come from
 //! the signed manifest, and the download is verified before it is unpacked. Transport is `curl` (HTTPS only,
-//! also for redirects), so sard links no TLS stack.
+//! also for redirects), so sard links no TLS stack. Windows 10 (1803+) and 11 ship `curl.exe` and `tar.exe`
+//! (bsdtar, which unpacks the zip) in System32.
 //!
 //! Only official release builds (compiled with `SARD_RELEASE_BUILD=1`, as CI does) replace themselves; a
 //! development build checks but refuses to install, so a `cargo build` or a dev `Sard.app` holding macOS
@@ -35,6 +37,7 @@ use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -57,11 +60,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_BUILD: bool = option_env!("SARD_RELEASE_BUILD").is_some();
 #[cfg(target_os = "macos")]
 const BUNDLE_ID: &str = "com.strangeape.sard";
+/// Set for the process [`restart`] starts on Windows, which may have to wait for the old one to let go of the
+/// app lock (there is no `exec` there).
+pub const RESTARTED_ENV: &str = "SARD_RESTARTED";
 
 /// A downloadable build for one platform, as listed in the signed manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
-    /// `linux-x86_64` or `macos-arm64`.
+    /// `linux-x86_64`, `macos-arm64` or `windows-x86_64`.
     pub platform: String,
     pub sha256: [u8; 32],
     pub size: u64,
@@ -92,6 +98,8 @@ pub fn platform() -> Option<&'static str> {
         Some("linux-x86_64")
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("macos-arm64")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("windows-x86_64")
     } else {
         None
     }
@@ -103,8 +111,9 @@ pub fn check() -> Result<Option<UpdateInfo>> {
     select(&fetch_manifest()?, VERSION, platform)
 }
 
-/// Download, verify and install `info`, replacing this installation: the running executable on Linux, the
-/// enclosing `.app` bundle on macOS. The swap is atomic (rename); on any error the old version stays.
+/// Download, verify and install `info`, replacing this installation: the running executable on Linux and
+/// Windows, the enclosing `.app` bundle on macOS. The swap is a rename (on Windows the running executable is
+/// renamed aside first); on any error the old version stays.
 /// Running processes keep the old code until [`restart`].
 pub fn install(info: &UpdateInfo) -> Result<()> {
     let target = install_target()?;
@@ -119,7 +128,11 @@ pub fn install(info: &UpdateInfo) -> Result<()> {
     {
         install_bundle(info, &target)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        install_windows(info, &target)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         install_binary(info, &target)
     }
@@ -157,10 +170,31 @@ pub fn install_target() -> Result<PathBuf> {
 }
 
 /// Replace this process with the (newly installed) version, keeping the command line. macOS relaunches the
-/// bundle through LaunchServices (`open -n`) so permissions stay attributed to Sard.app.
+/// bundle through LaunchServices (`open -n`) so permissions stay attributed to Sard.app; Windows starts the
+/// new executable and exits.
 pub fn restart() -> ! {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let target = install_target().or_else(|_| current_exe());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        match target {
+            Ok(exe) => {
+                let mut cmd = Command::new(&exe);
+                cmd.args(&args).env(RESTARTED_ENV, "1").stdin(Stdio::null());
+                if !sard_windows::os::has_console() {
+                    // The tray app has no console: don't let the new one open a console window.
+                    cmd.creation_flags(sard_windows::os::DETACHED_PROCESS);
+                }
+                match cmd.spawn() {
+                    Ok(_) => std::process::exit(0),
+                    Err(e) => eprintln!("restart: cannot start {}: {e}", exe.display()),
+                }
+            }
+            Err(e) => eprintln!("restart: {e}"),
+        }
+        std::process::exit(1)
+    }
     #[cfg(target_os = "macos")]
     if let Ok(bundle) = &target
         && bundle.extension().is_some_and(|e| e == "app")
@@ -177,15 +211,53 @@ pub fn restart() -> ! {
         }
         std::process::exit(1);
     }
-    use std::os::unix::process::CommandExt;
-    match target {
-        Ok(exe) => {
-            let err = Command::new(&exe).args(&args).exec();
-            eprintln!("restart: cannot exec {}: {err}", exe.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        match target {
+            Ok(exe) => {
+                let err = Command::new(&exe).args(&args).exec();
+                eprintln!("restart: cannot exec {}: {err}", exe.display());
+            }
+            Err(e) => eprintln!("restart: {e}"),
         }
-        Err(e) => eprintln!("restart: {e}"),
+        std::process::exit(1)
     }
-    std::process::exit(1)
+}
+
+/// Windows: remove the previous executable that [`install`] renamed aside (it could not be deleted while it
+/// was running). Best effort; call at startup.
+pub fn remove_replaced() {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        for old in [exe.with_extension("exe.old"), exe.with_file_name("sardw.exe.old")] {
+            if old.exists() {
+                match fs::remove_file(&old) {
+                    Ok(()) => sard_core::debug!("removed {}", old.display()),
+                    Err(e) => sard_core::debug!("cannot remove {} yet: {e}", old.display()),
+                }
+            }
+        }
+    }
+}
+
+/// A command that doesn't flash a console window when run from the (console-less) tray app on Windows.
+fn quiet(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(sard_windows::os::CREATE_NO_WINDOW);
+    }
+    c
+}
+
+/// A tool from System32 on Windows (never one from the current directory or PATH).
+#[cfg(windows)]
+fn system32(exe: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    root.join("System32").join(exe)
 }
 
 /// `sard update [--check]` and the hidden `sard release-sign` (CI).
@@ -419,7 +491,11 @@ fn curl(url: &str, max_bytes: u64, out: Option<&Path>, timeout_secs: u32) -> Res
         return Err(format!("refusing to download {url}").into());
     }
     let proto = if base_url().starts_with("http://") { "=http,https" } else { "=https" };
-    let mut cmd = Command::new(if cfg!(target_os = "macos") { "/usr/bin/curl" } else { "curl" });
+    #[cfg(windows)]
+    let program = system32("curl.exe");
+    #[cfg(not(windows))]
+    let program = if cfg!(target_os = "macos") { "/usr/bin/curl" } else { "curl" };
+    let mut cmd = quiet(program);
     cmd.args(["--fail", "--silent", "--show-error", "--location", "--max-redirs", "8", "--retry", "2"])
         .args(["--proto", proto, "--proto-redir", proto, "--connect-timeout", "20"])
         .arg("--max-time")
@@ -460,10 +536,11 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new_in(parent: &Path, prefix: &str) -> Result<Self> {
         let path = parent.join(format!("{prefix}-{}", hex(&sard_core::rand::bytes::<6>())));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut b = fs::DirBuilder::new();
+        #[cfg(unix)]
+        b.mode(0o700);
+        b.create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
         Ok(Self(path))
     }
 }
@@ -475,13 +552,20 @@ impl Drop for TempDir {
 }
 
 fn current_exe() -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate the sard executable: {e}"))?;
-    // Linux reports "<path> (deleted)" once the file has been replaced.
-    if let Some(p) = exe.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
-        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(p)));
-    }
-    Ok(fs::canonicalize(&exe).unwrap_or(exe))
+    // Windows: no canonicalize (it returns `\\?\` paths); the path is already absolute.
+    #[cfg(windows)]
+    let exe = Ok(exe);
+    #[cfg(unix)]
+    let exe = {
+        use std::os::unix::ffi::OsStrExt;
+        // Linux reports "<path> (deleted)" once the file has been replaced.
+        match exe.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+            Some(p) => Ok(PathBuf::from(std::ffi::OsStr::from_bytes(p))),
+            None => Ok(fs::canonicalize(&exe).unwrap_or(exe)),
+        }
+    };
+    exe
 }
 
 /// `…/Name.app` for an executable at `…/Name.app/Contents/MacOS/<exe>`.
@@ -491,6 +575,15 @@ fn enclosing_bundle(exe: &Path) -> Option<PathBuf> {
     contents.parent().filter(|p| p.extension().is_some_and(|e| e == "app")).map(Path::to_path_buf)
 }
 
+#[cfg(windows)]
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".sard-write-test-{}", hex(&sard_core::rand::bytes::<4>())));
+    let ok = fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
+}
+
+#[cfg(unix)]
 fn writable(dir: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
@@ -523,7 +616,7 @@ fn check_runs(bin: &Path, version: &str) -> Result<()> {
     if !meta.is_file() {
         return Err(format!("{} is not a regular file", bin.display()).into());
     }
-    let mut child = Command::new(bin)
+    let mut child = quiet(bin)
         .arg("version")
         .env("SARD_LOG", "error")
         .stdin(Stdio::null())
@@ -548,7 +641,51 @@ fn check_runs(bin: &Path, version: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: unpack `sard-<version>-windows-x86_64/sard.exe` (and the `sardw.exe` launcher) from the zip and
+/// put it in place of the running executable, which Windows lets us rename (not overwrite or delete) while it
+/// runs. The old one is left as `sard.exe.old` and removed at the next start ([`remove_replaced`]).
+#[cfg(windows)]
+fn install_windows(info: &UpdateInfo, exe: &Path) -> Result<()> {
+    let dir = exe.parent().ok_or("executable has no parent directory")?;
+    let tmp = TempDir::new_in(&std::env::temp_dir(), "sard-update")?;
+    let zip = tmp.0.join("update.zip");
+    download_verified(&info.asset, &zip)?;
+    let x = tmp.0.join("x");
+    fs::create_dir(&x)?;
+    run(quiet(system32("tar.exe")).arg("-xf").arg(&zip).arg("-C").arg(&x))?;
+    let new = single_entry(&x)?.join("sard.exe");
+    check_runs(&new, &info.version)?;
+
+    // Stage next to the target so the final rename stays on one volume.
+    let staged = dir.join(format!(".sard-update-{}.exe", hex(&sard_core::rand::bytes::<6>())));
+    fs::copy(&new, &staged).map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
+    let old = exe.with_extension("exe.old");
+    let _ = fs::remove_file(&old);
+    if let Err(e) = fs::rename(exe, &old) {
+        let _ = fs::remove_file(&staged);
+        return Err(format!("cannot move {} aside: {e}", exe.display()).into());
+    }
+    if let Err(e) = fs::rename(&staged, exe) {
+        let _ = fs::rename(&old, exe);
+        let _ = fs::remove_file(&staged);
+        return Err(format!("cannot replace {}: {e}", exe.display()).into());
+    }
+    // The windowless launcher (Start menu / login item), best effort: it only runs for a moment.
+    let launcher = new.with_file_name("sardw.exe");
+    if launcher.is_file() {
+        let target = exe.with_file_name("sardw.exe");
+        let aside = target.with_extension("exe.old");
+        let _ = fs::remove_file(&aside);
+        let _ = fs::rename(&target, &aside);
+        if let Err(e) = fs::copy(&launcher, &target) {
+            sard_core::warn!("cannot update {}: {e}", target.display());
+            let _ = fs::rename(&aside, &target);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn install_binary(info: &UpdateInfo, exe: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = exe.parent().ok_or("executable has no parent directory")?;
@@ -694,7 +831,11 @@ fn keygen(path: &Path) -> Result<()> {
     let seed: [u8; 32] = sard_core::rand::bytes();
     let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let mut b = fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        b.mode(0o700);
+        b.create(dir)?;
     }
     let contents = format!(
         "# sard update signing key (ed25519 seed). SECRET: it can push updates to every sard install.\n\
@@ -703,12 +844,11 @@ fn keygen(path: &Path) -> Result<()> {
         fingerprint(&public),
         hex(&seed)
     );
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut o = fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    o.mode(0o600);
+    let mut f = o.open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     io::Write::write_all(&mut f, contents.as_bytes())?;
     f.sync_all()?;
     println!("wrote private key to {}", path.display());

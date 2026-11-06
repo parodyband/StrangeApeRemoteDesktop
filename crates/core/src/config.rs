@@ -1,12 +1,14 @@
 //! Persistent identity and trust state.
 //!
 //! Files (all plain text, in the config directory):
-//! * `identity.key`  – this machine's X25519 secret key (hex), mode 0600.
+//! * `identity.key`  – this machine's X25519 secret key (hex), mode 0600
+//!   (Windows: the per-user ACL of `%APPDATA%`).
 //! * `trusted.txt`   – (host role) clients allowed to connect: `<pubkey hex> <name>`.
 //! * `known_hosts.txt` – (client role) paired hosts: `<pubkey hex> <addr> <name>`.
 //!
 //! Config directory: `$SARD_CONFIG_DIR`, else `$XDG_CONFIG_HOME/sard` /
-//! `~/.config/sard` on Linux and `~/Library/Application Support/sard` on macOS.
+//! `~/.config/sard` on Linux, `~/Library/Application Support/sard` on macOS
+//! and `%APPDATA%\sard` on Windows.
 
 use crate::crypto::Keypair;
 use crate::wire::{hex, unhex};
@@ -16,6 +18,13 @@ use std::path::{Path, PathBuf};
 pub fn config_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("SARD_CONFIG_DIR") {
         return PathBuf::from(d);
+    }
+    if cfg!(windows) {
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        let base = appdata
+            .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("AppData").join("Roaming")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        return base.join("sard");
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     if cfg!(target_os = "macos") {
@@ -27,6 +36,23 @@ pub fn config_dir() -> PathBuf {
     }
 }
 
+#[cfg(windows)]
+pub fn hostname() -> String {
+    const COMPUTER_NAME_DNS_HOSTNAME: i32 = 1;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetComputerNameExW(kind: i32, buf: *mut u16, len: *mut u32) -> i32;
+    }
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: buffer and length describe valid memory.
+    if unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, buf.as_mut_ptr(), &mut len) } == 0 || len == 0 {
+        return std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
+    }
+    String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())])
+}
+
+#[cfg(unix)]
 pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: buffer is valid for buf.len() bytes.
@@ -50,8 +76,12 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     }
     let tmp = path.with_extension("tmp");
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        // Windows: files inherit the per-user ACL of %APPDATA% (owner, SYSTEM, Administrators).
+        let mut f = o.open(&tmp)?;
         f.write_all(contents.as_bytes())?;
         f.sync_all()?;
     }
