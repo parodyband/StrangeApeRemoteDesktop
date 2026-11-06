@@ -278,11 +278,21 @@ impl MfEncoder {
                         s.GetSampleTime(&mut t);
                     }
                     let keyframe = clean != 0;
-                    if keyframe
-                        && !has_parameter_sets(self.codec, &data)
-                        && let Some(h) = &self.sequence_header
-                    {
-                        data.splice(0..0, h.iter().copied());
+                    if keyframe && !has_parameter_sets(self.codec, &data) {
+                        // Some encoders publish their configuration only once streaming.
+                        if self.sequence_header.is_none() {
+                            self.sequence_header = self
+                                .mft
+                                .current_output()
+                                .ok()
+                                .and_then(|t| mf::blob(&t, &mf::MF_MT_MPEG_SEQUENCE_HEADER));
+                        }
+                        match &self.sequence_header {
+                            Some(h) => {
+                                data.splice(0..0, h.iter().copied());
+                            }
+                            None => warn!("keyframe without codec configuration; the viewer may not decode it"),
+                        }
                     }
                     out.push(Packet { data, keyframe, timestamp_us: (t.max(0) / 10) as u64 });
                     wait = Duration::ZERO;
