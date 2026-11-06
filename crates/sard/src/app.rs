@@ -192,6 +192,7 @@ enum Action {
     InstallUpdate,
     OpenPermission(&'static str),
     SetUpAnywhere,
+    AnywhereOff,
     AirDropSettings,
     ForgetHost([u8; 32], String),
     RemoveDevice([u8; 32], String),
@@ -501,9 +502,14 @@ impl App {
         }
         m.push(MenuEntry::Submenu { label: "Allowed Devices".into(), enabled: true, items: allowed });
         m.push(MenuEntry::Separator);
-        let configured = sard_core::anywhere::Service::load(&config::config_dir()).is_some();
-        let anywhere = self.check("Connect Anywhere…", configured, Action::SetUpAnywhere);
-        m.push(anywhere);
+        if sard_core::anywhere::Service::load(&config::config_dir()).is_some() {
+            let change = self.item("Change Invite Code…", Action::SetUpAnywhere);
+            let off = self.item("Turn Off on This Computer…", Action::AnywhereOff);
+            m.push(MenuEntry::Submenu { label: "Connect Anywhere".into(), enabled: true, items: vec![change, off] });
+        } else {
+            let e = self.item("Connect Anywhere (Invite Only)…", Action::SetUpAnywhere);
+            m.push(e);
+        }
         let login = self.check("Start at Login", platform::launch_at_login(), Action::ToggleLogin);
         m.push(login);
         let upd = match (&self.update, self.update_busy) {
@@ -683,16 +689,34 @@ impl App {
                 std::thread::spawn(move || {
                     let Some(token) = platform::prompt_text(
                         "Connect Anywhere",
-                        "Account token (connect to this computer's paired devices from any network).\n\
-                         Leave empty to turn Connect Anywhere off:",
+                        "Reach your computers from any network, not just this one.\n\n\
+                         Connect Anywhere is invite-only for now; paid plans are coming soon.\n\
+                         Paste your invite code (the same one on each of your computers):",
                     ) else {
                         return;
                     };
+                    if token.trim().is_empty() {
+                        return;
+                    }
                     match sard_core::anywhere::Service::save_token(&config::config_dir(), &token) {
                         Ok(()) => {
                             let _ = proxy.send_event(AppEvent::AnywhereChanged);
                         }
                         Err(e) => platform::show_message("Connect Anywhere", &e.to_string()),
+                    }
+                });
+            }
+            Action::AnywhereOff => {
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    if platform::confirm(
+                        "Turn off Connect Anywhere?",
+                        "This computer will only be reachable on its local network. \
+                         You'll need your invite code to turn it back on.",
+                        "Turn Off",
+                    ) && sard_core::anywhere::Service::save_token(&config::config_dir(), "").is_ok()
+                    {
+                        let _ = proxy.send_event(AppEvent::AnywhereChanged);
                     }
                 });
             }

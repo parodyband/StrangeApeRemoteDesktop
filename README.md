@@ -85,6 +85,15 @@ be asked again. On macOS, grant the permissions described [below](#macos-permiss
 On Windows, allow Sard through Windows Firewall when it asks (the first time the PC is
 shared); all screens are always available.
 
+### Connect Anywhere (invite only)
+
+Away from home, **Connect To** still reaches your computers: Sard finds them
+through a small rendezvous service and connects directly (hole punching), or
+through an encrypted relay when a network doesn't allow that. It's invite-only
+for now, and paid plans are coming soon. With an invite code, choose **Connect
+Anywhere (Invite Only)…** on each of your computers and paste the same code.
+Pair them once on the same network; after that it works from anywhere.
+
 ### Shortcuts in a viewer window
 
 | <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Shift</kbd> + | |
