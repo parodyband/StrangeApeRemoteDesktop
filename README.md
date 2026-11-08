@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/icons/app/sard-256.png" width="128" alt="Sard icon"></p>
 
-<h1 align="center">Sard</h1>
+<h1 align="center">S.A.R.D.</h1>
 
 <p align="center"><b>Use your other computers as if you were sitting at them.</b><br>
 Fast remote desktop for Mac, Linux and Windows, made for 3D and game development.</p>
