@@ -15,7 +15,7 @@ use sard_core::stats::{Ema, Samples};
 use sard_core::video::{FRAME_META_LEN, FrameMeta, frame_flags};
 use sard_core::{error, info, warn};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -189,6 +189,9 @@ impl HostService {
         let anywhere = self.anywhere.as_ref().map(sard_core::anywhere::HostAgent::status);
         let mut s = self.state.status.lock().unwrap();
         s.anywhere = anywhere;
+        // Cheap, and the network may have changed since the service started
+        // (Wi-Fi joined after login, a new DHCP lease).
+        s.ips = local_ips();
         if s.pairing.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
             s.pairing = None;
         }
@@ -775,22 +778,47 @@ fn release_all(pressed: &mut PressedSet, input: &mut Box<dyn InputSink>) {
     }
 }
 
-/// Non-loopback IPv4 addresses of this machine (for the pairing hint).
-#[cfg(windows)]
+/// This machine's IPv4 addresses, the one to tell other computers first (the
+/// menu and the pairing notice show only that one).
 fn local_ips() -> Vec<String> {
-    let mut out: Vec<String> = sard_windows::os::local_ipv4()
-        .into_iter()
-        .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
-        .map(|ip| ip.to_string())
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+    rank_ips(interface_ips(), primary_ipv4())
 }
 
-/// Non-loopback IPv4 addresses of this machine (for the pairing hint).
+/// The address the default route leaves from: the LAN address other
+/// computers can reach. `connect` on UDP only picks a route; nothing is sent.
+fn primary_ipv4() -> Option<Ipv4Addr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?; // TEST-NET-1: routed like any internet address
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+/// Best first: the default route's address, then common home/office ranges
+/// before 172.16/12, where virtual adapters live (WSL and Hyper-V, Docker).
+/// Without the ranking, Windows showed WSL's 172.x address instead of its
+/// Wi-Fi address.
+fn rank_ips(mut ips: Vec<Ipv4Addr>, primary: Option<Ipv4Addr>) -> Vec<String> {
+    ips.retain(|ip| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified());
+    let class = |ip: &Ipv4Addr| match ip.octets() {
+        [192, 168, ..] => 0,
+        [10, ..] => 1,
+        [172, b, ..] if (16..32).contains(&b) => 3,
+        _ => 2,
+    };
+    ips.sort_by_key(|ip| (Some(*ip) != primary, class(ip), *ip));
+    ips.dedup();
+    ips.iter().map(Ipv4Addr::to_string).collect()
+}
+
+#[cfg(windows)]
+fn interface_ips() -> Vec<Ipv4Addr> {
+    sard_windows::os::local_ipv4()
+}
+
 #[cfg(unix)]
-fn local_ips() -> Vec<String> {
+fn interface_ips() -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs/freeifaddrs pair; we only read the returned list.
@@ -803,23 +831,30 @@ fn local_ips() -> Vec<String> {
             let a = (*p).ifa_addr;
             if !a.is_null() && (*a).sa_family as i32 == libc::AF_INET {
                 let sin = &*(a as *const libc::sockaddr_in);
-                let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                if !ip.is_loopback() && !ip.is_link_local() {
-                    out.push(ip.to_string());
-                }
+                out.push(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
             }
             p = (*p).ifa_next;
         }
         libc::freeifaddrs(ifap);
     }
-    out.sort();
-    out.dedup();
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_address_comes_first() {
+        let ips = |v: &[&str]| v.iter().map(|s| s.parse().unwrap()).collect::<Vec<Ipv4Addr>>();
+        // Windows with WSL: the vEthernet address used to win by sorting first.
+        let all = ips(&["172.27.0.1", "192.168.0.24", "127.0.0.1", "169.254.3.4"]);
+        assert_eq!(rank_ips(all.clone(), None), ["192.168.0.24", "172.27.0.1"]);
+        assert_eq!(rank_ips(all, "192.168.0.24".parse().ok()), ["192.168.0.24", "172.27.0.1"]);
+        // The default route's address wins even from an unusual range.
+        let all = ips(&["172.17.0.1", "10.0.0.5", "172.20.1.9"]);
+        assert_eq!(rank_ips(all, "172.20.1.9".parse().ok()), ["172.20.1.9", "10.0.0.5", "172.17.0.1"]);
+    }
 
     #[test]
     fn rate_control_backs_off_and_recovers() {

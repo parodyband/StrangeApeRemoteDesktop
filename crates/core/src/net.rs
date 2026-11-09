@@ -45,6 +45,11 @@ pub enum NetError {
     Crypto(CryptoError),
     Timeout,
     Rejected(String),
+    /// Packets to `addr` could not even be sent, for the whole attempt.
+    Unreachable {
+        addr: SocketAddr,
+        error: io::Error,
+    },
 }
 
 impl std::fmt::Display for NetError {
@@ -54,6 +59,19 @@ impl std::fmt::Display for NetError {
             NetError::Crypto(e) => write!(f, "handshake failed: {e}"),
             NetError::Timeout => f.write_str("timed out (is the host running, reachable, and are we paired?)"),
             NetError::Rejected(s) => write!(f, "rejected: {s}"),
+            NetError::Unreachable { addr, error } => {
+                write!(f, "this computer can't send to {} ({error}).", addr.ip())?;
+                // macOS's Local Network privacy blocks sends to LAN addresses
+                // until the user allows Sard; the failure is a bare errno.
+                if cfg!(target_os = "macos") && is_lan(addr.ip()) {
+                    f.write_str(
+                        " Allow Sard in System Settings → Privacy & Security → Local Network \
+                         (macOS asks the first time), then try again.",
+                    )
+                } else {
+                    f.write_str(" Check that both computers are on the same network.")
+                }
+            }
         }
     }
 }
@@ -1883,12 +1901,18 @@ impl Client {
             }
         };
         let framed = lock(&shared.relay).as_ref().map(|a| a.wrap(&pkt));
+        // A failing send may be transient (macOS waiting on the Local Network
+        // permission prompt, an interface coming up): keep trying until the
+        // deadline, and report it only if no send ever went out.
+        let mut send_failed = None;
+        let mut sent_once = false;
         loop {
             if let (Some(server), Some(f)) = (relay_server, &framed) {
                 let _ = shared.socket.send_to(f, server);
             } else if connected {
-                if let Err(e) = shared.socket.send(&pkt) {
-                    return fail(e.into());
+                match shared.socket.send(&pkt) {
+                    Ok(_) => sent_once = true,
+                    Err(e) => send_failed = Some(e),
                 }
             } else {
                 send_to(&candidates);
@@ -1915,7 +1939,12 @@ impl Client {
                     }
                     Ok(Err(e)) => return fail(e),
                     Err(_) if Instant::now() < deadline => {}
-                    Err(_) => return fail(NetError::Timeout),
+                    Err(_) => {
+                        return fail(match send_failed {
+                            Some(error) if !sent_once => NetError::Unreachable { addr: candidates[0], error },
+                            _ => NetError::Timeout,
+                        });
+                    }
                 }
             }
         }
@@ -1949,8 +1978,15 @@ impl Client {
         pkt.put_bytes(&sid);
         pkt.put_bytes(&cp.share);
         let mut host_share = None;
+        // Send failures can be transient (macOS shows its Local Network
+        // prompt on the first try): keep going until the deadline.
+        let mut send_failed = None;
+        let mut sent_once = false;
         'pake: while Instant::now() < deadline {
-            socket.send(&pkt)?;
+            match socket.send(&pkt) {
+                Ok(_) => sent_once = true,
+                Err(e) => send_failed = Some(e),
+            }
             let until = Instant::now() + Duration::from_millis(300);
             while Instant::now() < until {
                 match socket.recv_from(&mut buf) {
@@ -1962,16 +1998,18 @@ impl Client {
                         }
                     }
                     Ok(_) => {}
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
-                    Err(e) => return Err(e.into()),
+                    Err(e) => pairing_recv_error(e, until),
                 }
             }
         }
         let Some(host_share) = host_share else {
+            if let (Some(error), false) = (send_failed, sent_once) {
+                return Err(NetError::Unreachable { addr: peer, error });
+            }
             return Err(NetError::Rejected(format!(
-                "no answer from {addr}: is Sard running there, with “Allow a New Device to Pair…” \
-                 (or `sard host --pair`) and a code from the last 10 minutes?"
+                "no answer from {addr}. On that computer, check that this is the address shown at the top \
+                 of its Sard menu and that the menu shows a pairing code (“Pair a New Computer…”). \
+                 Its firewall may also be blocking Sard."
             )));
         };
         let psk = cp.finish(&host_share, true).map_err(|_| NetError::Rejected("invalid pairing reply".into()))?;
@@ -1988,7 +2026,8 @@ impl Client {
         // The host answers at once if the code was right; silence means wrong.
         let deadline = deadline.min(Instant::now() + Duration::from_secs(3));
         while Instant::now() < deadline {
-            socket.send(&pkt)?;
+            // Sends worked a moment ago; a failure here is a lost packet.
+            let _ = socket.send(&pkt);
             let until = Instant::now() + Duration::from_millis(300);
             while Instant::now() < until {
                 match socket.recv_from(&mut buf) {
@@ -2004,12 +2043,24 @@ impl Client {
                         return Ok((hp.static_key, hp.name, from));
                     }
                     Ok(_) => {}
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
-                    Err(e) => return Err(e.into()),
+                    Err(e) => pairing_recv_error(e, until),
                 }
             }
         }
         Err(NetError::Rejected("wrong pairing code (or it was already used)".into()))
+    }
+}
+
+/// A receive error while pairing. Timeouts and ICMP "port unreachable" (no
+/// Sard there yet) are routine; anything else (often the error of a failed
+/// send, reported again) waits out the rest of this resend interval rather
+/// than spinning.
+fn pairing_recv_error(e: io::Error, until: Instant) {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionRefused => {}
+        _ => {
+            debug!("pairing: receive: {e}");
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        }
     }
 }
