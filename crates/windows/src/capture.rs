@@ -573,6 +573,10 @@ impl DuplSource {
                 self.reopen_failures = 0;
                 let size = dupl_size(&d);
                 self.dupl = Some(d);
+                // Access is lost on mode changes: resolution, scaling,
+                // rotation, screens rearranged. Absolute mouse positions
+                // must map onto the new layout.
+                self.refresh_layout();
                 if size != self.desktop_size {
                     info!("desktop size changed to {}x{}", size.0, size.1);
                     self.desktop_size = size;
@@ -596,6 +600,21 @@ impl DuplSource {
                 false
             }
         }
+    }
+
+    /// Re-read where each screen sits on the virtual desktop (and its
+    /// rotation), and point absolute mouse input at the current one.
+    fn refresh_layout(&mut self) {
+        for s in &mut self.screens {
+            // SAFETY: zeroed POD out-struct.
+            let mut d: d3d::DXGI_OUTPUT_DESC = unsafe { std::mem::zeroed() };
+            if unsafe { s.output.GetDesc(&mut d) } >= 0 && d.AttachedToDesktop != 0 {
+                s.rect = d.DesktopCoordinates;
+                s.rotation = d.Rotation;
+            }
+        }
+        let screen = self.screens[self.current].rect;
+        *self.target.lock().unwrap() = InputTarget { screen, desktop: virtual_desktop(&self.screens) };
     }
 
     fn resize_output(&mut self, out: (u32, u32)) -> media::Result<()> {
@@ -937,7 +956,7 @@ impl VideoSource for DuplSource {
         self.desktop_size = size;
         self.pending = None;
         self.current = idx;
-        self.target.lock().unwrap().screen = s.rect;
+        self.refresh_layout();
         self.cursor.dirty = true;
         self.cursor.shape_dirty = self.cursor.shape.is_some();
         self.force_key = true;
