@@ -181,10 +181,8 @@ enum Action {
     SelectDisplay(u64, u32),
     Fullscreen(u64),
     Disconnect(u64),
-    PairHost,
+    Pair,
     ToggleShare,
-    AllowPairing,
-    ShowPairing,
     KickViewer,
     ChooseScreens,
     ToggleLogin,
@@ -368,6 +366,9 @@ impl App {
         MenuEntry::Item { id: 0, label: label.into(), enabled: false, checked: None }
     }
 
+    /// The tray menu, kept short: what this computer is doing (plus anything
+    /// that needs attention), the other computers (one click to connect),
+    /// pairing, then everything else under Settings.
     fn build_menu(&mut self) -> Vec<MenuEntry> {
         self.actions.clear();
         let mut m = Vec::new();
@@ -377,40 +378,46 @@ impl App {
         // ---- this computer ----
         match (&status, &self.host_error) {
             (Some(st), _) => {
-                let ip = st.ips.first().map(|i| format!(" ({i})")).unwrap_or_default();
-                m.push(Self::text(format!("Sharing as {}{ip}", st.name)));
+                let line = match (&st.viewer, st.ips.first()) {
+                    (Some(v), _) => format!("{v} is viewing this computer"),
+                    (None, Some(ip)) => format!("Shared as {} · {ip}", st.name),
+                    (None, None) => format!("Shared as {}", st.name),
+                };
+                m.push(Self::text(line));
                 if let Some(v) = &st.viewer {
-                    m.push(Self::text(format!("{v} is viewing this computer")));
-                }
-                match &st.anywhere {
-                    Some(a) if a.online => m.push(Self::text("Reachable from anywhere")),
-                    Some(a) => {
-                        let why = a.error.as_deref().unwrap_or("connecting…");
-                        let why: String = why.chars().take(60).collect();
-                        m.push(Self::text(format!("⚠ Connect Anywhere: {why}")));
-                    }
-                    None => {}
-                }
-                for p in self.missing_permissions.clone() {
-                    let e = self.item(format!("⚠ Allow {p}…"), Action::OpenPermission(p));
-                    m.push(e);
+                    let k = self.item(format!("Disconnect {v}"), Action::KickViewer);
+                    m.push(k);
                 }
                 if let Some((code, until)) = &st.pairing {
                     let mins = until.saturating_duration_since(Instant::now()).as_secs().div_ceil(60);
-                    let label = format!("Pairing code: {code} ({mins} min left)");
-                    m.push(self.item(label, Action::ShowPairing));
+                    let e = self.item(format!("Pairing code {code} · {mins} min left"), Action::Pair);
+                    m.push(e);
                     self.next_refresh = Some(Instant::now() + Duration::from_secs(30));
                 }
+                if let Some(a) = st.anywhere.as_ref().filter(|a| !a.online) {
+                    let why: String = a.error.as_deref().unwrap_or("connecting…").chars().take(60).collect();
+                    m.push(Self::text(format!("⚠ Connect Anywhere: {why}")));
+                }
             }
-            (None, Some(e)) => m.push(Self::text(format!("Sharing unavailable: {e}"))),
-            (None, None) => m.push(Self::text("Not sharing this computer")),
+            (None, Some(e)) => m.push(Self::text(format!("Not shared: {e}"))),
+            (None, None) => m.push(Self::text("Not shared")),
+        }
+        for p in self.missing_permissions.clone() {
+            let e = self.item(format!("⚠ Allow {p}…"), Action::OpenPermission(p));
+            m.push(e);
+        }
+        match (&self.update, self.update_installing) {
+            (Some(u), true) => m.push(Self::text(format!("Installing Sard {}…", u.version))),
+            (Some(u), false) if !self.update_busy => {
+                let e = self.item(format!("Install Sard {} and Restart", u.version), Action::InstallUpdate);
+                m.push(e);
+            }
+            _ => {}
         }
         m.push(MenuEntry::Separator);
 
-        // ---- open viewers ----
-        for (_, label, _) in &self.connecting {
-            m.push(Self::text(format!("Connecting to {label}…")));
-        }
+        // ---- other computers ----
+        // Open viewers: a submenu each, for their screens and window.
         let sessions: Vec<SessionMenu> = self
             .sessions
             .iter()
@@ -427,109 +434,88 @@ impl App {
             })
             .collect();
         for (sid, label, displays, current, stalls) in sessions {
-            let header = self.item(format!("Viewing {label}"), Action::Focus(sid));
-            m.push(header);
+            let mut sub = Vec::new();
             if stalls {
-                let e = self.item("⚠ Wi-Fi Stalls: Turn Off AirDrop & Handoff…", Action::AirDropSettings);
-                m.push(e);
+                sub.push(self.item("⚠ Wi-Fi Stalls: Turn Off AirDrop & Handoff…", Action::AirDropSettings));
             }
+            sub.push(self.item("Show Window", Action::Focus(sid)));
+            sub.push(self.item("Full Screen", Action::Fullscreen(sid)));
             if displays.len() > 1 {
+                sub.push(MenuEntry::Separator);
                 for (did, name) in displays {
-                    let e =
-                        self.check(format!("Screen: {name}"), current == Some(did), Action::SelectDisplay(sid, did));
-                    m.push(e);
+                    sub.push(self.check(name, current == Some(did), Action::SelectDisplay(sid, did)));
                 }
             }
-            let fs = self.item("Full Screen", Action::Fullscreen(sid));
-            let dc = self.item(format!("Disconnect from {label}"), Action::Disconnect(sid));
-            m.push(fs);
-            m.push(dc);
-            m.push(MenuEntry::Separator);
-        }
-
-        // ---- connect ----
-        let hosts = paired_hosts();
-        let mut forget = Vec::new();
-        for h in &hosts {
-            let e = self.item(format!("{}…", h.label), Action::ForgetHost(h.key, h.label.clone()));
-            forget.push(e);
-        }
-        let mut sub = Vec::new();
-        for h in hosts {
-            let open = self.sessions.iter().find(|s| s.target == h.target).map(|s| s.id);
-            let e = match open {
-                Some(sid) => self.check(h.label, true, Action::Focus(sid)),
-                None => self.item(h.label, Action::Connect(h.target)),
-            };
-            sub.push(e);
-        }
-        if !sub.is_empty() {
             sub.push(MenuEntry::Separator);
+            sub.push(self.item("Disconnect", Action::Disconnect(sid)));
+            let warn = if stalls { "⚠ " } else { "" };
+            m.push(MenuEntry::Submenu { label: format!("{warn}Viewing {label}"), enabled: true, items: sub });
         }
-        let pair_label = if self.pairing_busy { "Pairing…" } else { "Pair with a New Computer…" };
-        let pair = self.item(pair_label, Action::PairHost);
-        sub.push(pair);
-        if !forget.is_empty() {
-            sub.push(MenuEntry::Submenu { label: "Forget".into(), enabled: true, items: forget });
+        for (_, label, _) in &self.connecting {
+            m.push(Self::text(format!("Connecting to {label}…")));
         }
-        m.push(MenuEntry::Submenu { label: "Connect To".into(), enabled: true, items: sub });
+        // Paired computers that aren't open: one click connects.
+        let hosts = paired_hosts();
+        for h in &hosts {
+            let busy = self.sessions.iter().any(|s| s.target == h.target)
+                || self.connecting.iter().any(|(_, _, t)| *t == h.target);
+            if !busy {
+                let e = self.item(format!("Connect to {}", h.label), Action::Connect(h.target.clone()));
+                m.push(e);
+            }
+        }
+        let pair = if self.pairing_busy {
+            Self::text("Pairing…")
+        } else {
+            self.item("Pair a New Computer…", Action::Pair)
+        };
+        m.push(pair);
         m.push(MenuEntry::Separator);
 
-        // ---- sharing ----
-        let share = self.check("Share This Computer", self.settings.share, Action::ToggleShare);
-        m.push(share);
-        if let Some(st) = &status {
-            if let Some(v) = &st.viewer {
-                let k = self.item(format!("Disconnect {v}"), Action::KickViewer);
-                m.push(k);
-            }
-            let p = self.item("Allow a New Device to Pair…", Action::AllowPairing);
-            m.push(p);
-            if cfg!(target_os = "linux") {
-                let c = self.item("Choose Screens to Share…", Action::ChooseScreens);
-                m.push(c);
-            }
-        }
-        let devices = TrustStore::load(&config::config_dir()).map(|t| t.peers).unwrap_or_default();
-        let mut allowed = Vec::new();
-        for d in devices {
-            let name = if d.name.is_empty() { sard_core::crypto::fingerprint(&d.key) } else { d.name.clone() };
-            let e = self.item(format!("Remove {name}…"), Action::RemoveDevice(d.key, name));
-            allowed.push(e);
-        }
-        if allowed.is_empty() {
-            allowed.push(Self::text("No devices yet"));
-        }
-        m.push(MenuEntry::Submenu { label: "Allowed Devices".into(), enabled: true, items: allowed });
-        m.push(MenuEntry::Separator);
-        if sard_core::anywhere::Service::load(&config::config_dir()).is_some() {
-            let change = self.item("Change Invite Code…", Action::SetUpAnywhere);
-            let off = self.item("Turn Off on This Computer…", Action::AnywhereOff);
-            m.push(MenuEntry::Submenu { label: "Connect Anywhere".into(), enabled: true, items: vec![change, off] });
-        } else {
-            let e = self.item("Connect Anywhere (Invite Only)…", Action::SetUpAnywhere);
-            m.push(e);
+        // ---- settings ----
+        let mut s = Vec::new();
+        s.push(self.check("Share This Computer", self.settings.share, Action::ToggleShare));
+        if status.is_some() && cfg!(target_os = "linux") {
+            s.push(self.item("Choose Screens to Share…", Action::ChooseScreens));
         }
         let login = self.check("Start at Login", platform::launch_at_login(), Action::ToggleLogin);
-        m.push(login);
-        let upd = match (&self.update, self.update_busy) {
-            (Some(u), true) if self.update_installing => MenuEntry::Item {
-                id: 0,
-                label: format!("Installing Sard {}…", u.version),
-                enabled: false,
-                checked: None,
-            },
-            (_, true) => {
-                MenuEntry::Item { id: 0, label: "Checking for Updates…".into(), enabled: false, checked: None }
+        s.push(login);
+        s.push(MenuEntry::Separator);
+        let devices = TrustStore::load(&config::config_dir()).map(|t| t.peers).unwrap_or_default();
+        if !devices.is_empty() {
+            let mut items = Vec::new();
+            for d in devices {
+                let name = if d.name.is_empty() { sard_core::crypto::fingerprint(&d.key) } else { d.name.clone() };
+                items.push(self.item(format!("Remove {name}…"), Action::RemoveDevice(d.key, name)));
             }
-            (Some(u), false) => {
-                let label = format!("Install Sard {} and Restart", u.version);
-                self.item(label, Action::InstallUpdate)
+            s.push(MenuEntry::Submenu { label: "Computers That Can Connect Here".into(), enabled: true, items });
+        }
+        if !hosts.is_empty() {
+            let mut items = Vec::new();
+            for h in hosts {
+                items.push(self.item(format!("Forget {}…", h.label), Action::ForgetHost(h.key, h.label)));
             }
-            (None, false) => self.item("Check for Updates…", Action::CheckUpdates),
+            s.push(MenuEntry::Submenu { label: "Computers You Connect To".into(), enabled: true, items });
+        }
+        if sard_core::anywhere::Service::load(&config::config_dir()).is_some() {
+            let online = status.as_ref().and_then(|st| st.anywhere.as_ref()).is_some_and(|a| a.online);
+            let state = Self::text(if online { "Reachable from anywhere" } else { "Not reachable yet" });
+            let change = self.item("Change Invite Code…", Action::SetUpAnywhere);
+            let off = self.item("Turn Off on This Computer…", Action::AnywhereOff);
+            let items = vec![state, MenuEntry::Separator, change, off];
+            s.push(MenuEntry::Submenu { label: "Connect Anywhere".into(), enabled: true, items });
+        } else {
+            s.push(self.item("Connect Anywhere (Invite Only)…", Action::SetUpAnywhere));
+        }
+        s.push(MenuEntry::Separator);
+        let upd = if self.update_busy {
+            Self::text("Checking for Updates…")
+        } else {
+            self.item("Check for Updates…", Action::CheckUpdates)
         };
-        m.push(upd);
-        m.push(Self::text(format!("Sard {}", env!("CARGO_PKG_VERSION"))));
+        s.push(upd);
+        s.push(Self::text(format!("Sard {}", env!("CARGO_PKG_VERSION"))));
+        m.push(MenuEntry::Submenu { label: "Settings".into(), enabled: true, items: s });
         let quit = self.item("Quit Sard", Action::Quit);
         m.push(quit);
         m
@@ -546,7 +532,7 @@ impl App {
         }
         match (&status, viewer) {
             (Some(_), Some(v)) => tip.push(format!("{v} is viewing this computer")),
-            (Some(st), None) => tip.push(format!("Sharing as {}", st.name)),
+            (Some(st), None) => tip.push(format!("Shared as {}", st.name)),
             (None, _) => tip.push("Not sharing".into()),
         }
         let active = !self.sessions.is_empty() || status.as_ref().is_some_and(|s| s.viewer.is_some());
@@ -585,30 +571,67 @@ impl App {
         self.refresh();
     }
 
-    fn pair_host(&mut self) {
+    /// "Pair a New Computer…": one dialog for both directions, so nobody has
+    /// to work out which side does what. When this computer is shared it
+    /// shows this computer's address and code (for the other side to type),
+    /// and Enter Code… pairs with another computer from here.
+    fn pair(&mut self) {
         if self.pairing_busy {
             return;
         }
+        let here = self.host.as_ref().map(|h| {
+            let st = h.status();
+            // Keep a code that's still valid: someone may be typing it.
+            let code = match st.pairing {
+                Some((c, _)) => c,
+                None => h.new_pairing_code(),
+            };
+            (st.ips, st.name, code)
+        });
         self.pairing_busy = true;
         let (proxy, args) = (self.proxy.clone(), self.args.clone());
         std::thread::spawn(move || {
             let r = (|| -> Result<Option<String>> {
+                if let Some((ips, name, code)) = here {
+                    let addr = ips.first().cloned().unwrap_or(name);
+                    // Several when VPNs or virtual adapters (WSL, Docker) add
+                    // their own, in case the first isn't the reachable one.
+                    let others = match ips.get(1..) {
+                        Some(rest) if !rest.is_empty() => {
+                            format!("\n(if that doesn't work, try {})", rest.join(" or "))
+                        }
+                        _ => String::new(),
+                    };
+                    let msg = format!(
+                        "To control this computer from another one, choose “Pair a New Computer…” in Sard \
+                         there, click Enter Code…, and type:\n\n\
+                         Address:  {addr}{others}\nCode:  {code}\n\n\
+                         The code works once, within 10 minutes.\n\n\
+                         To control another computer from this one, click Enter Code… here instead."
+                    );
+                    if platform::choose("Pair a New Computer", &msg, &["Enter Code…", "Done"]) != Some(0) {
+                        return Ok(None);
+                    }
+                }
                 let Some(addr) = platform::prompt_text(
-                    "Pair with a computer",
-                    "Address of the computer to connect to\n(shown in the Sard menu on that computer):",
+                    "Pair a New Computer",
+                    "On the computer you want to control, choose “Pair a New Computer…” in Sard. \
+                     Type the address it shows (for example 192.168.1.20):",
                 ) else {
                     return Ok(None);
                 };
+                let addr = addr.trim().to_string();
+                if addr.is_empty() {
+                    return Ok(None);
+                }
                 let Some(code) = platform::prompt_text(
-                    "Pair with a computer",
-                    &format!(
-                        "6-digit pairing code for {addr}\n(on that computer choose “Allow a New Device to Pair…”):"
-                    ),
+                    "Pair a New Computer",
+                    &format!("Code shown on {addr} (6 digits; the space is optional):"),
                 ) else {
                     return Ok(None);
                 };
                 let cfg = crate::net_config(&args)?;
-                let (name, _, stored) = crate::pair_and_save(addr.trim(), code.trim(), &cfg)?;
+                let (name, _, stored) = crate::pair_and_save(&addr, code.trim(), &cfg)?;
                 info!("paired with {name} at {stored}");
                 Ok(Some(stored))
             })();
@@ -642,7 +665,7 @@ impl App {
                 self.sessions.retain(|s| s.id != sid);
                 self.refresh();
             }
-            Action::PairHost => self.pair_host(),
+            Action::Pair => self.pair(),
             Action::ToggleShare => {
                 self.settings.share = !self.settings.share;
                 self.settings.save();
@@ -656,14 +679,6 @@ impl App {
                 self.check_permissions();
                 self.refresh();
             }
-            Action::AllowPairing => {
-                if let Some(h) = &self.host {
-                    h.new_pairing_code();
-                    self.show_pairing();
-                }
-                self.refresh();
-            }
-            Action::ShowPairing => self.show_pairing(),
             Action::KickViewer => {
                 if let Some(h) = &self.host {
                     h.disconnect_viewer();
@@ -819,21 +834,6 @@ impl App {
             let choice = platform::choose("Sard Update", &msg, &["Install and Restart", "Later", "Skip This Version"]);
             let _ = proxy.send_event(AppEvent::UpdateChoice { version: u.version, choice });
         });
-    }
-
-    fn show_pairing(&self) {
-        let Some(st) = self.host_status() else { return };
-        let Some((code, _)) = st.pairing else { return };
-        let addr = st.ips.first().cloned().unwrap_or_else(|| st.name.clone());
-        notify(
-            "Pair a new device",
-            &format!(
-                "On the other computer: Sard menu → Connect To → Pair with a New Computer…\n\n\
-                 Address:  {addr}\nCode:  {code}\n\n\
-                 The code works once, for 10 minutes.\n(Terminal: sard pair {addr} {})",
-                code.replace(' ', "")
-            ),
-        );
     }
 
     fn session_closed(&mut self, sid: u64, reason: &str) {

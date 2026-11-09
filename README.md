@@ -35,18 +35,17 @@ every computer you want to use together.
 
 ## Connect two computers
 
-1. On the computer you want to **control**, open the Sard menu and choose
-   **Allow a New Device to Pair…**. It shows an address and a 6-digit code.
-2. On the computer you're **sitting at**, choose **Connect To → Pair with a New
-   Computer…** and type in that address and code.
-3. That's it. The other computer now appears under **Connect To**. Click it any
+1. On both computers, open the Sard menu and choose **Pair a New Computer…**.
+2. The computer you want to **control** shows an address and a 6-digit code. On
+   the computer you're **sitting at**, click **Enter Code…** and type them in.
+3. That's it. The Sard menu now has **Connect to** *that computer*. Click it any
    time to open its screen.
 
 Both computers need to be on the same network the first time you pair them.
 
 ## While you're connected
 
-- **Switch screens:** pick one under the computer's name in the Sard menu.
+- **Switch screens:** pick one under **Viewing** *that computer* in the Sard menu.
 - **Shortcuts** (hold <kbd>Ctrl</kbd> <kbd>Alt</kbd> <kbd>Shift</kbd>; on a Mac,
   <kbd>Ctrl</kbd> <kbd>Option</kbd> <kbd>Shift</kbd>):
 
@@ -68,12 +67,12 @@ Both computers need to be on the same network the first time you pair them.
 
 ## Connect from anywhere
 
-Away from home? **Connect To** can still reach your computers over the internet,
+Away from home? Sard can still reach your computers over the internet,
 without setting up your router. This is **invite-only for now; paid plans are
 coming soon.**
 
-If you have an invite code: on each of your computers, choose **Connect Anywhere
-(Invite Only)…** and paste the same code. Pair your computers once at home, and
+If you have an invite code: on each of your computers, choose **Settings →
+Connect Anywhere (Invite Only)…** and paste the same code. Pair your computers once at home, and
 they'll find each other from any network after that.
 
 ## First-time setup
