@@ -8,6 +8,7 @@
 use crate::dbus::{self, METHOD_CALL, Message, SIGNAL, Value, dict};
 use sard_core::media::{self, MenuEntry, Rgba, Tray, TrayCallback, TrayIcons};
 use sard_core::warn;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -20,7 +21,7 @@ const MENU_IFACE: &str = "com.canonical.dbusmenu";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const WATCHER: &str = "org.kde.StatusNotifierWatcher";
 
-/// One dbusmenu node (index = dbusmenu id; 0 is the root).
+/// One dbusmenu node.
 #[derive(Clone, Debug)]
 struct Node {
     props: Vec<(&'static str, Value)>,
@@ -30,17 +31,35 @@ struct Node {
 }
 
 struct State {
-    nodes: Vec<Node>,
+    /// By dbusmenu id; 0 is the root.
+    nodes: BTreeMap<i32, Node>,
     revision: u32,
     tooltip: String,
     active: bool,
 }
 
-fn flatten(entries: &[MenuEntry], nodes: &mut Vec<Node>) -> Vec<i32> {
+/// The kinds of dbusmenu entry. Plasma's importer keeps the QAction for an id
+/// across layout updates and never changes its kind afterwards (a separator
+/// stays a separator, and gets drawn as a bold, unclickable section heading
+/// once it has a label). So an id must always mean the same kind: each kind
+/// takes ids from its own sequence (id = 1 + n * KINDS + kind).
+const KINDS: i32 = 4;
+const SEPARATOR: i32 = 0;
+const PLAIN: i32 = 1;
+const CHECK: i32 = 2;
+const SUBMENU: i32 = 3;
+
+fn flatten(entries: &[MenuEntry], nodes: &mut BTreeMap<i32, Node>, next: &mut [i32; KINDS as usize]) -> Vec<i32> {
     let mut ids = Vec::new();
     for e in entries {
-        let id = nodes.len() as i32;
-        nodes.push(Node { props: Vec::new(), children: Vec::new(), user_id: None });
+        let kind = match e {
+            MenuEntry::Separator => SEPARATOR,
+            MenuEntry::Item { checked: None, .. } => PLAIN,
+            MenuEntry::Item { checked: Some(_), .. } => CHECK,
+            MenuEntry::Submenu { .. } => SUBMENU,
+        };
+        let id = 1 + next[kind as usize] * KINDS + kind;
+        next[kind as usize] += 1;
         // Always send every property: Plasma's importer only updates the
         // properties present in a new layout, so an omitted "enabled" would
         // keep a reused item greyed out (e.g. after "Checking for Updates…").
@@ -63,24 +82,23 @@ fn flatten(entries: &[MenuEntry], nodes: &mut Vec<Node>) -> Vec<i32> {
                 Node { props: full(label, *enabled, false, *checked, false), children: Vec::new(), user_id: Some(*uid) }
             }
             MenuEntry::Submenu { label, enabled, items } => {
-                let children = flatten(items, nodes);
+                let children = flatten(items, nodes, next);
                 Node { props: full(label, *enabled, false, None, true), children, user_id: None }
             }
         };
-        nodes[id as usize] = node;
+        nodes.insert(id, node);
         ids.push(id);
     }
     ids
 }
 
-fn build_nodes(menu: &[MenuEntry]) -> Vec<Node> {
-    let mut nodes = vec![Node {
-        props: vec![("children-display", Value::Str("submenu".into()))],
-        children: Vec::new(),
-        user_id: None,
-    }];
-    let top = flatten(menu, &mut nodes);
-    nodes[0].children = top;
+fn build_nodes(menu: &[MenuEntry]) -> BTreeMap<i32, Node> {
+    let mut nodes = BTreeMap::new();
+    let top = flatten(menu, &mut nodes, &mut [0; KINDS as usize]);
+    nodes.insert(
+        0,
+        Node { props: vec![("children-display", Value::Str("submenu".into()))], children: top, user_id: None },
+    );
     nodes
 }
 
@@ -95,8 +113,8 @@ fn props_value(node: &Node, filter: &[String]) -> Value {
 }
 
 /// `(ia{sv}av)` for `id`, recursing `depth` levels (-1 = all).
-fn layout(nodes: &[Node], id: i32, depth: i32, filter: &[String]) -> Value {
-    let node = &nodes[id as usize];
+fn layout(nodes: &BTreeMap<i32, Node>, id: i32, depth: i32, filter: &[String]) -> Value {
+    let node = &nodes[&id];
     let children = if depth == 0 {
         Vec::new()
     } else {
@@ -234,7 +252,7 @@ impl Shared {
                     .map(|v| v.items().iter().filter_map(|s| s.as_str().map(String::from)).collect())
                     .unwrap_or_default();
                 let st = self.state.lock().unwrap();
-                if parent < 0 || parent as usize >= st.nodes.len() {
+                if !st.nodes.contains_key(&parent) {
                     return c.reply_error(m, "org.freedesktop.DBus.Error.InvalidArgs", "no such menu item");
                 }
                 let l = layout(&st.nodes, parent, depth, &filter);
@@ -249,11 +267,10 @@ impl Shared {
                     .map(|v| v.items().iter().filter_map(|s| s.as_str().map(String::from)).collect())
                     .unwrap_or_default();
                 let st = self.state.lock().unwrap();
-                let ids: Vec<i32> = if ids.is_empty() { (0..st.nodes.len() as i32).collect() } else { ids };
+                let ids: Vec<i32> = if ids.is_empty() { st.nodes.keys().copied().collect() } else { ids };
                 let out = ids
                     .into_iter()
-                    .filter(|&i| i >= 0 && (i as usize) < st.nodes.len())
-                    .map(|i| Value::Struct(vec![Value::I32(i), props_value(&st.nodes[i as usize], &filter)]))
+                    .filter_map(|i| Some(Value::Struct(vec![Value::I32(i), props_value(st.nodes.get(&i)?, &filter)])))
                     .collect();
                 c.reply(m, &[Value::Array("(ia{sv})".into(), out)])
             }
@@ -262,7 +279,7 @@ impl Shared {
                 let st = self.state.lock().unwrap();
                 let v = st
                     .nodes
-                    .get(id.max(0) as usize)
+                    .get(&id)
                     .and_then(|n| n.props.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()));
                 match v {
                     Some(v) => c.reply(m, &[Value::Variant(Box::new(v))]),
@@ -309,7 +326,7 @@ impl Shared {
         if event != "clicked" {
             return;
         }
-        let user = self.state.lock().unwrap().nodes.get(id.max(0) as usize).and_then(|n| n.user_id);
+        let user = self.state.lock().unwrap().nodes.get(&id).and_then(|n| n.user_id);
         if let Some(u) = user {
             (self.on_click)(u);
         }
@@ -496,10 +513,13 @@ mod tests {
         ];
         let nodes = build_nodes(&menu);
         assert_eq!(nodes.len(), 5);
-        assert_eq!(nodes[0].children, vec![1, 2, 3]);
-        assert_eq!(nodes[3].children, vec![4]);
-        assert_eq!(nodes[4].user_id, Some(1000));
-        let label = nodes[4].props.iter().find(|(k, _)| *k == "label").unwrap();
+        let top = nodes[&0].children.clone();
+        assert_eq!(top.len(), 3);
+        let sub = &nodes[&top[2]];
+        assert_eq!(sub.children.len(), 1);
+        let mac = &nodes[&sub.children[0]];
+        assert_eq!(mac.user_id, Some(1000));
+        let label = mac.props.iter().find(|(k, _)| *k == "label").unwrap();
         assert_eq!(label.1, Value::Str("my__mac".into()));
         // Depth 1: root plus its children, but not grandchildren.
         let l = layout(&nodes, 0, 1, &[]);
@@ -507,6 +527,27 @@ mod tests {
         assert_eq!(kids.len(), 3);
         assert!(kids[2].unvariant().items()[2].items().is_empty());
         assert_eq!(pixmap(&icon()).items()[0].items()[2].items()[..4], [255, 10, 20, 30].map(Value::Byte));
+    }
+
+    /// An id never changes kind between layouts (Plasma keeps the old kind).
+    #[test]
+    fn ids_keep_their_kind() {
+        let item = |id, l: &str| MenuEntry::Item { id, label: l.into(), enabled: true, checked: None };
+        let kinds = |menu: &[MenuEntry]| {
+            let nodes = build_nodes(menu);
+            nodes
+                .iter()
+                .filter(|(id, _)| **id != 0)
+                .map(|(id, n)| (*id, n.props.iter().find(|(k, _)| *k == "type").unwrap().1.clone()))
+                .collect::<Vec<_>>()
+        };
+        let a = kinds(&[item(1, "Status"), MenuEntry::Separator, item(2, "Pair"), MenuEntry::Separator]);
+        let b = kinds(&[item(1, "Status"), item(3, "Extra"), MenuEntry::Separator, item(4, "Connect to mac")]);
+        for (id, t) in &a {
+            if let Some((_, t2)) = b.iter().find(|(i, _)| i == id) {
+                assert_eq!(t, t2, "id {id} changed kind");
+            }
+        }
     }
 
     /// Full round trip on a private bus: a fake StatusNotifierWatcher, the
