@@ -604,7 +604,15 @@ mod tests {
         // shares the first output line.
         let nums: Vec<u32> =
             text.lines().filter_map(|l| l.trim_end().rsplit('\r').next()?.trim().parse().ok()).collect();
-        let start = nums.iter().position(|&n| n == 1).expect("seq output");
+        let Some(start) = nums.iter().position(|&n| n == 1) else {
+            let at = text.find("seq 1").unwrap_or(0);
+            let around: String = text[at..].chars().take(600).collect();
+            panic!(
+                "no line \"1\" ({} numbers, first {:?}); output after the command: {around:?}",
+                nums.len(),
+                &nums[..nums.len().min(5)]
+            );
+        };
         let run = &nums[start..];
         assert_eq!(run.len(), 300000, "lines lost or duplicated");
         assert!(run.iter().enumerate().all(|(i, &n)| n as usize == i + 1));
