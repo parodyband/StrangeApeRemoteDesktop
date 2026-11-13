@@ -1218,6 +1218,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sard-mobile"
+version = "0.1.18"
+dependencies = [
+ "objc2 0.6.5",
+ "sard-core",
+ "sard-macos",
+]
+
+[[package]]
 name = "sard-windows"
 version = "0.1.18"
 dependencies = [

@@ -1,0 +1,19 @@
+[package]
+name = "sard-mobile"
+description = "C API of the Sard core for the iPhone app (static library + include/sard.h)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+sard-core.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+sard-macos.workspace = true
+objc2 = { version = "0.6", features = ["relax-void-encoding"] }

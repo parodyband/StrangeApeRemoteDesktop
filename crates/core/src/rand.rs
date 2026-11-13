@@ -1,5 +1,10 @@
 //! OS-backed cryptographically secure random bytes.
 
+// Every key and nonce comes from `fill`: a platform without a branch below
+// would silently get all-zero keys. Refuse to build instead.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+compile_error!("rand::fill has no CSPRNG for this platform");
+
 /// Fill `buf` with random bytes from the OS CSPRNG. Panics if the OS refuses,
 /// which only happens on a badly broken system.
 pub fn fill(buf: &mut [u8]) {
@@ -19,7 +24,8 @@ pub fn fill(buf: &mut [u8]) {
             off += r as usize;
         }
     }
-    #[cfg(target_os = "macos")]
+    // Apple platforms (macOS, iOS): getentropy.
+    #[cfg(target_vendor = "apple")]
     {
         for chunk in buf.chunks_mut(256) {
             // SAFETY: chunk is at most 256 bytes as getentropy requires.

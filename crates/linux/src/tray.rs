@@ -277,10 +277,8 @@ impl Shared {
             (MENU_PATH, MENU_IFACE, "GetProperty") => {
                 let (id, name) = (arg_i32(0), arg_str(1));
                 let st = self.state.lock().unwrap();
-                let v = st
-                    .nodes
-                    .get(&id)
-                    .and_then(|n| n.props.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()));
+                let v =
+                    st.nodes.get(&id).and_then(|n| n.props.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()));
                 match v {
                     Some(v) => c.reply(m, &[Value::Variant(Box::new(v))]),
                     None => c.reply_error(m, "org.freedesktop.DBus.Error.InvalidArgs", "no such property"),

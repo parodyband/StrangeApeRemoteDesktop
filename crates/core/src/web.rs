@@ -9,58 +9,63 @@
 //!
 //! Windows ships no libcurl library, so there the same API is implemented on
 //! WinHTTP (system TLS, proxy settings and its own WebSocket client) in
-//! `web/winhttp.rs`.
+//! `web/winhttp.rs`. iOS has no public libcurl either: there the app supplies
+//! the TCP + TLS byte stream (Network.framework), see `web/ios.rs`.
 
+#[cfg(target_os = "ios")]
+mod ios;
 #[cfg(windows)]
 mod winhttp;
+#[cfg(target_os = "ios")]
+pub use ios::{Stream, Transport, set_transport};
 #[cfg(windows)]
 pub use winhttp::{WebSocket, request};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 use std::ffi::{CString, c_char, c_int, c_long, c_void};
 use std::io;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 use std::sync::OnceLock;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type EasyInit = unsafe extern "C" fn() -> *mut c_void;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type EasySetopt = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type EasyPerform = unsafe extern "C" fn(*mut c_void) -> c_int;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type EasyIo = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut usize) -> c_int;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type EasyGetinfo = unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type EasyCleanup = unsafe extern "C" fn(*mut c_void);
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type EasyStrerror = unsafe extern "C" fn(c_int) -> *const c_char;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 type GlobalInit = unsafe extern "C" fn(c_long) -> c_int;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURLOPT_URL: c_int = 10002;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURLOPT_NOSIGNAL: c_int = 99;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURLOPT_HTTP_VERSION: c_int = 84;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURLOPT_CONNECT_ONLY: c_int = 141;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURLOPT_CONNECTTIMEOUT_MS: c_int = 156;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURL_HTTP_VERSION_1_1: c_long = 2;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURLINFO_ACTIVESOCKET: c_int = 0x50_0000 + 44;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURLE_AGAIN: c_int = 81;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 const CURL_GLOBAL_DEFAULT: c_long = 3;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 struct Curl {
     init: EasyInit,
     setopt: EasySetopt,
@@ -72,13 +77,13 @@ struct Curl {
     strerror: EasyStrerror,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 fn curl() -> io::Result<&'static Curl> {
     static LIB: OnceLock<Result<Curl, String>> = OnceLock::new();
     LIB.get_or_init(load).as_ref().map_err(|e| io::Error::other(e.clone()))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 fn load() -> Result<Curl, String> {
     let names: &[&str] = if cfg!(target_os = "macos") {
         &["/usr/lib/libcurl.4.dylib"]
@@ -120,7 +125,7 @@ fn load() -> Result<Curl, String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 fn curl_err(c: &Curl, code: c_int, what: &str) -> io::Error {
     // SAFETY: curl_easy_strerror returns a static string.
     let msg = unsafe { std::ffi::CStr::from_ptr((c.strerror)(code)) }.to_string_lossy().into_owned();
@@ -185,7 +190,7 @@ impl Url {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 /// A TCP (+TLS) byte stream opened by libcurl.
 pub struct Stream {
     lib: &'static Curl,
@@ -193,12 +198,12 @@ pub struct Stream {
     fd: c_int,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 // SAFETY: a curl easy handle may be used from any thread, one at a time;
 // `Stream` is not `Sync`, so &mut access is exclusive.
 unsafe impl Send for Stream {}
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 impl Stream {
     pub fn connect(url: &Url, timeout: Duration) -> io::Result<Stream> {
         let lib = curl()?;
@@ -290,7 +295,7 @@ impl Stream {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "ios")))]
 impl Drop for Stream {
     fn drop(&mut self) {
         // SAFETY: the handle came from curl_easy_init and is not used again.

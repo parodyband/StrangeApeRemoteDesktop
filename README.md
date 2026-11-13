@@ -13,6 +13,8 @@ Fast remote desktop for Mac, Linux and Windows, made for 3D and game development
 - **Sound and clipboard come along.** Copy on one computer, paste on the other.
 - **Private.** Your computers pair once with a 6-digit code and only talk to each
   other, encrypted. No accounts needed.
+- **From your iPhone too.** Control a computer's screen from your phone, or open a
+  terminal on it.
 
 ## Install
 
@@ -64,6 +66,40 @@ Both computers need to be on the same network the first time you pair them.
 - **Games and 3D apps:** when an app on the other computer hides the mouse pointer
   to look around, Sard locks the mouse automatically (not yet when the other
   computer is a Mac; use the <kbd>M</kbd> shortcut there).
+
+## On your iPhone
+
+The Sard iPhone app shows and controls your computers' screens, and opens
+terminals on them. It isn't on the App Store yet: build it from this repository
+with Xcode (see [docs/TECHNICAL.md](docs/TECHNICAL.md#iphone-app)).
+
+- **Pair:** on the computer choose **Pair a New Computer…**, then tap **+** in the
+  app and enter the address and code it shows.
+- **Screen:** drag to move the pointer, tap to click, two-finger tap to
+  right-click, hold then drag to drag, two fingers to scroll, pinch to zoom. The
+  keyboard button brings up the keyboard with Esc, Tab, Ctrl, Alt, ⌘ and arrow
+  keys; hardware keyboards work too. Prefer tapping where you want to click? Switch
+  the pointer to **Touch**.
+- **Fit Screen to Phone** (on by default) lowers the computer's resolution while
+  you're connected so text is readable on the phone, and puts it back when you
+  leave. Choose how big text gets under **Settings → Text Size**.
+- **Terminal:** first turn on **Settings → Allow Terminal Access** in the Sard menu
+  of that computer. Terminals keep running when you switch apps or lose signal;
+  the app picks them up again when you're back.
+
+## Terminals from another computer
+
+With **Allow Terminal Access** on, open a terminal on a paired computer from a
+terminal on this one:
+
+```sh
+sard shell linux                # a new terminal
+sard shell linux --list         # terminals still running there
+sard shell linux --attach 3     # pick one up again
+```
+
+Type <kbd>Enter</kbd> <kbd>~</kbd> <kbd>.</kbd> to disconnect and leave the
+terminal running.
 
 ## Connect from anywhere
 

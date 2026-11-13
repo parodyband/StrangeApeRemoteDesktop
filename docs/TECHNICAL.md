@@ -75,6 +75,45 @@ One UDP socket and one network thread; there is no async runtime.
 - **Control:** a reliable ordered channel carries input and control messages. Clock
   sync gives true end-to-end latency figures.
 
+### Terminals
+
+A client that wants shells opens a session in the *terminal lane* (a byte in the
+handshake hello): the host replaces an older session from the same device only
+in the same lane, so a phone can show a screen and a terminal at once. Its
+`ClientHello` carries the `TERMINAL` flag, so the host captures nothing and
+injects no input; the reliable channel then carries `ShellOpen` / `ShellData` /
+`ShellResize` / `ShellClose` (`crates/sard/src/terminal.rs`).
+
+- The shell is the user's login shell on a pseudo-terminal (`openpty`,
+  `crates/core/src/pty.rs`; ConPTY with PowerShell on Windows), started in the
+  home directory with `TERM=xterm-256color`.
+- Shells belong to the device that opened them and outlive the session: a phone
+  drops its connection whenever the app goes to the background. Reattaching
+  replays the last 256 KB of output and nudges the window size so full-screen
+  programs repaint. A shell nobody reattaches to ends after 12 hours; at most 12
+  per device.
+- Flow control: the client acknowledges each output message (`ShellAck`) once it
+  has shown it, and the host keeps at most 128 unacknowledged (and holds back
+  while the reliable channel has a backlog), so `cat` of a huge file runs at the
+  client's pace instead of overflowing it.
+- Off until the host's owner turns on **Allow Terminal Access** (`terminal=on` in
+  `settings.txt`, or `sard host --terminal`): pairing for screen sharing shouldn't
+  silently grant a shell. Turning it off ends running shells.
+
+### Fit to the viewer's screen
+
+A viewer can ask the host to switch the streamed display to the mode closest to a
+desktop size (`ClientHello.fit_*`, `Control::FitDisplay`). `media::pick_mode`
+chooses: closest shape, then closest size, keeping HiDPI and refresh rate, never
+larger than the current desktop. The original mode comes back when the viewer
+asks, switches displays or leaves.
+
+| | How | Restored if Sard crashes |
+|---|---|---|
+| macOS | `CGConfigureDisplayWithDisplayMode`, `kCGConfigureForAppOnly` | yes (by macOS) |
+| Windows | `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` (never saved) | not guaranteed |
+| Linux | KDE: `kscreen-doctor`; GNOME: Mutter `ApplyMonitorsConfig` (temporary); X11: `xrandr` | no: the log has the command to restore it |
+
 ### Connect Anywhere
 
 A Cloudflare Worker with one Durable Object per host (private repo
@@ -119,6 +158,35 @@ or macOS forgets its permissions on every rebuild. Windows needs the MSVC build
 tools ("Desktop development with C++"). Releases are built by GitHub Actions; see
 [RELEASING.md](RELEASING.md).
 
+## iPhone app
+
+`ios/Sard.xcodeproj` (SwiftUI + UIKit, iOS 17+) on top of `crates/mobile`, a
+static library with a C API (`crates/mobile/include/sard.h`). The Rust side does
+everything protocol-shaped: pairing, Connect Anywhere, the transport,
+VideoToolbox decode and Metal drawing (the macOS viewer's code, shared), audio
+jitter buffering and key mapping. Swift does the UI, gestures, audio output, the
+terminal emulator ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) and,
+for Connect Anywhere, TCP + TLS on Network.framework (iOS has no public libcurl).
+
+Building needs Xcode 16+ and Rust (`rustup target add aarch64-apple-ios
+aarch64-apple-ios-sim`; the build phase adds them if missing). Open
+`ios/Sard.xcodeproj`, pick your team under Signing & Capabilities, choose your
+iPhone and Run: a build phase (`ios/build-rust.sh`) compiles the Rust core for the
+selected device or simulator. From the command line:
+
+```sh
+xcodebuild -project ios/Sard.xcodeproj -scheme Sard \
+  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+```
+
+Debug builds accept `-SardAutoOpen screen|terminal` to open the first paired
+computer at launch. To pair a simulator without typing, run `sard pair` with
+`SARD_CONFIG_DIR` set to the app's `Library/Application Support/sard` (from
+`xcrun simctl get_app_container booted com.strangeape.sard.ios data`).
+`cargo run -p sard-mobile --example smoke -- <dir> <addr> <code>` drives the C
+API from the Mac against a host started with `sard host --pair --terminal
+--test-pattern`.
+
 ## Command line
 
 Everything in the menu also works from a terminal:
@@ -128,6 +196,7 @@ sard app                                 # the menu bar / tray app
 sard host --pair                         # share this computer; prints a pairing code
 sard pair 192.168.1.77 123456 --alias linux
 sard connect linux                       # open a viewer window
+sard shell linux                         # a terminal there (--list, --attach <id>)
 sard alias 192.168.1.131 mac             # name a paired computer; `sard alias` lists them
 sard info                                # identity, paired devices, encoders/decoders
 sard update [--check]                    # install the latest release
@@ -185,4 +254,7 @@ Extensions* / *AV1 Video Extension* from the Store.
 - [x] Connect Anywhere: hole punching, TURN relay fallback, invite-only accounts
 - [x] Viewer-drawn cursor for macOS hosts
 - [x] Bitrate control that tells Wi-Fi stalls from real congestion
+- [x] iPhone app: screen control, fit-to-phone resolution, terminals
+- [x] Remote terminals that survive reconnects (`sard shell`, the iPhone app)
+- [ ] Fit-to-phone and terminals on Windows and Linux hosts (written, builds; not yet tested on hardware)
 - [ ] Connect Anywhere paid plans

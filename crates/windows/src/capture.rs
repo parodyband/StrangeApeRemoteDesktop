@@ -28,7 +28,8 @@ use crate::input::{InputTarget, SendInputSink};
 use crate::sys::{self, RECT};
 use sard_core::clock;
 use sard_core::media::{
-    self, CursorMode, CursorShape, CursorUpdate, DisplayInfo, EncodedFrame, InputSink, SourceOptions, VideoSource,
+    self, CursorMode, CursorShape, CursorUpdate, DisplayInfo, DisplayMode, EncodedFrame, InputSink, SourceOptions,
+    VideoSource,
 };
 use sard_core::proto::Codec;
 use sard_core::{debug, info, warn};
@@ -287,6 +288,133 @@ fn friendly_names() -> Vec<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Display modes ("fit to the viewer's screen")
+
+type FnGetDpiForMonitor = unsafe extern "system" fn(sys::HMONITOR, u32, *mut u32, *mut u32) -> sys::HRESULT;
+
+/// The monitor's scale factor (1.5 at 150 %): physical pixels per logical
+/// pixel. 1 if unknown.
+fn monitor_scale(output: &IDXGIOutput1) -> f64 {
+    static F: std::sync::OnceLock<Option<FnGetDpiForMonitor>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| {
+        let lib = crate::dl::Library::open(&["shcore.dll"]).ok()?;
+        // SAFETY: GetDpiForMonitor has exactly this signature (shellscalingapi.h).
+        let f = unsafe { lib.sym_opt::<FnGetDpiForMonitor>("GetDpiForMonitor\0") };
+        std::mem::forget(lib); // keep loaded for the process lifetime
+        f
+    });
+    // SAFETY: zeroed POD out-struct.
+    let mut d: d3d::DXGI_OUTPUT_DESC = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer.
+    let Some(f) = f.filter(|_| unsafe { output.GetDesc(&mut d) } >= 0) else { return 1.0 };
+    let (mut x, mut y) = (0u32, 0u32);
+    // SAFETY: the output's monitor handle and valid out pointers. The process
+    // is per-monitor DPI aware (`set_dpi_aware`), so this is the real scale.
+    if unsafe { f(d.Monitor, sys::MDT_EFFECTIVE_DPI, &mut x, &mut y) } < 0 || x == 0 {
+        return 1.0;
+    }
+    x as f64 / sys::USER_DEFAULT_SCREEN_DPI as f64
+}
+
+fn display_mode(dm: &sys::DEVMODEW, scale: f64) -> DisplayMode {
+    let logical = |px: u32| ((px as f64 / scale).round() as u32).max(1);
+    DisplayMode {
+        width: logical(dm.dmPelsWidth),
+        height: logical(dm.dmPelsHeight),
+        pixel_width: dm.dmPelsWidth,
+        pixel_height: dm.dmPelsHeight,
+        refresh: if dm.dmDisplayFrequency > 1 { dm.dmDisplayFrequency as f64 } else { 0.0 },
+    }
+}
+
+/// The current mode of a screen (`\\.\DISPLAYn`).
+fn current_mode(device: &str) -> Result<sys::DEVMODEW, String> {
+    let dev = sys::wide(device);
+    let mut dm = sys::DEVMODEW::new();
+    // SAFETY: valid device name and DEVMODEW with dmSize set.
+    if unsafe { sys::EnumDisplaySettingsExW(dev.as_ptr(), sys::ENUM_CURRENT_SETTINGS, &mut dm, 0) } == 0 {
+        return Err(format!("cannot read the display mode of {device}"));
+    }
+    Ok(dm)
+}
+
+/// The modes a screen offers at its current colour depth and orientation
+/// (progressive only, one per size and refresh rate).
+fn display_modes(device: &str, current: &sys::DEVMODEW, scale: f64) -> Vec<(DisplayMode, sys::DEVMODEW)> {
+    let dev = sys::wide(device);
+    let landscape = current.dmPelsWidth >= current.dmPelsHeight;
+    let mut out: Vec<(DisplayMode, sys::DEVMODEW)> = Vec::new();
+    for i in 0.. {
+        let mut dm = sys::DEVMODEW::new();
+        // SAFETY: valid device name and DEVMODEW with dmSize set. Without
+        // EDS_ROTATEDMODE only modes of the current orientation are listed.
+        if unsafe { sys::EnumDisplaySettingsExW(dev.as_ptr(), i, &mut dm, 0) } == 0 {
+            break;
+        }
+        let same_orientation = dm.dmFields & sys::DM_DISPLAYORIENTATION == 0
+            || current.dmFields & sys::DM_DISPLAYORIENTATION == 0
+            || dm.dmDisplayOrientation == current.dmDisplayOrientation;
+        if dm.dmBitsPerPel != current.dmBitsPerPel
+            || dm.dmDisplayFlags & sys::DM_INTERLACED != 0
+            || !same_orientation
+            || (dm.dmPelsWidth >= dm.dmPelsHeight) != landscape
+            || out.iter().any(|(_, o)| {
+                (o.dmPelsWidth, o.dmPelsHeight, o.dmDisplayFrequency)
+                    == (dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency)
+            })
+        {
+            continue;
+        }
+        out.push((display_mode(&dm, scale), dm));
+    }
+    out
+}
+
+/// Switch a screen to `dm` until it is restored (`CDS_FULLSCREEN`: a
+/// temporary change, never written to the registry).
+fn apply_mode(device: &str, dm: &sys::DEVMODEW) -> Result<(), String> {
+    let dev = sys::wide(device);
+    let mut dm = *dm;
+    dm.dmFields =
+        sys::DM_BITSPERPEL | sys::DM_PELSWIDTH | sys::DM_PELSHEIGHT | sys::DM_DISPLAYFREQUENCY | sys::DM_DISPLAYFLAGS;
+    // SAFETY: valid device name and DEVMODEW; no window, no video parameters.
+    let r = unsafe {
+        sys::ChangeDisplaySettingsExW(dev.as_ptr(), &dm, std::ptr::null_mut(), sys::CDS_FULLSCREEN, std::ptr::null())
+    };
+    match r {
+        sys::DISP_CHANGE_SUCCESSFUL => Ok(()),
+        sys::DISP_CHANGE_RESTART => Err("Windows wants a restart for that mode".into()),
+        sys::DISP_CHANGE_BADMODE => Err("the display doesn't support that mode".into()),
+        r => Err(format!("ChangeDisplaySettingsEx failed ({r})")),
+    }
+}
+
+/// Put a screen back in its saved (registry) mode.
+fn restore_mode(device: &str) {
+    let dev = sys::wide(device);
+    // SAFETY: valid device name; NULL mode and no flags mean "the mode in the
+    // registry", undoing a CDS_FULLSCREEN change.
+    let r = unsafe {
+        sys::ChangeDisplaySettingsExW(dev.as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null())
+    };
+    if r != sys::DISP_CHANGE_SUCCESSFUL {
+        warn!("cannot restore the display mode of {device} ({r})");
+    }
+}
+
+/// A screen this source switched to another mode, and what to go back to.
+struct Fitted {
+    /// Index into `DuplSource::screens`.
+    screen: usize,
+    device: String,
+    /// The mode before the change, and the scale it was measured with: the
+    /// baseline for later fits (never fit to a mode bigger than this one).
+    original: DisplayMode,
+    scale: f64,
+    mode: DisplayMode,
+}
+
+// ---------------------------------------------------------------------------
 // Cursor
 
 /// Convert a DXGI pointer shape to straight-alpha RGBA. XOR ("invert the
@@ -414,6 +542,8 @@ pub struct DuplSource {
     /// A newer picture than the last encoded one, held back for the frame rate (its capture time).
     pending: Option<u64>,
     last_encode: Instant,
+    /// The streamed screen's mode was changed to fit the viewer (undone on drop).
+    fitted: Option<Fitted>,
 }
 
 // SAFETY: created on the host thread, then used only by the video thread.
@@ -489,6 +619,7 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
         warned_rotation: false,
         pending: None,
         last_encode: Instant::now() - Duration::from_secs(1),
+        fitted: None,
     };
     Ok((Box::new(src), Box::new(SendInputSink::new(target))))
 }
@@ -936,12 +1067,109 @@ impl VideoSource for DuplSource {
             self.force_key = true;
             return Ok(());
         }
+        // The screen we leave gets its own mode back first. That may move
+        // the other screens on the desktop (and interrupt their duplication).
+        let settle = if self.restore_fitted().is_some() { MODE_SETTLE } else { Duration::ZERO };
+        if let Err(e) = self.open_screen(idx, settle) {
+            if !settle.is_zero() {
+                // The old screen changed mode under its duplication: reopen it.
+                self.dupl = None;
+                self.desktop = None;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn fit_display(&mut self, size: Option<(u32, u32)>) -> media::Result<String> {
+        let Some(target) = size else {
+            let Some(f) = self.restore_fitted() else {
+                return Ok(self.mode_now()?.describe());
+            };
+            self.reopen_after_mode_change(f.screen)?;
+            return Ok(f.original.describe());
+        };
+        let idx = self.current;
+        if self.fitted.as_ref().is_some_and(|f| f.screen != idx) {
+            self.restore_fitted(); // not expected: switching screens restores
+        }
+        let device = self.screens[idx].device_name.clone();
+        let fitted = self.fitted.as_ref();
+        // Measure against the mode the screen had before we touched it.
+        let (original, scale) = match fitted {
+            Some(f) => (f.original, f.scale),
+            None => {
+                let scale = monitor_scale(&self.screens[idx].output);
+                (display_mode(&current_mode(&device)?, scale), scale)
+            }
+        };
+        let now = current_mode(&device)?;
+        let modes = display_modes(&device, &now, scale);
+        let list: Vec<DisplayMode> = modes.iter().map(|m| m.0).collect();
+        let Some(i) = media::pick_mode(&list, &original, target) else {
+            // The original mode fits best: undo an earlier fit, if any.
+            if self.restore_fitted().is_some() {
+                self.reopen_after_mode_change(idx)?;
+            }
+            self.force_key = true;
+            return Ok(original.describe());
+        };
+        let (mode, dm) = modes[i];
+        if fitted.is_some_and(|f| f.mode == mode) {
+            self.force_key = true;
+            return Ok(mode.describe());
+        }
+        apply_mode(&device, &dm)?;
+        info!(
+            "display {} set to {}x{} @ {} Hz (was {}x{}) to fit a {}x{} viewer",
+            self.screens[idx].name,
+            mode.pixel_width,
+            mode.pixel_height,
+            mode.refresh,
+            original.pixel_width,
+            original.pixel_height,
+            target.0,
+            target.1
+        );
+        self.fitted = Some(Fitted { screen: idx, device, original, scale, mode });
+        // The duplication is lost on a mode change (DXGI_ERROR_ACCESS_LOST)
+        // and the desktop has a new size: capture and encoder start over.
+        if let Err(e) = self.reopen_after_mode_change(idx) {
+            // Don't leave the screen changed behind an error.
+            if self.restore_fitted().is_some() {
+                let _ = self.reopen_after_mode_change(idx);
+            }
+            return Err(e);
+        }
+        Ok(mode.describe())
+    }
+}
+
+/// How long a screen may take to come back after a mode change before
+/// duplicating it works again.
+const MODE_SETTLE: Duration = Duration::from_secs(3);
+
+impl DuplSource {
+    /// Start capturing screen `idx` (another screen, or the same one after a
+    /// mode change): new duplication, new encoder if the size or GPU
+    /// changed, input mapped onto it. On failure the current capture is
+    /// left alone. `settle`: keep retrying the duplication that long (a
+    /// screen is briefly unavailable right after a mode change).
+    fn open_screen(&mut self, idx: usize, settle: Duration) -> media::Result<()> {
         let s = self.screens[idx].clone();
         let same_gpu = (s.adapter.luid.LowPart, s.adapter.luid.HighPart) == self.gpu.luid;
         // Set up the new screen first so a failure leaves the old one running.
         let gpu = if same_gpu { None } else { Some(Gpu::new(&s.adapter)?) };
         let dev = gpu.as_ref().map_or(&self.gpu.dev, |g| &g.dev);
-        let dupl = duplicate(dev, &s.output)?;
+        let deadline = Instant::now() + settle;
+        let dupl = loop {
+            match duplicate(dev, &s.output) {
+                Ok(d) => break d,
+                Err(e) if Instant::now() >= deadline => return Err(e.into()),
+                Err(e) => debug!("{e}; retrying"),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
         let size = dupl_size(&dupl);
         let out = fit(size.0, size.1, self.opts.max_width, self.opts.max_height);
         self.dupl = None;
@@ -960,8 +1188,50 @@ impl VideoSource for DuplSource {
         self.cursor.dirty = true;
         self.cursor.shape_dirty = self.cursor.shape.is_some();
         self.force_key = true;
-        info!("switched to display {} ({}x{} → {}x{}, {})", s.name, size.0, size.1, out.0, out.1, self.enc.name);
+        self.reopen_failures = 0;
+        info!("capturing display {} ({}x{} → {}x{}, {})", s.name, size.0, size.1, out.0, out.1, self.enc.name);
         Ok(())
+    }
+
+    /// After screen `idx` changed mode: capture it again at its new size (if
+    /// it is the streamed one). If it doesn't come back in time, the normal
+    /// reopen path keeps trying from `next_frame`.
+    fn reopen_after_mode_change(&mut self, idx: usize) -> media::Result<()> {
+        if idx != self.current {
+            self.refresh_layout();
+            return Ok(());
+        }
+        // The old duplication is lost (DXGI wants it released before the
+        // output is duplicated again).
+        self.dupl = None;
+        self.desktop = None;
+        self.pending = None;
+        self.force_key = true;
+        self.open_screen(idx, MODE_SETTLE)
+    }
+
+    /// Undo a mode change, if any: the screen goes back to its saved mode.
+    fn restore_fitted(&mut self) -> Option<Fitted> {
+        let f = self.fitted.take()?;
+        info!("display {}: back to {}x{}", f.device, f.original.pixel_width, f.original.pixel_height);
+        restore_mode(&f.device);
+        Some(f)
+    }
+
+    /// The streamed screen's mode as it is now.
+    fn mode_now(&self) -> Result<DisplayMode, String> {
+        let s = &self.screens[self.current];
+        Ok(display_mode(&current_mode(&s.device_name)?, monitor_scale(&s.output)))
+    }
+}
+
+impl Drop for DuplSource {
+    fn drop(&mut self) {
+        // A session never leaves a screen in the viewer's mode.
+        if self.fitted.is_some() {
+            self.dupl = None;
+            self.restore_fitted();
+        }
     }
 }
 

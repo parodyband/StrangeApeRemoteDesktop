@@ -68,6 +68,11 @@ impl std::fmt::Display for NetError {
                         " Allow Sard in System Settings → Privacy & Security → Local Network \
                          (macOS asks the first time), then try again.",
                     )
+                } else if cfg!(target_os = "ios") && is_lan(addr.ip()) {
+                    f.write_str(
+                        " Allow Sard in Settings → Privacy & Security → Local Network \
+                         (iOS asks the first time), then try again.",
+                    )
                 } else {
                     f.write_str(" Check that both computers are on the same network.")
                 }
@@ -101,11 +106,19 @@ pub struct NetConfig {
     pub pace_mbps: u32,
     /// Socket buffer size request (bytes).
     pub socket_buffer: usize,
+    /// Client side: which session lane to open (`proto::lane`).
+    pub lane: u8,
 }
 
 impl Default for NetConfig {
     fn default() -> Self {
-        Self { max_datagram: 1400, name: crate::config::hostname(), pace_mbps: 0, socket_buffer: 8 << 20 }
+        Self {
+            max_datagram: 1400,
+            name: crate::config::hostname(),
+            pace_mbps: 0,
+            socket_buffer: 8 << 20,
+            lane: crate::proto::lane::SCREEN,
+        }
     }
 }
 
@@ -216,6 +229,8 @@ struct Conn {
     remote_index: u32,
     remote_static: [u8; 32],
     remote_name: String,
+    /// Session lane (`proto::lane`) the client opened this session in.
+    lane: u8,
     send_cipher: TransportCipher,
     recv_cipher: TransportCipher,
     send_counter: AtomicU64,
@@ -251,6 +266,7 @@ impl Conn {
         remote_index: u32,
         remote_static: [u8; 32],
         remote_name: String,
+        lane: u8,
         send: TransportCipher,
         recv: TransportCipher,
         cfg: &NetConfig,
@@ -271,6 +287,7 @@ impl Conn {
             remote_index,
             remote_static,
             remote_name,
+            lane,
             send_cipher: send,
             recv_cipher: recv,
             send_counter: AtomicU64::new(0),
@@ -670,6 +687,23 @@ impl Connection {
         lock(&self.conn.io).peer
     }
 
+    /// Both handles refer to the same session.
+    pub fn same_session(&self, other: &Connection) -> bool {
+        Arc::ptr_eq(&self.conn, &other.conn)
+    }
+
+    /// Session lane the client opened (`proto::lane`).
+    pub fn lane(&self) -> u8 {
+        self.conn.lane
+    }
+
+    /// Reliable-channel segments sent but not yet acknowledged: bulk senders
+    /// (terminal output) wait while this is high instead of queueing without
+    /// bound.
+    pub fn reliable_backlog(&self) -> usize {
+        lock(&self.conn.state).reliable.unacked_len()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.conn.closed.load(Ordering::Relaxed)
     }
@@ -897,7 +931,8 @@ struct Shared {
     handshake_bucket: Mutex<TokenBucket>,
     on_paired: Mutex<Option<PairedFn>>,
     accept_tx: Mutex<Option<Sender<Connection>>>,
-    hs_cache: Mutex<HashMap<[u8; 32], HandshakeCache>>,
+    /// Keyed by (client key, lane): each lane has its own replay window.
+    hs_cache: Mutex<HashMap<([u8; 32], u8), HandshakeCache>>,
     last_untrusted_warn: AtomicU64,
     /// Testing aid: drop this fraction of incoming DATA packets (`SARD_SIM_LOSS`).
     sim_loss: f64,
@@ -1289,7 +1324,7 @@ impl Shared {
         // Replay protection + idempotent retransmits.
         {
             let cache = lock(&self.hs_cache);
-            if let Some(c) = cache.get(&rs) {
+            if let Some(c) = cache.get(&(rs, hello.lane)) {
                 if c.msg1_hash == msg1_hash {
                     let _ = self.socket.send_to(&c.response, from);
                     return Ok(());
@@ -1302,8 +1337,12 @@ impl Shared {
         }
 
         let local_index = self.new_index();
-        let reply =
-            HelloPayload { version: PROTOCOL_VERSION, timestamp: clock::unix_ns(), name: self.cfg.name.clone() };
+        let reply = HelloPayload {
+            version: PROTOCOL_VERSION,
+            timestamp: clock::unix_ns(),
+            name: self.cfg.name.clone(),
+            lane: 0,
+        };
         let (msg2, out) = resp.write_message2(&reply.encode())?;
         let mut response = Vec::with_capacity(9 + msg2.len());
         response.put_u8(packet::HANDSHAKE_RESP);
@@ -1311,10 +1350,15 @@ impl Shared {
         response.put_u32(sender_index);
         response.put_bytes(&msg2);
 
-        // Replace any previous session with the same peer.
+        // Replace any previous session with the same peer in the same lane
+        // (a reconnect); other lanes (a terminal next to a screen) stay.
         {
             let mut sessions = lock(&self.sessions);
-            let old: Vec<u32> = sessions.iter().filter(|(_, c)| c.remote_static == rs).map(|(k, _)| *k).collect();
+            let old: Vec<u32> = sessions
+                .iter()
+                .filter(|(_, c)| c.remote_static == rs && c.lane == hello.lane)
+                .map(|(k, _)| *k)
+                .collect();
             for k in old {
                 if let Some(c) = sessions.remove(&k) {
                     // Tell the old endpoint (if it is still alive) before dropping it.
@@ -1331,7 +1375,7 @@ impl Shared {
             Some(s) => ConnIo { socket: Arc::clone(s), peer: from, connected: true, relay: None },
             None => ConnIo { socket: Arc::clone(&self.socket), peer: from, connected: false, relay: None },
         };
-        let conn = Conn::new(io, local_index, sender_index, rs, display, out.send, out.recv, &self.cfg);
+        let conn = Conn::new(io, local_index, sender_index, rs, display, hello.lane, out.send, out.recv, &self.cfg);
         lock(&self.sessions).insert(local_index, Arc::clone(&conn));
         if let Some(s) = session_socket {
             self.spawn_session_reader(s, Arc::clone(&conn));
@@ -1344,7 +1388,8 @@ impl Shared {
                 recent.pop_front();
             }
         }
-        lock(&self.hs_cache).insert(rs, HandshakeCache { timestamp: hello.timestamp, msg1_hash, response });
+        lock(&self.hs_cache)
+            .insert((rs, hello.lane), HandshakeCache { timestamp: hello.timestamp, msg1_hash, response });
         info!("{} connected from {from}", conn.remote_name);
         if let Some(tx) = lock(&self.accept_tx).as_ref() {
             let _ = tx.send(Connection { conn, endpoint: Arc::clone(self), _guard: None });
@@ -1376,8 +1421,12 @@ impl Shared {
             }
         };
         p.initiator = None;
-        let mut hello =
-            HelloPayload::decode(&payload).unwrap_or(HelloPayload { version: 0, timestamp: 0, name: String::new() });
+        let mut hello = HelloPayload::decode(&payload).unwrap_or(HelloPayload {
+            version: 0,
+            timestamp: 0,
+            name: String::new(),
+            lane: 0,
+        });
         hello.name = crate::config::clean_display(&hello.name);
         let result = if hello.version != PROTOCOL_VERSION {
             Err(NetError::Rejected(format!("host speaks protocol v{}", hello.version)))
@@ -1400,6 +1449,7 @@ impl Shared {
                 sender_index,
                 out.remote_static,
                 hello.name,
+                self.cfg.lane,
                 out.send,
                 out.recv,
                 &self.cfg,
@@ -1588,7 +1638,7 @@ impl Shared {
 fn raise_thread_priority() {
     #[cfg(windows)]
     win_timing::raise_thread_priority();
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     // SAFETY: plain libc call on the current thread.
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
@@ -1876,7 +1926,12 @@ impl Client {
         }
         let local_index = shared.new_index();
         let mut ini = IkInitiator::new(&identity, host_key, IK_PROLOGUE);
-        let hello = HelloPayload { version: PROTOCOL_VERSION, timestamp: clock::unix_ns(), name: cfg.name.clone() };
+        let hello = HelloPayload {
+            version: PROTOCOL_VERSION,
+            timestamp: clock::unix_ns(),
+            name: cfg.name.clone(),
+            lane: cfg.lane,
+        };
         let msg1 = ini.write_message1(&hello.encode())?;
         let mut pkt = Vec::with_capacity(5 + msg1.len());
         pkt.put_u8(packet::HANDSHAKE_INIT);

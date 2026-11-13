@@ -109,6 +109,7 @@ pub enum Platform {
     Linux = 1,
     MacOs = 2,
     Windows = 3,
+    Ios = 4,
 }
 
 impl Platform {
@@ -119,6 +120,8 @@ impl Platform {
             Platform::MacOs
         } else if cfg!(target_os = "windows") {
             Platform::Windows
+        } else if cfg!(target_os = "ios") {
+            Platform::Ios
         } else {
             Platform::Unknown
         }
@@ -128,6 +131,7 @@ impl Platform {
             1 => Platform::Linux,
             2 => Platform::MacOs,
             3 => Platform::Windows,
+            4 => Platform::Ios,
             _ => Platform::Unknown,
         }
     }
@@ -140,6 +144,9 @@ pub mod client_flags {
     pub const LOCAL_CURSOR: u32 = 1 << 1;
     /// Client can decode 4:4:4 chroma.
     pub const YUV444: u32 = 1 << 2;
+    /// Terminal-only session: no video, audio, input or clipboard, just
+    /// shells (see `Control::ShellOpen`). Sent in the [`lane::TERMINAL`] lane.
+    pub const TERMINAL: u32 = 1 << 3;
 }
 
 /// Sent by the client right after the handshake.
@@ -158,6 +165,11 @@ pub struct ClientHello {
     pub flags: u32,
     /// Index of the host display the client wants (0 = primary / host choice).
     pub display: u8,
+    /// "Fit to this screen": switch the streamed display to the mode closest
+    /// to this desktop size (logical pixels) for the session; 0x0 = leave the
+    /// display alone. Trailing fields: older clients omit them.
+    pub fit_width: u16,
+    pub fit_height: u16,
 }
 
 /// Host → client description of the video stream. Sent before the first
@@ -247,6 +259,81 @@ pub enum Control {
     SelectDisplay {
         id: u32,
     },
+    /// Client → host: switch the streamed display to the mode closest to this
+    /// desktop size (logical pixels) until the session ends; 0x0 restores it.
+    FitDisplay {
+        width: u16,
+        height: u16,
+    },
+    /// Client → host: start a shell (`id` 0) or reattach to a running one
+    /// (`id` from [`Control::Shells`]). The host answers with
+    /// [`Control::ShellOpened`] or [`Control::ShellRefused`] carrying `token`.
+    ShellOpen {
+        token: u32,
+        id: u32,
+        cols: u16,
+        rows: u16,
+    },
+    /// Host → client: the shell is running. `resumed`: it was already running
+    /// (reattached); its recent output follows.
+    ShellOpened {
+        token: u32,
+        id: u32,
+        name: String,
+        resumed: bool,
+    },
+    /// Host → client: no shell (terminal access is off, unknown id, ...).
+    ShellRefused {
+        token: u32,
+        reason: String,
+    },
+    /// Terminal bytes: client → host is keyboard input, host → client output.
+    /// The client acknowledges each output message with [`Control::ShellAck`]
+    /// once it has consumed it: the host keeps only a window of
+    /// unacknowledged output in flight, so a slow client slows the shell
+    /// down instead of overflowing.
+    ShellData {
+        id: u32,
+        data: Vec<u8>,
+    },
+    /// Client → host: `count` more output messages of shell `id` consumed.
+    ShellAck {
+        id: u32,
+        count: u32,
+    },
+    ShellResize {
+        id: u32,
+        cols: u16,
+        rows: u16,
+    },
+    /// Client → host: end the shell (hang up).
+    ShellClose {
+        id: u32,
+    },
+    /// Host → client: the shell ended.
+    ShellExit {
+        id: u32,
+        message: String,
+    },
+    /// Client → host: list this client's shells (answered with `Shells`).
+    ShellList,
+    /// Host → client: this client's shells, including ones kept running since
+    /// an earlier session. Also sent once at the start of a terminal session.
+    Shells {
+        list: Vec<ShellInfo>,
+    },
+}
+
+/// A shell kept by the host for one client.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShellInfo {
+    pub id: u32,
+    /// e.g. "zsh"
+    pub name: String,
+    /// Some session currently shows it.
+    pub attached: bool,
+    /// Seconds since it started.
+    pub age_s: u32,
 }
 
 /// A display the host can stream.
@@ -279,6 +366,17 @@ mod tag {
     pub const STATUS: u8 = 12;
     pub const DISPLAYS: u8 = 13;
     pub const SELECT_DISPLAY: u8 = 14;
+    pub const FIT_DISPLAY: u8 = 15;
+    pub const SHELL_OPEN: u8 = 16;
+    pub const SHELL_OPENED: u8 = 17;
+    pub const SHELL_REFUSED: u8 = 18;
+    pub const SHELL_DATA: u8 = 19;
+    pub const SHELL_RESIZE: u8 = 20;
+    pub const SHELL_CLOSE: u8 = 21;
+    pub const SHELL_EXIT: u8 = 22;
+    pub const SHELL_LIST: u8 = 23;
+    pub const SHELLS: u8 = 24;
+    pub const SHELL_ACK: u8 = 25;
 }
 
 impl Control {
@@ -296,6 +394,8 @@ impl Control {
                 b.put_u32(h.bitrate_kbps);
                 b.put_u32(h.flags);
                 b.put_u8(h.display);
+                b.put_u16(h.fit_width);
+                b.put_u16(h.fit_height);
             }
             Control::StreamConfig(c) => {
                 b.put_u8(tag::STREAM_CONFIG);
@@ -375,6 +475,66 @@ impl Control {
                 b.put_u8(tag::SELECT_DISPLAY);
                 b.put_u32(*id);
             }
+            Control::FitDisplay { width, height } => {
+                b.put_u8(tag::FIT_DISPLAY);
+                b.put_u16(*width);
+                b.put_u16(*height);
+            }
+            Control::ShellOpen { token, id, cols, rows } => {
+                b.put_u8(tag::SHELL_OPEN);
+                b.put_u32(*token);
+                b.put_u32(*id);
+                b.put_u16(*cols);
+                b.put_u16(*rows);
+            }
+            Control::ShellOpened { token, id, name, resumed } => {
+                b.put_u8(tag::SHELL_OPENED);
+                b.put_u32(*token);
+                b.put_u32(*id);
+                b.put_str(name);
+                b.put_u8(*resumed as u8);
+            }
+            Control::ShellRefused { token, reason } => {
+                b.put_u8(tag::SHELL_REFUSED);
+                b.put_u32(*token);
+                b.put_str(reason);
+            }
+            Control::ShellData { id, data } => {
+                b.put_u8(tag::SHELL_DATA);
+                b.put_u32(*id);
+                b.put_blob32(data);
+            }
+            Control::ShellAck { id, count } => {
+                b.put_u8(tag::SHELL_ACK);
+                b.put_u32(*id);
+                b.put_u32(*count);
+            }
+            Control::ShellResize { id, cols, rows } => {
+                b.put_u8(tag::SHELL_RESIZE);
+                b.put_u32(*id);
+                b.put_u16(*cols);
+                b.put_u16(*rows);
+            }
+            Control::ShellClose { id } => {
+                b.put_u8(tag::SHELL_CLOSE);
+                b.put_u32(*id);
+            }
+            Control::ShellExit { id, message } => {
+                b.put_u8(tag::SHELL_EXIT);
+                b.put_u32(*id);
+                b.put_str(message);
+            }
+            Control::ShellList => b.put_u8(tag::SHELL_LIST),
+            Control::Shells { list } => {
+                b.put_u8(tag::SHELLS);
+                b.put_u8(list.len().min(64) as u8);
+                for i in list.iter().take(64) {
+                    b.put_u32(i.id);
+                    b.put_str(&i.name);
+                    b.put_u8(i.attached as u8);
+                    b.put_u32(i.age_s);
+                }
+            }
         }
         b
     }
@@ -392,6 +552,8 @@ impl Control {
                 bitrate_kbps: r.u32()?,
                 flags: r.u32()?,
                 display: r.u8().unwrap_or(0),
+                fit_width: r.u16().unwrap_or(0),
+                fit_height: r.u16().unwrap_or(0),
             }),
             tag::STREAM_CONFIG => Control::StreamConfig(StreamConfig {
                 codec: Codec::from_u8(r.u8()?).ok_or(WireError)?,
@@ -439,6 +601,26 @@ impl Control {
                 Control::Displays { current, list }
             }
             tag::SELECT_DISPLAY => Control::SelectDisplay { id: r.u32()? },
+            tag::FIT_DISPLAY => Control::FitDisplay { width: r.u16()?, height: r.u16()? },
+            tag::SHELL_OPEN => Control::ShellOpen { token: r.u32()?, id: r.u32()?, cols: r.u16()?, rows: r.u16()? },
+            tag::SHELL_OPENED => {
+                Control::ShellOpened { token: r.u32()?, id: r.u32()?, name: r.str()?, resumed: r.u8()? != 0 }
+            }
+            tag::SHELL_REFUSED => Control::ShellRefused { token: r.u32()?, reason: r.str()? },
+            tag::SHELL_DATA => Control::ShellData { id: r.u32()?, data: r.blob32()?.to_vec() },
+            tag::SHELL_ACK => Control::ShellAck { id: r.u32()?, count: r.u32()? },
+            tag::SHELL_RESIZE => Control::ShellResize { id: r.u32()?, cols: r.u16()?, rows: r.u16()? },
+            tag::SHELL_CLOSE => Control::ShellClose { id: r.u32()? },
+            tag::SHELL_EXIT => Control::ShellExit { id: r.u32()?, message: r.str()? },
+            tag::SHELL_LIST => Control::ShellList,
+            tag::SHELLS => {
+                let n = r.u8()? as usize;
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    list.push(ShellInfo { id: r.u32()?, name: r.str()?, attached: r.u8()? != 0, age_s: r.u32()? });
+                }
+                Control::Shells { list }
+            }
             _ => return Err(WireError),
         })
     }
@@ -451,6 +633,18 @@ pub struct HelloPayload {
     /// Wall-clock ns; host rejects replays of older handshakes.
     pub timestamp: u64,
     pub name: String,
+    /// Which of the client's parallel sessions this is (see [`lane`]). A new
+    /// session replaces an older one from the same client only in the same
+    /// lane. Trailing field: older peers omit it (= [`lane::SCREEN`]).
+    pub lane: u8,
+}
+
+/// Session lanes: one client can hold one session per lane at a time.
+pub mod lane {
+    /// Remote desktop (video, audio, input). Also what older clients use.
+    pub const SCREEN: u8 = 0;
+    /// Terminal only.
+    pub const TERMINAL: u8 = 1;
 }
 
 impl HelloPayload {
@@ -459,11 +653,12 @@ impl HelloPayload {
         b.put_u16(self.version);
         b.put_u64(self.timestamp);
         b.put_str(&self.name);
+        b.put_u8(self.lane);
         b
     }
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf);
-        Ok(Self { version: r.u16()?, timestamp: r.u64()?, name: r.str()? })
+        Ok(Self { version: r.u16()?, timestamp: r.u64()?, name: r.str()?, lane: r.u8().unwrap_or(lane::SCREEN) })
     }
 }
 
@@ -578,6 +773,8 @@ mod tests {
                 bitrate_kbps: 80_000,
                 flags: client_flags::AUDIO,
                 display: 1,
+                fit_width: 1280,
+                fit_height: 590,
             }),
             Control::StreamConfig(StreamConfig {
                 codec: Codec::Hevc,
@@ -614,6 +811,17 @@ mod tests {
                 ],
             },
             Control::SelectDisplay { id: 2 },
+            Control::FitDisplay { width: 1280, height: 590 },
+            Control::ShellOpen { token: 7, id: 0, cols: 80, rows: 24 },
+            Control::ShellOpened { token: 7, id: 3, name: "zsh".into(), resumed: true },
+            Control::ShellRefused { token: 8, reason: "off".into() },
+            Control::ShellData { id: 3, data: b"ls -la\r\x1b[A".to_vec() },
+            Control::ShellAck { id: 3, count: 2 },
+            Control::ShellResize { id: 3, cols: 120, rows: 40 },
+            Control::ShellClose { id: 3 },
+            Control::ShellExit { id: 3, message: "exited with status 0".into() },
+            Control::ShellList,
+            Control::Shells { list: vec![ShellInfo { id: 3, name: "zsh".into(), attached: false, age_s: 600 }] },
         ];
         for m in msgs {
             assert_eq!(Control::decode(&m.encode()).unwrap(), m);
@@ -625,5 +833,30 @@ mod tests {
             AudioPacket { seq: 7, capture_us: 99, samples: vec![1, -2, 3, -4] }
         );
         assert!(Control::decode(&[tag::KEY, 1]).is_err());
+    }
+
+    /// Trailing fields added later decode from older peers' shorter messages.
+    #[test]
+    fn older_peers_messages_still_decode() {
+        let hello = ClientHello {
+            platform: Platform::Linux,
+            decoders: Codec::Hevc.bit(),
+            codec_pref: 0,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 60,
+            bitrate_kbps: 0,
+            flags: 0,
+            display: 2,
+            fit_width: 0,
+            fit_height: 0,
+        };
+        let mut old = Control::ClientHello(hello.clone()).encode();
+        old.truncate(old.len() - 4); // no fit size
+        assert_eq!(Control::decode(&old).unwrap(), Control::ClientHello(hello));
+        let h = HelloPayload { version: 1, timestamp: 5, name: "old".into(), lane: lane::SCREEN };
+        let mut old = HelloPayload { lane: lane::TERMINAL, ..h.clone() }.encode();
+        old.pop(); // no lane
+        assert_eq!(HelloPayload::decode(&old).unwrap(), h);
     }
 }

@@ -71,6 +71,10 @@ pub struct HostStatus {
     pub missing_permissions: Vec<String>,
     /// Connect Anywhere (None: not set up on this device).
     pub anywhere: Option<sard_core::anywhere::AgentStatus>,
+    /// Paired devices may open shells here.
+    pub terminal_allowed: bool,
+    /// Devices with a terminal session open right now.
+    pub terminal_clients: Vec<String>,
 }
 
 type ChangeFn = Box<dyn Fn() + Send + Sync>;
@@ -80,6 +84,9 @@ struct ServiceState {
     stop: AtomicBool,
     /// Current session (connection) so it can be kicked.
     current: Mutex<Option<Connection>>,
+    /// Terminal sessions (any number, next to the screen session).
+    terminal_sessions: Mutex<Vec<Connection>>,
+    terminals: Arc<crate::terminal::Terminals>,
     on_change: ChangeFn,
 }
 
@@ -123,6 +130,8 @@ impl HostService {
             }),
             stop: AtomicBool::new(false),
             current: Mutex::new(None),
+            terminal_sessions: Mutex::new(Vec::new()),
+            terminals: crate::terminal::Terminals::new(args.flag("terminal")),
             on_change,
         });
         let paired_state = Arc::clone(&state);
@@ -187,8 +196,17 @@ impl HostService {
 
     pub fn status(&self) -> HostStatus {
         let anywhere = self.anywhere.as_ref().map(sard_core::anywhere::HostAgent::status);
+        let terminal_clients: Vec<String> = {
+            let mut sessions = self.state.terminal_sessions.lock().unwrap();
+            sessions.retain(|c| !c.is_closed());
+            let mut names: Vec<String> = sessions.iter().map(|c| config::clean_display(c.peer_name())).collect();
+            names.dedup();
+            names
+        };
         let mut s = self.state.status.lock().unwrap();
         s.anywhere = anywhere;
+        s.terminal_allowed = self.state.terminals.allowed();
+        s.terminal_clients = terminal_clients;
         // Cheap, and the network may have changed since the service started
         // (Wi-Fi joined after login, a new DHCP lease).
         s.ips = local_ips();
@@ -214,11 +232,24 @@ impl HostService {
         code
     }
 
+    /// Let paired devices open shells on this computer (or not: turning it
+    /// off ends running shells).
+    pub fn set_terminal_allowed(&self, on: bool) {
+        if self.state.terminals.allowed() != on {
+            self.state.terminals.set_allowed(on);
+            (self.state.on_change)();
+        }
+    }
+
     /// Revoke a paired device: it can't connect any more (and is disconnected
     /// if it is viewing right now).
     pub fn remove_device(&self, key: &[u8; 32]) -> Result<()> {
         self.host.untrust(key);
         self.trust.lock().unwrap().remove(key)?;
+        self.state.terminals.remove_device(key);
+        for c in self.state.terminal_sessions.lock().unwrap().iter().filter(|c| &c.peer_key() == key) {
+            c.close();
+        }
         let current = self.state.current.lock().unwrap().clone();
         if let Some(c) = current
             && &c.peer_key() == key
@@ -245,6 +276,10 @@ impl Drop for HostService {
     fn drop(&mut self) {
         self.state.stop.store(true, Ordering::Relaxed);
         self.disconnect_viewer();
+        self.state.terminals.shutdown();
+        for c in self.state.terminal_sessions.lock().unwrap().drain(..) {
+            c.close();
+        }
         if let Some(t) = self.accept.take() {
             let _ = t.join();
         }
@@ -253,51 +288,84 @@ impl Drop for HostService {
 }
 
 fn accept_loop(host: &Host, state: Arc<ServiceState>, args: &Args) {
-    // One session at a time; a new client takes over from the current one
-    // (personal use: reconnecting from another machine should just work).
+    // One screen session at a time; a new viewer takes over from the current
+    // one (personal use: reconnecting from another machine should just work).
+    // Terminal sessions run alongside, any number of them. What a connection
+    // is for is only known from its hello, so each new connection first
+    // waits for that on its own thread.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<(Connection, Receiver<Event>, ClientHello)>();
     let mut current: Option<std::thread::JoinHandle<()>> = None;
     while !state.stop.load(Ordering::Relaxed) {
-        let Some(conn) = host.accept(Duration::from_millis(250)) else {
-            continue;
-        };
-        if let Some(handle) = current.take() {
-            let old = state.current.lock().unwrap().take();
-            if let Some(old) = old
-                && !old.is_closed()
-            {
-                info!("{} connected; ending the session with {}", conn.peer_name(), old.peer_name());
-                old.send_control(&Control::Status { text: format!("{} took over this host", conn.peer_name()) });
-                std::thread::sleep(Duration::from_millis(50));
-                old.close();
-            }
-            let _ = handle.join();
-        }
-        info!("session start: {} from {}", conn.peer_name(), conn.peer_addr());
-        *state.current.lock().unwrap() = Some(conn.clone());
-        state.status.lock().unwrap().viewer = Some(config::clean_display(conn.peer_name()));
-        (state.on_change)();
-        let (a, state) = (args.clone(), Arc::clone(&state));
-        let r = std::thread::Builder::new().name("sard-session".into()).spawn({
-            move || {
-                match serve(&conn, &a) {
-                    Ok(()) => info!("session with {} ended", conn.peer_name()),
+        if let Some(conn) = host.accept(Duration::from_millis(100)) {
+            let (tx, state) = (ready_tx.clone(), Arc::clone(&state));
+            let r = std::thread::Builder::new().name("sard-hello".into()).spawn(move || {
+                let Some(events) = conn.take_events() else { return };
+                match wait_hello(&events) {
+                    Ok(h) if h.flags & client_flags::TERMINAL != 0 => serve_terminal(conn, events, &state),
+                    Ok(h) => {
+                        let _ = tx.send((conn, events, h));
+                    }
                     Err(e) => {
-                        error!("session with {} failed: {e}", conn.peer_name());
-                        conn.send_control(&Control::Status { text: format!("host error: {e}") });
-                        std::thread::sleep(Duration::from_millis(200));
+                        info!("{} did not start a session: {e}", conn.peer_name());
+                        conn.close();
                     }
                 }
-                conn.close();
-                // Unless a newer viewer already took over (it holds `current`).
-                if state.current.lock().unwrap().take().is_some() {
-                    state.status.lock().unwrap().viewer = None;
-                    (state.on_change)();
-                }
+            });
+            if let Err(e) = r {
+                error!("cannot start session thread: {e}");
             }
-        });
-        match r {
-            Ok(h) => current = Some(h),
-            Err(e) => error!("cannot start session thread: {e}"),
+        }
+        while let Ok((conn, events, hello)) = ready_rx.try_recv() {
+            if conn.is_closed() {
+                continue;
+            }
+            if let Some(handle) = current.take() {
+                let old = state.current.lock().unwrap().take();
+                if let Some(old) = old
+                    && !old.is_closed()
+                {
+                    info!("{} connected; ending the session with {}", conn.peer_name(), old.peer_name());
+                    old.send_control(&Control::Status { text: format!("{} took over this host", conn.peer_name()) });
+                    std::thread::sleep(Duration::from_millis(50));
+                    old.close();
+                }
+                let _ = handle.join();
+            }
+            info!("session start: {} from {}", conn.peer_name(), conn.peer_addr());
+            *state.current.lock().unwrap() = Some(conn.clone());
+            state.status.lock().unwrap().viewer = Some(config::clean_display(conn.peer_name()));
+            (state.on_change)();
+            let (a, state) = (args.clone(), Arc::clone(&state));
+            let r = std::thread::Builder::new().name("sard-session".into()).spawn({
+                move || {
+                    match serve(&conn, events, hello, &a) {
+                        Ok(()) => info!("session with {} ended", conn.peer_name()),
+                        Err(e) => {
+                            error!("session with {} failed: {e}", conn.peer_name());
+                            conn.send_control(&Control::Status { text: format!("host error: {e}") });
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                    conn.close();
+                    // Unless a newer viewer already took over (it holds `current`).
+                    let mine = {
+                        let mut cur = state.current.lock().unwrap();
+                        let mine = cur.as_ref().is_some_and(|c| c.same_session(&conn));
+                        if mine {
+                            *cur = None;
+                        }
+                        mine
+                    };
+                    if mine {
+                        state.status.lock().unwrap().viewer = None;
+                        (state.on_change)();
+                    }
+                }
+            });
+            match r {
+                Ok(h) => current = Some(h),
+                Err(e) => error!("cannot start session thread: {e}"),
+            }
         }
     }
     if let Some(c) = state.current.lock().unwrap().take() {
@@ -307,6 +375,20 @@ fn accept_loop(host: &Host, state: Arc<ServiceState>, args: &Args) {
         let _ = h.join();
     }
 }
+
+/// A terminal session (on its own thread, next to any screen session).
+fn serve_terminal(conn: Connection, events: Receiver<Event>, state: &ServiceState) {
+    info!("terminal session: {} from {}", conn.peer_name(), conn.peer_addr());
+    state.terminal_sessions.lock().unwrap().push(conn.clone());
+    (state.on_change)();
+    if let Err(e) = crate::terminal::serve(&conn, events, &state.terminals) {
+        error!("terminal session with {} failed: {e}", conn.peer_name());
+    }
+    conn.close();
+    state.terminal_sessions.lock().unwrap().retain(|c| !c.same_session(&conn));
+    (state.on_change)();
+}
+
 fn negotiate(hello: &ClientHello, args: &Args) -> Result<SourceOptions> {
     let host_enc = platform::encoders();
     let both = host_enc & hello.decoders;
@@ -402,6 +484,9 @@ struct Shared {
     bitrate_kbps: AtomicU32,
     /// Display the client asked for (applied by the video thread).
     select_display: Mutex<Option<u32>>,
+    /// Pending "fit to the viewer's screen" request: Some(Some(size)) fits,
+    /// Some(None) restores (applied by the video thread, which owns the source).
+    fit: Mutex<Option<Option<(u32, u32)>>>,
 }
 
 fn displays_msg(source: &dyn VideoSource) -> Option<Control> {
@@ -410,9 +495,7 @@ fn displays_msg(source: &dyn VideoSource) -> Option<Control> {
     (!list.is_empty()).then_some(Control::Displays { current, list })
 }
 
-fn serve(conn: &Connection, args: &Args) -> Result<()> {
-    let events = conn.take_events().ok_or("events already taken")?;
-    let hello = wait_hello(&events)?;
+fn serve(conn: &Connection, events: Receiver<Event>, hello: ClientHello, args: &Args) -> Result<()> {
     info!(
         "client {} ({:?}): decoders {:#x}, max {}x{}@{}",
         conn.peer_name(),
@@ -496,6 +579,10 @@ fn serve(conn: &Connection, args: &Args) -> Result<()> {
         keyframe: AtomicBool::new(true),
         bitrate_kbps: AtomicU32::new(ceiling),
         select_display: Mutex::new(None),
+        fit: Mutex::new(
+            (hello.fit_width > 0 && hello.fit_height > 0)
+                .then_some(Some((hello.fit_width as u32, hello.fit_height as u32))),
+        ),
     });
     let input_thread = {
         let shared = Arc::clone(&shared);
@@ -525,10 +612,45 @@ fn video_loop(
     let mut frame_bytes = Ema::new(0.05);
     let mut frames = 0u32;
     let mut last_log = Instant::now();
+    // Desktop size the viewer asked the display to fit (kept across display switches).
+    let mut fit_target: Option<(u32, u32)> = None;
+    let fit = |source: &mut dyn VideoSource, target: Option<(u32, u32)>| match source.fit_display(target) {
+        Ok(mode) => {
+            info!("display mode for this session: {mode}");
+            let text = match target {
+                Some(_) => format!("screen set to {mode} while you're connected"),
+                None => format!("screen back to {mode}"),
+            };
+            conn.send_control(&Control::Status { text });
+            true
+        }
+        Err(e) => {
+            warn!("cannot fit the display: {e}");
+            conn.send_control(&Control::Status { text: format!("can't change the screen resolution: {e}") });
+            false
+        }
+    };
     while !shared.stop.load(Ordering::Relaxed) && !conn.is_closed() {
+        if let Some(target) = shared.fit.lock().unwrap().take() {
+            let ok = fit(source, target);
+            fit_target = if ok { target } else { None };
+            // The capture was rebuilt at the new size; the client resets on StreamConfig.
+            let (w, h) = source.size();
+            size = (w, h);
+            conn.send_control(&stream_cfg(w, h, current_kbps));
+            if let Some(d) = displays_msg(source) {
+                conn.send_control(&d);
+            }
+        }
         if let Some(id) = shared.select_display.lock().unwrap().take() {
             match source.select_display(id) {
                 Ok(()) => {
+                    // The previous display got its own mode back; fit the new one.
+                    if let Some(t) = fit_target
+                        && !fit(source, Some(t))
+                    {
+                        fit_target = None;
+                    }
                     // A new display may have a new size; the client resets on StreamConfig.
                     let (w, h) = source.size();
                     size = (w, h);
@@ -747,6 +869,10 @@ fn input_loop(
                 Control::ReleaseAll => release_all(&mut pressed, &mut input),
                 Control::SelectDisplay { id } => {
                     *shared.select_display.lock().unwrap() = Some(id);
+                }
+                Control::FitDisplay { width, height } => {
+                    let size = (width > 0 && height > 0).then_some((width as u32, height as u32));
+                    *shared.fit.lock().unwrap() = Some(size);
                 }
                 Control::SetBitrate { kbps } => {
                     rc.ceiling = if kbps == 0 { ceiling } else { kbps };

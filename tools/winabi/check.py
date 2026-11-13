@@ -52,6 +52,7 @@ INCLUDES = """
 #include <ksmedia.h>
 #include <iphlpapi.h>
 #include <commctrl.h>
+#include <shellscalingapi.h>
 """
 
 # Rust name -> C name, where they differ.

@@ -419,6 +419,9 @@ pub struct ScreenSource {
     fps: u32,
     /// Viewer-drawn cursor: tracked here instead of drawn into the video.
     cursor: Option<crate::cursor::CursorTracker>,
+    /// The captured display was switched to a mode fitting the viewer
+    /// (restored when dropped). Declared last: dropped after the capture.
+    fitted: Option<crate::display_mode::Fitted>,
 }
 
 pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
@@ -474,6 +477,7 @@ impl ScreenSource {
             max_size,
             fps,
             cursor: metadata_cursor.then(crate::cursor::CursorTracker::default),
+            fitted: None,
         })
     }
 
@@ -612,7 +616,32 @@ impl VideoSource for ScreenSource {
             self.force_key = true;
             return Ok(());
         }
+        // The display we leave gets its own mode back.
+        if let Some(f) = self.fitted.take()
+            && let Err(e) = f.restore()
+        {
+            sard_core::warn!("cannot restore the display mode: {e}");
+        }
         autoreleasepool(|_| self.switch_to(id)).map_err(media::err)
+    }
+
+    fn fit_display(&mut self, size: Option<(u32, u32)>) -> media::Result<String> {
+        let id = self.display.id();
+        let mode = match size {
+            Some(target) => {
+                let (fitted, mode) =
+                    crate::display_mode::Fitted::new(id, target, self.fitted.take()).map_err(media::err)?;
+                self.fitted = fitted;
+                mode
+            }
+            None => match self.fitted.take() {
+                Some(f) => f.restore().map_err(media::err)?,
+                None => crate::display_mode::current(id).ok_or("cannot read the display mode")?.0,
+            },
+        };
+        // Same display, new size: restart capture and encoder.
+        autoreleasepool(|_| self.switch_to(id)).map_err(media::err)?;
+        Ok(mode.describe())
     }
 }
 

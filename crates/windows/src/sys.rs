@@ -19,6 +19,8 @@ pub type HMODULE = *mut c_void;
 pub type HGLOBAL = *mut c_void;
 pub type HKEY = *mut c_void;
 pub type HMONITOR = *mut c_void;
+/// A pseudoconsole (ConPTY).
+pub type HPCON = *mut c_void;
 pub type WPARAM = usize;
 pub type LPARAM = isize;
 pub type LRESULT = isize;
@@ -225,6 +227,120 @@ pub struct MONITORINFOEXW {
     pub szDevice: [u16; 32],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct COORD {
+    pub X: i16,
+    pub Y: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SMALL_RECT {
+    pub Left: i16,
+    pub Top: i16,
+    pub Right: i16,
+    pub Bottom: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CONSOLE_SCREEN_BUFFER_INFO {
+    pub dwSize: COORD,
+    pub dwCursorPosition: COORD,
+    pub wAttributes: u16,
+    pub srWindow: SMALL_RECT,
+    pub dwMaximumWindowSize: COORD,
+}
+
+#[repr(C)]
+pub struct STARTUPINFOW {
+    pub cb: u32,
+    pub lpReserved: *mut u16,
+    pub lpDesktop: *mut u16,
+    pub lpTitle: *mut u16,
+    pub dwX: u32,
+    pub dwY: u32,
+    pub dwXSize: u32,
+    pub dwYSize: u32,
+    pub dwXCountChars: u32,
+    pub dwYCountChars: u32,
+    pub dwFillAttribute: u32,
+    pub dwFlags: u32,
+    pub wShowWindow: u16,
+    pub cbReserved2: u16,
+    pub lpReserved2: *mut u8,
+    pub hStdInput: HANDLE,
+    pub hStdOutput: HANDLE,
+    pub hStdError: HANDLE,
+}
+
+#[repr(C)]
+pub struct STARTUPINFOEXW {
+    pub StartupInfo: STARTUPINFOW,
+    pub lpAttributeList: *mut c_void,
+}
+
+#[repr(C)]
+pub struct PROCESS_INFORMATION {
+    pub hProcess: HANDLE,
+    pub hThread: HANDLE,
+    pub dwProcessId: u32,
+    pub dwThreadId: u32,
+}
+
+/// `DEVMODEW` with the display variant of its unions (`dmPosition`,
+/// `dmDisplayOrientation`, `dmDisplayFixedOutput`; `dmDisplayFlags`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DEVMODEW {
+    pub dmDeviceName: [u16; 32],
+    pub dmSpecVersion: u16,
+    pub dmDriverVersion: u16,
+    pub dmSize: u16,
+    pub dmDriverExtra: u16,
+    pub dmFields: u32,
+    pub dmPosition: POINT,
+    pub dmDisplayOrientation: u32,
+    pub dmDisplayFixedOutput: u32,
+    pub dmColor: i16,
+    pub dmDuplex: i16,
+    pub dmYResolution: i16,
+    pub dmTTOption: i16,
+    pub dmCollate: i16,
+    pub dmFormName: [u16; 32],
+    pub dmLogPixels: u16,
+    pub dmBitsPerPel: u32,
+    pub dmPelsWidth: u32,
+    pub dmPelsHeight: u32,
+    pub dmDisplayFlags: u32,
+    pub dmDisplayFrequency: u32,
+    pub dmICMMethod: u32,
+    pub dmICMIntent: u32,
+    pub dmMediaType: u32,
+    pub dmDitherType: u32,
+    pub dmReserved1: u32,
+    pub dmReserved2: u32,
+    pub dmPanningWidth: u32,
+    pub dmPanningHeight: u32,
+}
+
+impl DEVMODEW {
+    /// Zeroed, with `dmSize` set (as `EnumDisplaySettingsExW` requires).
+    pub fn new() -> DEVMODEW {
+        // SAFETY: plain integers and arrays; all-zero is a valid value.
+        let mut dm: DEVMODEW = unsafe { std::mem::zeroed() };
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        dm
+    }
+}
+
+impl Default for DEVMODEW {
+    fn default() -> DEVMODEW {
+        DEVMODEW::new()
+    }
+}
+
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<GUID>() == 16);
@@ -242,6 +358,24 @@ const _: () = {
     assert!(size_of::<KEYBDINPUT>() == 24);
     assert!(size_of::<INPUT>() == 40);
     assert!(size_of::<MONITORINFOEXW>() == 104);
+    assert!(size_of::<COORD>() == 4);
+    assert!(size_of::<SMALL_RECT>() == 8);
+    assert!(size_of::<CONSOLE_SCREEN_BUFFER_INFO>() == 22);
+    assert!(offset_of!(CONSOLE_SCREEN_BUFFER_INFO, srWindow) == 10);
+    assert!(size_of::<STARTUPINFOW>() == 104);
+    assert!(offset_of!(STARTUPINFOW, dwFlags) == 60);
+    assert!(offset_of!(STARTUPINFOW, hStdInput) == 80);
+    assert!(size_of::<STARTUPINFOEXW>() == 112);
+    assert!(size_of::<PROCESS_INFORMATION>() == 24);
+    assert!(size_of::<DEVMODEW>() == 220);
+    assert!(offset_of!(DEVMODEW, dmFields) == 72);
+    assert!(offset_of!(DEVMODEW, dmPosition) == 76);
+    assert!(offset_of!(DEVMODEW, dmDisplayOrientation) == 84);
+    assert!(offset_of!(DEVMODEW, dmLogPixels) == 166);
+    assert!(offset_of!(DEVMODEW, dmBitsPerPel) == 168);
+    assert!(offset_of!(DEVMODEW, dmDisplayFlags) == 180);
+    assert!(offset_of!(DEVMODEW, dmDisplayFrequency) == 184);
+    assert!(offset_of!(DEVMODEW, dmPanningHeight) == 216);
 };
 
 // ---- window messages / styles ----
@@ -363,6 +497,45 @@ pub const RRF_RT_REG_SZ: u32 = 0x0000_0002;
 pub const ERROR_SUCCESS: i32 = 0;
 pub const ERROR_FILE_NOT_FOUND: i32 = 2;
 
+// ---- console ----
+pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+pub const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+pub const ENABLE_LINE_INPUT: u32 = 0x0002;
+pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
+pub const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+pub const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+pub const DISABLE_NEWLINE_AUTO_RETURN: u32 = 0x0008;
+pub const CP_UTF8: u32 = 65001;
+
+// ---- processes ----
+pub const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+pub const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: u32 = 0x0002_0016;
+pub const STILL_ACTIVE: u32 = 259;
+pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+pub const ERROR_HANDLE_EOF: i32 = 38;
+pub const ERROR_BROKEN_PIPE: i32 = 109;
+pub const ERROR_NO_DATA: i32 = 232;
+
+// ---- display modes ----
+pub const ENUM_CURRENT_SETTINGS: u32 = -1i32 as u32;
+pub const DM_DISPLAYORIENTATION: u32 = 0x0000_0080;
+pub const DM_BITSPERPEL: u32 = 0x0004_0000;
+pub const DM_PELSWIDTH: u32 = 0x0008_0000;
+pub const DM_PELSHEIGHT: u32 = 0x0010_0000;
+pub const DM_DISPLAYFLAGS: u32 = 0x0020_0000;
+pub const DM_DISPLAYFREQUENCY: u32 = 0x0040_0000;
+pub const DM_INTERLACED: u32 = 0x0000_0002;
+pub const CDS_FULLSCREEN: u32 = 0x0000_0004;
+pub const DISP_CHANGE_SUCCESSFUL: i32 = 0;
+pub const DISP_CHANGE_RESTART: i32 = 1;
+pub const DISP_CHANGE_BADMODE: i32 = -2;
+pub const MDT_EFFECTIVE_DPI: u32 = 0;
+pub const USER_DEFAULT_SCREEN_DPI: u32 = 96;
+
 // ---- COM ----
 pub const COINIT_MULTITHREADED: u32 = 0x0;
 pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
@@ -390,6 +563,39 @@ unsafe extern "system" {
     pub fn GetStdHandle(which: u32) -> HANDLE;
     pub fn SetStdHandle(which: u32, h: HANDLE) -> BOOL;
     pub fn GetCurrentThreadId() -> u32;
+    pub fn SetConsoleMode(h: HANDLE, mode: u32) -> BOOL;
+    pub fn GetConsoleCP() -> u32;
+    pub fn GetConsoleOutputCP() -> u32;
+    pub fn SetConsoleCP(cp: u32) -> BOOL;
+    pub fn SetConsoleOutputCP(cp: u32) -> BOOL;
+    pub fn GetConsoleScreenBufferInfo(h: HANDLE, info: *mut CONSOLE_SCREEN_BUFFER_INFO) -> BOOL;
+    pub fn ReadConsoleW(h: HANDLE, buf: *mut c_void, chars: u32, read: *mut u32, control: *mut c_void) -> BOOL;
+    pub fn CreatePipe(read: *mut HANDLE, write: *mut HANDLE, attrs: *const c_void, size: u32) -> BOOL;
+    pub fn InitializeProcThreadAttributeList(list: *mut c_void, count: u32, flags: u32, size: *mut usize) -> BOOL;
+    pub fn UpdateProcThreadAttribute(
+        list: *mut c_void,
+        flags: u32,
+        attribute: usize,
+        value: *const c_void,
+        size: usize,
+        previous: *mut c_void,
+        returned: *mut usize,
+    ) -> BOOL;
+    pub fn DeleteProcThreadAttributeList(list: *mut c_void);
+    pub fn CreateProcessW(
+        app: *const u16,
+        cmdline: *mut u16,
+        process_attrs: *const c_void,
+        thread_attrs: *const c_void,
+        inherit: BOOL,
+        flags: u32,
+        env: *const c_void,
+        cwd: *const u16,
+        startup: *const STARTUPINFOW,
+        info: *mut PROCESS_INFORMATION,
+    ) -> BOOL;
+    pub fn GetExitCodeProcess(process: HANDLE, code: *mut u32) -> BOOL;
+    pub fn TerminateProcess(process: HANDLE, code: u32) -> BOOL;
     pub fn FormatMessageW(
         flags: u32,
         source: *const c_void,
@@ -462,6 +668,14 @@ unsafe extern "system" {
     pub fn GetDlgItemTextW(hwnd: HWND, id: i32, buf: *mut u16, max: i32) -> u32;
     pub fn GetWindowTextLengthW(hwnd: HWND) -> i32;
     pub fn SetFocus(hwnd: HWND) -> HWND;
+    pub fn EnumDisplaySettingsExW(device: *const u16, mode: u32, devmode: *mut DEVMODEW, flags: u32) -> BOOL;
+    pub fn ChangeDisplaySettingsExW(
+        device: *const u16,
+        devmode: *const DEVMODEW,
+        hwnd: HWND,
+        flags: u32,
+        param: *const c_void,
+    ) -> i32;
 }
 
 #[link(name = "gdi32")]

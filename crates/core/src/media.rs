@@ -134,6 +134,71 @@ pub trait VideoSource: Send {
     fn select_display(&mut self, _id: u32) -> Result<()> {
         Err(err("this source cannot switch displays"))
     }
+    /// "Fit to the viewer's screen": switch the streamed display to the mode
+    /// closest to `size` (desktop size in logical pixels, see [`pick_mode`]),
+    /// or back to the mode it had (`None`). Returns the new mode for the
+    /// viewer to show. The source must keep streaming afterwards (restart
+    /// capture at the new size if needed) and must restore the original mode
+    /// when it is dropped, or when another display is selected.
+    fn fit_display(&mut self, _size: Option<(u32, u32)>) -> Result<String> {
+        Err(err("changing the screen resolution isn't supported on this computer"))
+    }
+}
+
+/// A display mode, as offered by the OS.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplayMode {
+    /// Desktop size in logical pixels (what windows and text are laid out in).
+    pub width: u32,
+    pub height: u32,
+    /// Pixels actually scanned out (2x the logical size for HiDPI modes).
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// Hz (0 = unknown).
+    pub refresh: f64,
+}
+
+impl DisplayMode {
+    pub fn hidpi(&self) -> bool {
+        self.pixel_width >= self.width * 3 / 2
+    }
+    pub fn describe(&self) -> String {
+        if self.hidpi() {
+            format!("{}×{} (HiDPI)", self.width, self.height)
+        } else {
+            format!("{}×{}", self.width, self.height)
+        }
+    }
+}
+
+/// Pick the mode that best fits a viewer wanting a desktop of about
+/// `target` logical pixels: closest shape first, then closest size, keeping
+/// the current mode's sharpness (HiDPI) and refresh rate where possible.
+/// Never picks a desktop larger than the current one (fitting a phone means
+/// bigger text, not more of it). Returns an index into `modes`, or None if
+/// nothing smaller fits or `current` is already the best.
+pub fn pick_mode(modes: &[DisplayMode], current: &DisplayMode, target: (u32, u32)) -> Option<usize> {
+    let (tw, th) = (target.0.max(1) as f64, target.1.max(1) as f64);
+    // A phone in landscape is wider than any monitor mode; portrait (taller
+    // than wide) can't be matched by a landscape monitor: fit the width.
+    let target_aspect = (tw / th).max(1.0);
+    let score = |m: &DisplayMode| {
+        let aspect = m.width as f64 / m.height as f64;
+        let shape = (aspect / target_aspect).ln().abs();
+        let size = (m.width as f64 / tw).ln().abs();
+        let sharp = if m.hidpi() == current.hidpi() { 0.0 } else { 0.4 };
+        let rate = if current.refresh > 0.0 && (m.refresh - current.refresh).abs() > 1.0 { 0.05 } else { 0.0 };
+        shape * 2.0 + size + sharp + rate
+    };
+    let best = modes
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.width >= 640 && m.height >= 400)
+        .filter(|(_, m)| m.width <= current.width && m.height <= current.height)
+        .min_by(|a, b| score(a.1).total_cmp(&score(b.1)))?;
+    let same =
+        best.1.width == current.width && best.1.height == current.height && best.1.pixel_width == current.pixel_width;
+    (!same && score(best.1) < score(current)).then_some(best.0)
 }
 
 /// Input events delivered to the host. Positions are normalized to the
@@ -359,7 +424,34 @@ pub fn letterbox(win_w: u32, win_h: u32, vid_w: u32, vid_h: u32) -> (f32, f32, f
 
 #[cfg(test)]
 mod tests {
-    use super::{AUDIO_PACKET_FRAMES, JitterBuffer, letterbox};
+    use super::{AUDIO_PACKET_FRAMES, DisplayMode, JitterBuffer, letterbox, pick_mode};
+
+    fn m(width: u32, height: u32, scale: u32, refresh: f64) -> DisplayMode {
+        DisplayMode { width, height, pixel_width: width * scale, pixel_height: height * scale, refresh }
+    }
+
+    #[test]
+    fn pick_mode_for_a_phone() {
+        // A 1440p monitor: a landscape phone asking for ~1280 wide gets 1280×720.
+        let modes = [
+            m(2560, 1440, 1, 144.0),
+            m(1920, 1080, 1, 144.0),
+            m(1280, 720, 1, 144.0),
+            m(1280, 720, 1, 60.0),
+            m(1280, 1024, 1, 60.0),
+            m(800, 600, 1, 60.0),
+        ];
+        assert_eq!(pick_mode(&modes, &modes[0], (1280, 590)), Some(2), "keeps 144 Hz");
+        // Portrait phone: still a landscape mode, by width.
+        assert_eq!(pick_mode(&modes, &modes[0], (1024, 2200)).map(|i| modes[i].width), Some(1280));
+        // Already at the best mode: nothing to do.
+        assert_eq!(pick_mode(&modes, &modes[2], (1280, 590)), None);
+        // Never larger than the current desktop.
+        assert_eq!(pick_mode(&modes[..3], &modes[2], (2560, 1200)), None);
+        // A Retina Mac keeps HiDPI.
+        let mac = [m(1728, 1117, 2, 120.0), m(1280, 800, 2, 120.0), m(1280, 800, 1, 120.0), m(1024, 640, 2, 120.0)];
+        assert_eq!(pick_mode(&mac, &mac[0], (1280, 590)), Some(1));
+    }
 
     #[test]
     fn jitter_buffer_primes_fills_gaps_and_caps() {

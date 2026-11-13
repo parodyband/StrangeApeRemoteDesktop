@@ -4,10 +4,13 @@ mod app;
 mod args;
 mod client;
 mod clipsync;
+mod console;
 mod host;
 mod keymap;
 mod platform;
 mod session;
+mod shell;
+mod terminal;
 mod update;
 
 use args::Args;
@@ -26,6 +29,9 @@ USAGE:
   sard pair <host> <code>        Pair with a host (one time; code shown by `sard host --pair`)
                                  add `--alias <name>` to name it at the same time
   sard connect <host> [options]  View and control a paired host
+  sard shell <host>              Open a terminal on a paired host (it must allow terminal access)
+                                 --list: show its running terminals, --attach <id>: reopen one;
+                                 Enter ~ . disconnects and leaves the terminal running
   sard alias <address> <name>    Name a host: then `sard connect <name>` (`sard alias` lists)
   sard unalias <name>            Remove an alias
   sard info                      Show identity, paired devices and GPU capabilities
@@ -46,6 +52,7 @@ HOST OPTIONS:
   --cursor <mode>        metadata (client draws cursor, default) | embedded
   --test-pattern [WxH]   Stream a synthetic pattern instead of the screen
   --no-audio             Don't stream audio
+  --terminal             Allow paired devices to open terminals (`sard shell`, the iPhone app)
 
 CLIENT OPTIONS:
   --fps <n>              Request a frame rate
@@ -97,6 +104,7 @@ fn main() -> ExitCode {
         "app" => app::run(&args),
         "host" | "serve" => host::run(&args),
         "connect" | "c" => client::run(&args),
+        "shell" | "sh" => shell::run(&args),
         "pair" => pair(&args),
         "info" => info(),
         "unpair" => unpair(&args),

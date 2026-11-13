@@ -1,7 +1,8 @@
 //! Windows platform backends for sard: DXGI Desktop Duplication capture,
 //! NVENC / NVDEC (NVIDIA) or Media Foundation hardware codecs (AMD, Intel,
 //! others), Direct3D 11 presentation, SendInput injection, WASAPI audio and
-//! the app shell (notification-area icon, dialogs, start at login).
+//! the app shell (notification-area icon, dialogs, start at login), remote
+//! shells on a pseudoconsole (ConPTY) and the `sard shell` console.
 //!
 //! All bindings are hand-written: Win32 in `sys`, COM interfaces declared by
 //! vtable slot with `com_interface!`, GPU/media DLLs loaded at run time
@@ -16,6 +17,8 @@ pub mod audio;
 pub mod capture;
 pub mod clipboard;
 pub mod com;
+pub mod conpty;
+pub mod console;
 pub mod d3d;
 pub mod decode;
 pub mod dl;

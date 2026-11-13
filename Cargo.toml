@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/linux", "crates/macos", "crates/windows", "crates/sard"]
+members = ["crates/core", "crates/linux", "crates/macos", "crates/windows", "crates/sard", "crates/mobile"]
 
 [workspace.package]
 version = "0.1.18"
@@ -15,6 +15,7 @@ sard-core = { path = "crates/core" }
 sard-linux = { path = "crates/linux" }
 sard-macos = { path = "crates/macos" }
 sard-windows = { path = "crates/windows" }
+sard-mobile = { path = "crates/mobile" }
 libc = "0.2"
 
 # Fast incremental dev builds: our code lightly optimized, dependencies fully optimized

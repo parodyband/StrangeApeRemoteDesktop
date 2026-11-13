@@ -320,6 +320,91 @@ fn serve(mut ws: WebSocket, hooks: &HostHooks, stop: &AtomicBool, status: &Mutex
     }
 }
 
+/// Connect to a paired host: directly at `addr`, and with Connect Anywhere
+/// set up in `dir` also through the rendezvous service (public addresses,
+/// hole punching, then the relay). Whichever path answers first is used.
+/// Errors are user-facing text.
+pub fn connect(
+    dir: &Path,
+    host: &crate::config::KnownHost,
+    addr: &str,
+    identity: crate::crypto::Keypair,
+    cfg: crate::net::NetConfig,
+) -> Result<crate::net::Connection, String> {
+    use crate::net::{Client, NetError};
+    use crate::{stun, turn};
+    let text = |e: &dyn std::fmt::Display| e.to_string();
+    let Some(service) = Service::load(dir) else {
+        return Client::connect(addr, host.key, identity, cfg, Duration::from_secs(8)).map_err(|e| text(&e));
+    };
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| text(&e))?;
+    let lan: Vec<SocketAddr> = crate::net::resolve(addr).into_iter().filter(|a| a.is_ipv4()).collect();
+    // Our public address, learned on the socket the connection will use.
+    let public = stun::resolve(stun::DEFAULT_SERVER, false)
+        .and_then(|server| stun::query(&socket, server, Duration::from_millis(1500)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host_addrs: Arc<Mutex<Option<Vec<SocketAddr>>>> = Arc::default();
+    {
+        let (service, found) = (service.clone(), Arc::clone(&host_addrs));
+        let (host_key, me, name) = (host.key, identity.public(), host.name.clone());
+        std::thread::spawn(move || match service.introduce(&host_key, &me, public.as_slice()) {
+            Ok(Some(addrs)) => {
+                info!("Connect Anywhere: {name} is at {addrs:?}");
+                *found.lock().unwrap() = Some(addrs.clone());
+                let _ = tx.send(addrs);
+            }
+            Ok(None) => info!("Connect Anywhere: {name} is not online"),
+            Err(e) => warn!("{e}"),
+        });
+    }
+    // 1. Directly: LAN address, or the host's public address with hole punching.
+    //    (SARD_FORCE_RELAY=1 skips this, to test the relay.)
+    let force_relay = std::env::var_os("SARD_FORCE_RELAY").is_some();
+    if force_relay {
+        for _ in 0..50 {
+            if host_addrs.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let direct = if force_relay {
+        Err(NetError::Timeout)
+    } else {
+        Client::connect_candidates(
+            socket,
+            lan,
+            Some(rx),
+            host.key,
+            identity.clone(),
+            cfg.clone(),
+            Duration::from_secs(3),
+        )
+    };
+    match direct {
+        Ok(c) => return Ok(c),
+        Err(NetError::Timeout) => {}
+        Err(e) => return Err(text(&e)),
+    }
+    // 2. Through the relay, for networks that can't be punched through.
+    let not_reached = || format!("{} didn't answer on this network or through Connect Anywhere", host.name);
+    let Some(addrs) = host_addrs.lock().unwrap().clone() else { return Err(not_reached()) };
+    let Some(host_public) = addrs.iter().copied().find(|a| !crate::net::is_lan(a.ip())) else {
+        return Err(not_reached());
+    };
+    let Some(creds) = service.relay_credentials().map_err(|e| text(&e))? else { return Err(not_reached()) };
+    info!("Connect Anywhere: no direct path to {}; using the relay", host.name);
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| text(&e))?;
+    let relay = turn::allocate(&socket, &creds, host_public, Duration::from_secs(4)).map_err(|e| text(&e))?;
+    info!("Connect Anywhere: relay address {}", relay.relayed);
+    // The host punches toward the relay so its router lets the relay's packets in.
+    service.introduce(&host.key, &identity.public(), &[relay.relayed]).map_err(|e| text(&e))?;
+    Client::connect_relay(socket, relay, host.key, identity, cfg, Duration::from_secs(6)).map_err(|e| match e {
+        NetError::Timeout => not_reached(),
+        e => text(&e),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

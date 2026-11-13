@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 #[cfg(target_os = "linux")]
 const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const CLOCK: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
 
 /// Monotonic time in microseconds.

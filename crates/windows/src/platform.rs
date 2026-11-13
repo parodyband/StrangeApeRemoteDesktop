@@ -65,6 +65,12 @@ pub fn open_clipboard() -> Option<Box<dyn Clipboard>> {
     Some(Box::new(crate::clipboard::WinClipboard::open()?))
 }
 
+/// A shell (pwsh, Windows PowerShell or cmd) on a pseudoconsole of
+/// `cols` x `rows` cells, for remote terminals.
+pub fn spawn_shell(cols: u16, rows: u16) -> std::io::Result<Box<dyn sard_core::pty::Pty>> {
+    crate::conpty::spawn(cols, rows)
+}
+
 // ---- app shell: `tray.rs` / `shell.rs` ----
 
 /// Notification-area icon. Call on winit's main thread (inside `resumed`);

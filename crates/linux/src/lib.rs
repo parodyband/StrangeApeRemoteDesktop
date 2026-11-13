@@ -15,6 +15,7 @@ pub mod nv;
 pub mod platform;
 pub mod portal;
 pub mod pw;
+pub mod resolution;
 pub mod shell;
 pub mod sink;
 pub mod test_source;

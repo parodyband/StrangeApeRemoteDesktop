@@ -40,6 +40,8 @@ fn notify(title: &str, message: &str) {
 /// `settings.txt`: `key=value` lines.
 struct Settings {
     share: bool,
+    /// Paired devices may open terminals here (off unless turned on).
+    terminal: bool,
     /// An update the user chose "Skip This Version" for.
     skip_version: Option<String>,
 }
@@ -50,13 +52,14 @@ impl Settings {
     }
 
     fn load() -> Settings {
-        let mut s = Settings { share: true, skip_version: None };
+        let mut s = Settings { share: true, terminal: false, skip_version: None };
         if let Ok(text) = std::fs::read_to_string(Self::path()) {
             for line in text.lines() {
                 if let Some((k, v)) = line.split_once('=') {
                     let on = matches!(v.trim(), "on" | "true" | "1" | "yes");
                     match k.trim() {
                         "share" => s.share = on,
+                        "terminal" => s.terminal = on,
                         "skip_version" if !v.trim().is_empty() => s.skip_version = Some(v.trim().to_string()),
                         _ => {}
                     }
@@ -67,7 +70,8 @@ impl Settings {
     }
 
     fn save(&self) {
-        let mut text = format!("# sard app settings\nshare={}\n", if self.share { "on" } else { "off" });
+        let onoff = |b: bool| if b { "on" } else { "off" };
+        let mut text = format!("# sard app settings\nshare={}\nterminal={}\n", onoff(self.share), onoff(self.terminal));
         if let Some(v) = &self.skip_version {
             text += &format!("skip_version={v}\n");
         }
@@ -183,6 +187,7 @@ enum Action {
     Disconnect(u64),
     Pair,
     ToggleShare,
+    ToggleTerminal,
     KickViewer,
     ChooseScreens,
     ToggleLogin,
@@ -305,6 +310,7 @@ impl App {
         });
         match HostService::start(&self.args, false, on_change) {
             Ok(h) => {
+                h.set_terminal_allowed(self.settings.terminal);
                 let st = h.status();
                 info!("sharing as {} on port {}", st.name, st.port);
                 for m in &st.missing_permissions {
@@ -387,6 +393,9 @@ impl App {
                 if let Some(v) = &st.viewer {
                     let k = self.item(format!("Disconnect {v}"), Action::KickViewer);
                     m.push(k);
+                }
+                if !st.terminal_clients.is_empty() {
+                    m.push(Self::text(format!("Terminal open from {}", st.terminal_clients.join(", "))));
                 }
                 if let Some((code, until)) = &st.pairing {
                     let mins = until.saturating_duration_since(Instant::now()).as_secs().div_ceil(60);
@@ -475,6 +484,7 @@ impl App {
         // ---- settings ----
         let mut s = Vec::new();
         s.push(self.check("Share This Computer", self.settings.share, Action::ToggleShare));
+        s.push(self.check("Allow Terminal Access", self.settings.terminal, Action::ToggleTerminal));
         if status.is_some() && cfg!(target_os = "linux") {
             s.push(self.item("Choose Screens to Share…", Action::ChooseScreens));
         }
@@ -677,6 +687,14 @@ impl App {
                     self.next_share_retry = None;
                 }
                 self.check_permissions();
+                self.refresh();
+            }
+            Action::ToggleTerminal => {
+                self.settings.terminal = !self.settings.terminal;
+                self.settings.save();
+                if let Some(h) = &self.host {
+                    h.set_terminal_allowed(self.settings.terminal);
+                }
                 self.refresh();
             }
             Action::KickViewer => {

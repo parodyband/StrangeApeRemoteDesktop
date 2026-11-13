@@ -467,6 +467,10 @@ pub const kCGEventFlagMaskNonCoalesced: u64 = 0x0000_0100;
 pub const NX_DEVICELCTLKEYMASK: u64 = 0x0000_0001;
 pub const NX_DEVICELSHIFTKEYMASK: u64 = 0x0000_0002;
 pub const NX_DEVICERSHIFTKEYMASK: u64 = 0x0000_0004;
+/// `CGConfigureOption`: the change lasts until this process exits (macOS
+/// puts the old mode back itself, even after a crash).
+pub const kCGConfigureForAppOnly: u32 = 0;
+
 pub const NX_DEVICELCMDKEYMASK: u64 = 0x0000_0008;
 pub const NX_DEVICERCMDKEYMASK: u64 = 0x0000_0010;
 pub const NX_DEVICELALTKEYMASK: u64 = 0x0000_0020;
@@ -486,6 +490,21 @@ unsafe extern "C" {
     pub fn CGDisplayModeGetPixelWidth(mode: *mut c_void) -> usize;
     pub fn CGDisplayModeGetPixelHeight(mode: *mut c_void) -> usize;
     pub fn CGDisplayModeRelease(mode: *mut c_void);
+    pub static kCGDisplayShowDuplicateLowResolutionModes: CFStringRef;
+    pub fn CGDisplayCopyAllDisplayModes(d: CGDirectDisplayID, options: CFDictionaryRef) -> CFArrayRef;
+    pub fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+    pub fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+    pub fn CGDisplayModeGetRefreshRate(mode: *const c_void) -> f64;
+    pub fn CGDisplayModeIsUsableForDesktopGUI(mode: *const c_void) -> bool;
+    pub fn CGBeginDisplayConfiguration(config: *mut *mut c_void) -> i32;
+    pub fn CGConfigureDisplayWithDisplayMode(
+        config: *mut c_void,
+        d: CGDirectDisplayID,
+        mode: *const c_void,
+        options: CFDictionaryRef,
+    ) -> i32;
+    pub fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> i32;
+    pub fn CGCancelDisplayConfiguration(config: *mut c_void) -> i32;
     pub fn CGColorSpaceCreateWithName(name: CFStringRef) -> *mut c_void;
     pub fn CGColorSpaceRelease(cs: *mut c_void);
 
@@ -513,6 +532,7 @@ unsafe extern "C" {
     pub fn CGRequestPostEventAccess() -> bool;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     pub fn AXIsProcessTrusted() -> Boolean;
@@ -534,6 +554,7 @@ unsafe extern "C" {
     pub fn CACurrentMediaTime() -> f64;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "ScreenCaptureKit", kind = "framework")]
 unsafe extern "C" {
     /// `NSString *` key into the per-frame attachment dictionary.

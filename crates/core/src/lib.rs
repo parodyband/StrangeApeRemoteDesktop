@@ -18,6 +18,7 @@ pub mod media;
 pub mod net;
 pub mod png;
 pub mod proto;
+pub mod pty;
 pub mod rand;
 pub mod reliable;
 pub mod stats;

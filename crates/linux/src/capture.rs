@@ -12,6 +12,7 @@ use crate::nv::cuda::{CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY, CUgraphicsResource, 
 use crate::nv::nvenc::{EncoderParams, NvEncoder};
 use crate::portal::{self, PortalInput, Session};
 use crate::pw::{self, Capture, FrameData, VideoFormat};
+use crate::resolution::{self, Desktop};
 use sard_core::clock;
 use sard_core::config;
 use sard_core::input::wire_button_to_evdev;
@@ -99,6 +100,18 @@ pub struct PortalSource {
     gl_current: bool,
     frames: u64,
     timing: Timing,
+    /// Monitor whose mode `fit_display` changed, to restore later.
+    fitted: Option<Fitted>,
+}
+
+/// A monitor switched to a smaller mode for a phone, and what to put back.
+struct Fitted {
+    desktop: Desktop,
+    /// Index into `session.streams`.
+    stream: usize,
+    /// Connector ("DP-1").
+    output: String,
+    original: resolution::Mode,
 }
 
 // SAFETY: the source is created on the host thread and then used (and the GL
@@ -188,6 +201,7 @@ pub fn open(opts: &SourceOptions) -> media::Result<(Box<dyn VideoSource>, Box<dy
         gl_current: false,
         frames: 0,
         timing: Timing::default(),
+        fitted: None,
     };
     Ok((Box::new(src), input))
 }
@@ -274,6 +288,86 @@ fn monitor_names(streams: &[portal::StreamInfo]) -> Vec<String> {
 }
 
 impl PortalSource {
+    /// (Re)connect the stream of monitor `idx` (also after its mode changed)
+    /// and resize the encoder to match. If the stream can't be connected, the
+    /// old one keeps running.
+    fn connect(&mut self, idx: usize) -> media::Result<VideoFormat> {
+        let (capture, format) = connect_stream(&self.session, idx, self.opts.fps, &self.modifiers)?;
+        self.capture = capture;
+        self.drop_dma_cache();
+        self.stream_size = (format.width, format.height);
+        self.resize_output(fit(format.width, format.height, self.opts.max_width, self.opts.max_height))?;
+        self.current = idx;
+        *self.active.lock().unwrap() = self.session.streams[idx].clone();
+        self.force_key = true;
+        Ok(format)
+    }
+
+    /// New encoder (and CSC target) for a new output size.
+    fn resize_output(&mut self, out: (u32, u32)) -> media::Result<()> {
+        if out == self.out_size {
+            return Ok(());
+        }
+        let enc = make_encoder(&self.cuda, &self.opts, out, self.bitrate_kbps)?;
+        self.release_csc();
+        self.out_size = out;
+        self.enc = enc;
+        self.last_input = None;
+        self.force_key = true;
+        Ok(())
+    }
+
+    /// The streamed monitor and its modes, as the desktop reports them.
+    fn fit_monitor(&self, desk: Desktop) -> media::Result<resolution::Monitor> {
+        let mons = resolution::monitors(desk)?;
+        let mon = match &self.fitted {
+            Some(f) => mons.iter().find(|m| m.name == f.output),
+            None => resolution::find(&mons, self.session.streams[self.current].position),
+        };
+        mon.cloned().ok_or_else(|| media::err("couldn't tell which monitor is being shared"))
+    }
+
+    /// Mode `m` is now on the streamed monitor: the stream's logical size
+    /// (input mapping) follows, and capture restarts at the new size.
+    fn mode_changed(&mut self, stream: usize, m: &resolution::Mode, reconnect: bool) -> media::Result<()> {
+        self.session.streams[stream].size = m.layout;
+        if stream == self.current {
+            *self.active.lock().unwrap() = self.session.streams[stream].clone();
+            if reconnect {
+                let f = self.connect(stream)?;
+                info!(
+                    "{}: capturing at {}x{} → {}x{}",
+                    m.mode.describe(),
+                    f.width,
+                    f.height,
+                    self.out_size.0,
+                    self.out_size.1
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Put the original mode back (no-op if nothing was changed). `wait`:
+    /// until the desktop reports it; `reconnect`: then restart capture at the
+    /// restored size.
+    fn restore_mode(&mut self, wait: bool, reconnect: bool) -> media::Result<String> {
+        let Some(f) = self.fitted.take() else { return Ok(String::new()) };
+        if let Err(e) = resolution::set_mode(f.desktop, &f.output, &f.original, wait || reconnect) {
+            warn!(
+                "could not restore {} to {}: {e}; to do it by hand: {}",
+                f.output,
+                f.original.mode.describe(),
+                resolution::restore_hint(f.desktop, &f.output, &f.original)
+            );
+            self.fitted = Some(f);
+            return Err(media::err(e));
+        }
+        info!("{} restored to {}", f.output, f.original.mode.describe());
+        self.mode_changed(f.stream, &f.original, reconnect)?;
+        Ok(f.original.mode.describe())
+    }
+
     fn release_csc(&mut self) {
         self.drop_dma_cache();
         if let Some(c) = self.csc.take() {
@@ -502,8 +596,18 @@ impl VideoSource for PortalSource {
         let capture_us =
             frame.pts_ns.map(|p| (p / 1000) as u64).filter(|&p| p <= now && now - p < 200_000).unwrap_or(now);
         if (frame.format.width, frame.format.height) != self.stream_size {
-            debug!("stream resized to {}x{}", frame.format.width, frame.format.height);
-            self.stream_size = (frame.format.width, frame.format.height);
+            let (w, h) = (frame.format.width, frame.format.height);
+            debug!("stream resized to {w}x{h}");
+            self.stream_size = (w, h);
+            // e.g. the monitor's mode changed: encode at the new size rather than scale.
+            let out = fit(w, h, self.opts.max_width, self.opts.max_height);
+            if out != self.out_size {
+                info!("screen is now {w}x{h}; encoding {}x{}", out.0, out.1);
+                if let Err(e) = self.resize_output(out).and_then(|_| self.ensure_gl()) {
+                    self.capture.release(frame);
+                    return Err(e);
+                }
+            }
         }
         let t0 = std::time::Instant::now();
         let src_tex = match frame.data {
@@ -620,23 +724,77 @@ impl VideoSource for PortalSource {
             self.force_key = true;
             return Ok(());
         }
-        // Connect the new stream first so a failure leaves the old one running.
-        let (capture, format) = connect_stream(&self.session, idx, self.opts.fps, &self.modifiers)?;
-        self.capture = capture;
-        self.drop_dma_cache();
-        self.stream_size = (format.width, format.height);
-        let out = fit(format.width, format.height, self.opts.max_width, self.opts.max_height);
-        if out != self.out_size {
-            self.release_csc();
-            self.out_size = out;
-            self.enc = make_encoder(&self.cuda, &self.opts, out, self.bitrate_kbps)?;
-            self.last_input = None;
+        // The monitor being left gets its own mode back (the caller fits the new one).
+        if let Err(e) = self.restore_mode(true, false) {
+            warn!("switching displays anyway: {e}");
         }
-        self.current = idx;
-        *self.active.lock().unwrap() = self.session.streams[idx].clone();
-        self.force_key = true;
+        let format = self.connect(idx)?;
+        let out = self.out_size;
         info!("switched to display {} ({}x{} → {}x{})", self.names[idx], format.width, format.height, out.0, out.1);
         Ok(())
+    }
+
+    fn fit_display(&mut self, size: Option<(u32, u32)>) -> media::Result<String> {
+        let Some(target) = size else {
+            if self.fitted.is_some() {
+                return self.restore_mode(true, true);
+            }
+            // Nothing changed: report the current mode.
+            let stream = &self.session.streams[self.current];
+            let fallback = format!("{}×{}", stream.size.0, stream.size.1);
+            let mon = resolution::desktop().ok().and_then(|d| self.fit_monitor(d).ok());
+            return Ok(mon.map(|m| m.current_mode().mode.describe()).unwrap_or(fallback));
+        };
+        // A monitor left fitted by a failed restore must be put back first.
+        if self.fitted.as_ref().is_some_and(|f| f.stream != self.current) {
+            self.restore_mode(true, false)?;
+        }
+        let desk = resolution::desktop()?;
+        let mon = self.fit_monitor(desk)?;
+        // Choose relative to the mode the monitor had before Sard touched it,
+        // so a new target (phone rotated) can also mean a larger mode.
+        let original = match &self.fitted {
+            Some(f) => mon.modes.iter().position(|m| m.id == f.original.id).unwrap_or(mon.current),
+            None => mon.current,
+        };
+        let modes: Vec<media::DisplayMode> = mon.modes.iter().map(|m| m.mode).collect();
+        let want = match media::pick_mode(&modes, &modes[original], target) {
+            Some(i) => i,
+            None if self.fitted.is_some() => original,
+            None => return Ok(mon.current_mode().mode.describe()),
+        };
+        if want == mon.current {
+            return Ok(mon.current_mode().mode.describe());
+        }
+        if want == original {
+            return self.restore_mode(true, true);
+        }
+        let new = mon.modes[want].clone();
+        if self.fitted.is_none() {
+            let orig = &mon.modes[original];
+            info!(
+                "fitting {} to {}x{}: {} → {} for this session; if it isn't restored, run: {}",
+                mon.name,
+                target.0,
+                target.1,
+                orig.mode.describe(),
+                new.mode.describe(),
+                resolution::restore_hint(desk, &mon.name, orig)
+            );
+            // Remember before switching: even a half-applied change gets restored.
+            self.fitted =
+                Some(Fitted { desktop: desk, stream: self.current, output: mon.name.clone(), original: orig.clone() });
+        }
+        if let Err(e) = resolution::set_mode(desk, &mon.name, &new, true) {
+            // Nothing to restore if the monitor is still in its original mode.
+            let original_id = self.fitted.as_ref().map(|f| f.original.id.clone());
+            if self.fit_monitor(desk).is_ok_and(|m| Some(&m.current_mode().id) == original_id.as_ref()) {
+                self.fitted = None;
+            }
+            return Err(e.into());
+        }
+        self.mode_changed(self.current, &new, true)?;
+        Ok(new.mode.describe())
     }
 
     fn describe(&self) -> String {
@@ -654,6 +812,8 @@ impl VideoSource for PortalSource {
 
 impl Drop for PortalSource {
     fn drop(&mut self) {
+        // The session is over: the shared monitor gets its own mode back.
+        let _ = self.restore_mode(false, false);
         self.release_csc();
     }
 }

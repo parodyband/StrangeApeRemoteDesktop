@@ -179,6 +179,8 @@ impl Session {
             bitrate_kbps: opts.bitrate_kbps.unwrap_or(0),
             flags: client_flags::LOCAL_CURSOR | if opts.audio { client_flags::AUDIO } else { 0 },
             display: opts.display,
+            fit_width: 0,
+            fit_height: 0,
         };
         info!(
             "requesting up to {}x{} @ {} fps, decoders {:#x}",

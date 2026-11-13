@@ -320,6 +320,33 @@ impl Presenter {
         }
     }
 
+    /// Draw into an existing `CAMetalLayer` (iOS: the app's video view).
+    /// Its `drawableSize` follows [`Presenter::resize`]; the app sizes and
+    /// positions the layer (zoom and pan are layer transforms there).
+    ///
+    /// # Safety
+    /// `layer` must be a valid `CAMetalLayer`. Call on the main thread.
+    pub unsafe fn with_layer(layer: *mut AnyObject, width: u32, height: u32) -> Result<Self> {
+        let renderer = Renderer::new()?;
+        // SAFETY: caller contract; plain CAMetalLayer property setters
+        // available on macOS and iOS.
+        unsafe {
+            let layer: Retained<AnyObject> = Retained::retain(layer).ok_or("no layer")?;
+            let _: () = msg_send![&*layer, setDevice: &*renderer.device];
+            let _: () = msg_send![&*layer, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
+            let _: () = msg_send![&*layer, setFramebufferOnly: true];
+            let _: () = msg_send![&*layer, setOpaque: true];
+            let size = CGSize { width: width.max(1) as f64, height: height.max(1) as f64 };
+            let _: () = msg_send![&*layer, setDrawableSize: size];
+            Ok(Presenter { renderer, layer, current: None })
+        }
+    }
+
+    /// Forget the current picture (the next draw shows black until a frame).
+    pub fn clear_frame(&mut self) {
+        self.current = None;
+    }
+
     pub fn set_frame(&mut self, pb: &CfRef) -> Result<()> {
         self.current = Some(self.renderer.textures(pb)?);
         Ok(())

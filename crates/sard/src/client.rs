@@ -4,16 +4,15 @@
 use crate::args::Args;
 use crate::session::{AppEvent, Outcome, Session, SessionOpts};
 use crate::{Result, platform};
+use sard_core::anywhere;
 use sard_core::clock;
 use sard_core::config::{self, KnownHost, KnownHosts};
-use sard_core::net::{Client, Connection, Event};
+use sard_core::net::{Connection, Event};
 use sard_core::proto::{AudioPacket, ClientHello, Codec, Control, Platform, client_flags};
 use sard_core::stats::Samples;
 use sard_core::video::{CompleteFrame, FrameMeta, frame_flags};
-use sard_core::{anywhere, stun, turn};
 use sard_core::{error, info, warn};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -50,78 +49,16 @@ pub fn resolve(arg: &str) -> Result<(KnownHost, String)> {
 /// configured also through the rendezvous service (public addresses, hole
 /// punching). Whichever path answers first is used.
 pub fn dial(host: &KnownHost, addr: &str, args: &Args) -> Result<Connection> {
+    dial_lane(host, addr, args, sard_core::proto::lane::SCREEN)
+}
+
+/// [`dial`] for a session in `lane` (`proto::lane`).
+pub fn dial_lane(host: &KnownHost, addr: &str, args: &Args, lane: u8) -> Result<Connection> {
     let dir = config::config_dir();
     let identity = config::load_or_create_identity(&dir)?;
-    let cfg = crate::net_config(args)?;
-    let Some(service) = anywhere::Service::load(&dir) else {
-        return Ok(Client::connect(addr, host.key, identity, cfg, Duration::from_secs(8))?);
-    };
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    let lan: Vec<std::net::SocketAddr> = sard_core::net::resolve(addr).into_iter().filter(|a| a.is_ipv4()).collect();
-    // Our public address, learned on the socket the connection will use.
-    let public = stun::resolve(stun::DEFAULT_SERVER, false)
-        .and_then(|server| stun::query(&socket, server, Duration::from_millis(1500)));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let host_addrs: Arc<Mutex<Option<Vec<std::net::SocketAddr>>>> = Arc::default();
-    {
-        let (service, found) = (service.clone(), Arc::clone(&host_addrs));
-        let (host_key, me, name) = (host.key, identity.public(), host.name.clone());
-        std::thread::spawn(move || match service.introduce(&host_key, &me, public.as_slice()) {
-            Ok(Some(addrs)) => {
-                info!("Connect Anywhere: {name} is at {addrs:?}");
-                *found.lock().unwrap() = Some(addrs.clone());
-                let _ = tx.send(addrs);
-            }
-            Ok(None) => info!("Connect Anywhere: {name} is not online"),
-            Err(e) => warn!("{e}"),
-        });
-    }
-    // 1. Directly: LAN address, or the host's public address with hole punching.
-    //    (SARD_FORCE_RELAY=1 skips this, to test the relay.)
-    let force_relay = std::env::var_os("SARD_FORCE_RELAY").is_some();
-    if force_relay {
-        for _ in 0..50 {
-            if host_addrs.lock().unwrap().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    let direct = if force_relay {
-        Err(sard_core::net::NetError::Timeout)
-    } else {
-        Client::connect_candidates(
-            socket,
-            lan,
-            Some(rx),
-            host.key,
-            identity.clone(),
-            cfg.clone(),
-            Duration::from_secs(3),
-        )
-    };
-    match direct {
-        Ok(c) => return Ok(c),
-        Err(sard_core::net::NetError::Timeout) => {}
-        Err(e) => return Err(e.into()),
-    }
-    // 2. Through the relay, for networks that can't be punched through.
-    let not_reached = || format!("{} didn't answer on this network or through Connect Anywhere", host.name);
-    let Some(addrs) = host_addrs.lock().unwrap().clone() else { return Err(not_reached().into()) };
-    let Some(host_public) = addrs.iter().copied().find(|a| !sard_core::net::is_lan(a.ip())) else {
-        return Err(not_reached().into());
-    };
-    let Some(creds) = service.relay_credentials()? else { return Err(not_reached().into()) };
-    info!("Connect Anywhere: no direct path to {}; using the relay", host.name);
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    let relay = turn::allocate(&socket, &creds, host_public, Duration::from_secs(4))?;
-    info!("Connect Anywhere: relay address {}", relay.relayed);
-    // The host punches toward the relay so its router lets the relay's packets in.
-    service.introduce(&host.key, &identity.public(), &[relay.relayed])?;
-    Client::connect_relay(socket, relay, host.key, identity, cfg, Duration::from_secs(6)).map_err(|e| match e {
-        sard_core::net::NetError::Timeout => not_reached().into(),
-        e => e.into(),
-    })
+    let mut cfg = crate::net_config(args)?;
+    cfg.lane = lane;
+    Ok(anywhere::connect(&dir, host, addr, identity, cfg)?)
 }
 
 pub fn opts_from_args(args: &Args) -> Result<SessionOpts> {
@@ -243,6 +180,8 @@ fn run_headless(
         bitrate_kbps: args.parse_value::<f32>("bitrate")?.map_or(0, |m| (m * 1000.0) as u32),
         flags: client_flags::LOCAL_CURSOR | if args.flag("audio") { client_flags::AUDIO } else { 0 },
         display: args.parse_value("display")?.unwrap_or(0),
+        fit_width: 0,
+        fit_height: 0,
     };
     conn.send_control(&Control::ClientHello(hello));
     let stop = Arc::new(AtomicBool::new(false));

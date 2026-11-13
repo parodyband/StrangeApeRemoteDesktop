@@ -30,13 +30,28 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component rustfmt && rustup default stable
       - run: cargo fmt --all --check
       - name: Shell scripts parse
-        run: for f in scripts/*.sh packaging/linux/install.sh; do sh -n "$f"; done
+        run: for f in scripts/*.sh packaging/linux/install.sh ios/build-rust.sh; do sh -n "$f"; done
       - name: PowerShell installer parses
         shell: pwsh
         run: |
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
           if ($errors) { $errors; exit 1 }
+
+  ios:
+    name: iPhone app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --target aarch64-apple-ios -p sard-mobile -p sard-macos -p sard-core -- -D warnings
+      - name: Build for the simulator (Rust core + Swift app)
+        run: |
+          xcodebuild -project ios/Sard.xcodeproj -scheme Sard -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath ios/build/dd \
+            CODE_SIGNING_ALLOWED=NO build
 
   test:
     name: clippy + test (${{ matrix.os }})
