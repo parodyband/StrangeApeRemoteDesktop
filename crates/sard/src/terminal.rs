@@ -438,6 +438,38 @@ mod tests {
         panic!("timed out; output so far: {:?}", String::from_utf8_lossy(out));
     }
 
+    /// Text with terminal escape sequences (CSI, OSC and two-byte) removed.
+    fn strip_escapes(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            match it.next() {
+                // CSI: parameters, then a final byte in @..~.
+                Some('[') => while it.next().is_some_and(|c| !('@'..='~').contains(&c)) {},
+                // OSC: up to BEL or ESC \.
+                Some(']') => {
+                    while let Some(c) = it.next() {
+                        if c == '\x07' || (c == '\x1b' && it.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strips_escapes() {
+        let s = "\x1b[?2004l\r\x1b]3008;start=x;cwd=/home\x1b\\1\r\n2\x1b]0;title\x07\x1b[1;31m!\x1bc";
+        assert_eq!(strip_escapes(s), "\r1\r\n2!");
+    }
+
     fn output_contains(events: &Receiver<Event>, out: &mut Vec<u8>, needle: &str) {
         // Only the tail can hold a new match: stays linear for bulk output.
         wait_for(events, out, |_, out| {
@@ -600,19 +632,12 @@ mod tests {
         c.send_control(&Control::ShellData { id, data: b"seq 1 300000; echo END-OF-$((1+1))\r".to_vec() });
         output_contains(&ev, &mut out, "END-OF-2");
         let text = String::from_utf8_lossy(&out);
-        // What's after a line's last \r: bash's bracketed-paste "\x1b[?2004l\r"
-        // shares the first output line.
+        // Shells decorate the first output line (bash's bracketed-paste
+        // "\x1b[?2004l\r", Ubuntu's OSC 3008 shell-integration marks).
+        let plain = strip_escapes(&text);
         let nums: Vec<u32> =
-            text.lines().filter_map(|l| l.trim_end().rsplit('\r').next()?.trim().parse().ok()).collect();
-        let Some(start) = nums.iter().position(|&n| n == 1) else {
-            let at = text.find("seq 1").unwrap_or(0);
-            let around: String = text[at..].chars().take(600).collect();
-            panic!(
-                "no line \"1\" ({} numbers, first {:?}); output after the command: {around:?}",
-                nums.len(),
-                &nums[..nums.len().min(5)]
-            );
-        };
+            plain.lines().filter_map(|l| l.trim_end().rsplit('\r').next()?.trim().parse().ok()).collect();
+        let start = nums.iter().position(|&n| n == 1).expect("seq output");
         let run = &nums[start..];
         assert_eq!(run.len(), 300000, "lines lost or duplicated");
         assert!(run.iter().enumerate().all(|(i, &n)| n as usize == i + 1));
