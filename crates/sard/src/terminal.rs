@@ -600,7 +600,10 @@ mod tests {
         c.send_control(&Control::ShellData { id, data: b"seq 1 300000; echo END-OF-$((1+1))\r".to_vec() });
         output_contains(&ev, &mut out, "END-OF-2");
         let text = String::from_utf8_lossy(&out);
-        let nums: Vec<u32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        // What's after a line's last \r: bash's bracketed-paste "\x1b[?2004l\r"
+        // shares the first output line.
+        let nums: Vec<u32> =
+            text.lines().filter_map(|l| l.trim_end().rsplit('\r').next()?.trim().parse().ok()).collect();
         let start = nums.iter().position(|&n| n == 1).expect("seq output");
         let run = &nums[start..];
         assert_eq!(run.len(), 300000, "lines lost or duplicated");
