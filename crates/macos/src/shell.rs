@@ -106,6 +106,58 @@ pub fn choose(title: &str, message: &str, buttons: &[&str]) -> Option<usize> {
     }
 }
 
+/// [`choose`] with a picture (a pairing QR code: `png` at 2x for Retina,
+/// shown at `points` square). A native alert on the main thread: AppleScript
+/// dialogs can't show an image big enough to scan. Blocks the calling
+/// (background) thread until answered.
+pub fn choose_with_image(title: &str, message: &str, png: &[u8], points: f64, buttons: &[&str]) -> Option<usize> {
+    use crate::ffi::{CGRect, CGSize};
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (title, message, png) = (title.to_string(), message.to_string(), png.to_vec());
+    let buttons: Vec<String> = buttons.iter().take(3).map(|b| b.to_string()).collect();
+    let n = buttons.len();
+    crate::objc::main_async(move || {
+        let chosen = autoreleasepool(|_| {
+            // SAFETY: AppKit on the main thread (main_async); NSAlert, NSImage,
+            // NSImageView and NSData with valid arguments.
+            unsafe {
+                let alert: Retained<AnyObject> = msg_send![class!(NSAlert), new];
+                let _: () = msg_send![&*alert, setMessageText: &*crate::objc::ns_string(&title)];
+                let _: () = msg_send![&*alert, setInformativeText: &*crate::objc::ns_string(&message)];
+                for b in &buttons {
+                    let _: *mut AnyObject = msg_send![&*alert, addButtonWithTitle: &*crate::objc::ns_string(b)];
+                }
+                if buttons.len() >= 2 {
+                    // Escape answers the second button, as in `choose`.
+                    let list: *mut AnyObject = msg_send![&*alert, buttons];
+                    let second: *mut AnyObject = msg_send![list, objectAtIndex: 1usize];
+                    let _: () = msg_send![second, setKeyEquivalent: &*crate::objc::ns_string("\u{1b}")];
+                }
+                let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: png.as_ptr().cast::<std::ffi::c_void>(), length: png.len()];
+                let image: objc2::rc::Allocated<AnyObject> = msg_send![class!(NSImage), alloc];
+                let image: Option<Retained<AnyObject>> = msg_send![image, initWithData: data];
+                if let Some(image) = image {
+                    let size = CGSize { width: points, height: points };
+                    let _: () = msg_send![&*image, setSize: size];
+                    let view: Retained<AnyObject> = msg_send![class!(NSImageView), imageViewWithImage: &*image];
+                    let frame = CGRect { origin: crate::ffi::CGPoint { x: 0.0, y: 0.0 }, size };
+                    let _: () = msg_send![&*view, setFrame: frame];
+                    let _: () = msg_send![&*alert, setAccessoryView: &*view];
+                }
+                let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+                let _: () = msg_send![app, activateIgnoringOtherApps: true];
+                let window: *mut AnyObject = msg_send![&*alert, window];
+                let _: () = msg_send![window, setLevel: 3isize]; // floating: above other apps' windows
+                let r: isize = msg_send![&*alert, runModal];
+                // NSAlertFirstButtonReturn = 1000.
+                usize::try_from(r - 1000).ok()
+            }
+        });
+        let _ = tx.send(chosen);
+    });
+    rx.recv().ok().flatten().filter(|&i| i < n)
+}
+
 /// Ask before doing something; `true` if the user chose `action`. Blocks
 /// until answered (any thread).
 pub fn confirm(title: &str, message: &str, action: &str) -> bool {

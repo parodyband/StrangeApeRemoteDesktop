@@ -84,6 +84,34 @@ pub fn choose(title: &str, message: &str, buttons: &[&str]) -> Option<usize> {
     }
 }
 
+/// [`choose`] with a QR code. kdialog renders HTML, so the code goes in the
+/// dialog; zenity can't show images, so the picture opens next to it.
+pub fn choose_with_qr(title: &str, message: &str, qr: &sard_core::qr::QrCode, buttons: &[&str]) -> Option<usize> {
+    let path = sard_core::config::config_dir().join("pairing-qr.png");
+    if sard_core::config::write_private_file(&sard_core::config::config_dir(), "pairing-qr.png", "").is_err()
+        || std::fs::write(&path, qr.to_png(6)).is_err()
+    {
+        return choose(title, message, buttons);
+    }
+    let r = if dialog_tool() == Some("kdialog") {
+        let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\n', "<br>");
+        let html = format!(
+            "<html><p>{}</p><p align=\"center\"><img src=\"{}\" width=\"260\" height=\"260\"></p></html>",
+            esc(message),
+            esc(&path.to_string_lossy())
+        );
+        choose(title, &html, buttons)
+    } else {
+        let viewer = Command::new("xdg-open").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        if let Ok(mut c) = viewer {
+            std::thread::spawn(move || c.wait());
+        }
+        choose(title, message, buttons)
+    };
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
 /// Ask before doing something; `true` if the user chose `action`. Blocks
 /// until answered: call from a background thread.
 pub fn confirm(title: &str, message: &str, action: &str) -> bool {

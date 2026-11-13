@@ -60,7 +60,8 @@ impl std::fmt::Display for NetError {
             NetError::Timeout => f.write_str("timed out (is the host running, reachable, and are we paired?)"),
             NetError::Rejected(s) => write!(f, "rejected: {s}"),
             NetError::Unreachable { addr, error } => {
-                write!(f, "this computer can't send to {} ({error}).", addr.ip())?;
+                let me = if cfg!(target_os = "ios") { "this phone" } else { "this computer" };
+                write!(f, "{me} can't send to {} ({error}).", addr.ip())?;
                 // macOS's Local Network privacy blocks sends to LAN addresses
                 // until the user allows Sard; the failure is a bare errno.
                 if cfg!(target_os = "macos") && is_lan(addr.ip()) {
@@ -2017,9 +2018,13 @@ impl Client {
         let normalized = crate::crypto::normalize_pairing_code(code)
             .ok_or_else(|| NetError::Rejected("the pairing code is 6 digits".into()))?;
         let peer = resolve(addr)?;
-        let socket = bind_for(&peer)?;
-        socket.connect(peer)?;
-        socket.set_read_timeout(Some(Duration::from_millis(300)))?;
+        let open = || -> io::Result<UdpSocket> {
+            let s = bind_for(&peer)?;
+            s.connect(peer)?;
+            s.set_read_timeout(Some(Duration::from_millis(300)))?;
+            Ok(s)
+        };
+        let mut socket = open()?;
         let local_index = crate::rand::u32();
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 2048];
@@ -2040,7 +2045,14 @@ impl Client {
         'pake: while Instant::now() < deadline {
             match socket.send(&pkt) {
                 Ok(_) => sent_once = true,
-                Err(e) => send_failed = Some(e),
+                Err(e) => {
+                    send_failed = Some(e);
+                    // Retry on a new socket: when the user answers iOS's Local
+                    // Network prompt, sockets opened before stay dead (EPIPE).
+                    if let Ok(s) = open() {
+                        socket = s;
+                    }
+                }
             }
             let until = Instant::now() + Duration::from_millis(300);
             while Instant::now() < until {
@@ -2081,8 +2093,13 @@ impl Client {
         // The host answers at once if the code was right; silence means wrong.
         let deadline = deadline.min(Instant::now() + Duration::from_secs(3));
         while Instant::now() < deadline {
-            // Sends worked a moment ago; a failure here is a lost packet.
-            let _ = socket.send(&pkt);
+            // Sends worked a moment ago; a failure here is a lost packet (or a
+            // socket iOS invalidated: use a fresh one next time).
+            if socket.send(&pkt).is_err()
+                && let Ok(s) = open()
+            {
+                socket = s;
+            }
             let until = Instant::now() + Duration::from_millis(300);
             while Instant::now() < until {
                 match socket.recv_from(&mut buf) {

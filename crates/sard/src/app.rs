@@ -596,13 +596,13 @@ impl App {
                 Some((c, _)) => c,
                 None => h.new_pairing_code(),
             };
-            (st.ips, st.name, code)
+            (st.ips, st.name, code, h.pairing_link())
         });
         self.pairing_busy = true;
         let (proxy, args) = (self.proxy.clone(), self.args.clone());
         std::thread::spawn(move || {
             let r = (|| -> Result<Option<String>> {
-                if let Some((ips, name, code)) = here {
+                if let Some((ips, name, code, link)) = here {
                     let addr = ips.first().cloned().unwrap_or(name);
                     // Several when VPNs or virtual adapters (WSL, Docker) add
                     // their own, in case the first isn't the reachable one.
@@ -612,14 +612,25 @@ impl App {
                         }
                         _ => String::new(),
                     };
+                    let qr = link.and_then(|l| sard_core::qr::QrCode::encode(l.as_bytes()));
+                    let phone = if qr.is_some() {
+                        "From an iPhone: scan this code with the Sard app or the Camera.\n\n"
+                    } else {
+                        ""
+                    };
                     let msg = format!(
-                        "To control this computer from another one, choose “Pair a New Computer…” in Sard \
+                        "{phone}To control this computer from another one, choose “Pair a New Computer…” in Sard \
                          there, click Enter Code…, and type:\n\n\
                          Address:  {addr}{others}\nCode:  {code}\n\n\
                          The code works once, within 10 minutes.\n\n\
                          To control another computer from this one, click Enter Code… here instead."
                     );
-                    if platform::choose("Pair a New Computer", &msg, &["Enter Code…", "Done"]) != Some(0) {
+                    let buttons = ["Enter Code…", "Done"];
+                    let choice = match &qr {
+                        Some(qr) => platform::choose_with_qr("Pair a New Computer", &msg, qr, &buttons),
+                        None => platform::choose("Pair a New Computer", &msg, &buttons),
+                    };
+                    if choice != Some(0) {
                         return Ok(None);
                     }
                 }

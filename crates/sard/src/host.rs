@@ -39,6 +39,13 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some((code, _)) = &st.pairing {
         println!();
         println!("  Pairing code:  {code}   (single use, valid for 10 minutes)");
+        if let Some(link) = svc.pairing_link()
+            && let Some(qr) = sard_core::qr::QrCode::encode(link.as_bytes())
+        {
+            println!("\n  Or scan this with the Sard iPhone app (or the iPhone's Camera):\n");
+            print!("{}", qr.to_terminal());
+            println!("  ({link})");
+        }
         let code = code.replace(' ', "");
         println!(
             "  On the other machine run:  sard pair {} {code}",
@@ -101,6 +108,8 @@ pub struct HostService {
     trust: Arc<Mutex<TrustStore>>,
     state: Arc<ServiceState>,
     accept: Option<std::thread::JoinHandle<()>>,
+    /// This computer's public key (goes in the pairing QR code).
+    key: [u8; 32],
 }
 
 const PAIRING_TTL: Duration = Duration::from_secs(600);
@@ -178,6 +187,7 @@ impl HostService {
             trust,
             state: Arc::clone(&state),
             accept: None,
+            key: identity_public,
         };
         let _ = std::fs::remove_file(dir.join("pairing-code.txt"));
         if pair {
@@ -230,6 +240,25 @@ impl HostService {
         self.state.status.lock().unwrap().pairing = Some((code.clone(), Instant::now() + PAIRING_TTL));
         (self.state.on_change)();
         code
+    }
+
+    /// What the pairing QR code holds: addresses, the current code (if one
+    /// is active) and this computer's key, for a phone to pair by scanning.
+    pub fn pairing_link(&self) -> Option<String> {
+        let st = self.status();
+        let (code, _) = st.pairing?;
+        let with_port = |ip: &String| {
+            if st.port == sard_core::DEFAULT_PORT { ip.clone() } else { format!("{ip}:{}", st.port) }
+        };
+        let addrs: Vec<String> = st.ips.iter().take(4).map(with_port).collect();
+        let addrs = if addrs.is_empty() { vec![with_port(&st.name)] } else { addrs };
+        let link = sard_core::pairlink::PairLink {
+            addrs,
+            code: code.chars().filter(char::is_ascii_digit).collect(),
+            key: Some(self.key),
+            name: config::clean_display(&st.name),
+        };
+        Some(link.to_url())
     }
 
     /// Let paired devices open shells on this computer (or not: turning it

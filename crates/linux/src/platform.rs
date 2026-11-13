@@ -81,6 +81,11 @@ pub fn choose(title: &str, message: &str, buttons: &[&str]) -> Option<usize> {
     crate::shell::choose(title, message, buttons)
 }
 
+/// [`choose`] showing a QR code (pairing a phone by scanning it).
+pub fn choose_with_qr(title: &str, message: &str, qr: &sard_core::qr::QrCode, buttons: &[&str]) -> Option<usize> {
+    crate::shell::choose_with_qr(title, message, qr, buttons)
+}
+
 pub fn confirm(title: &str, message: &str, action: &str) -> bool {
     crate::shell::confirm(title, message, action)
 }

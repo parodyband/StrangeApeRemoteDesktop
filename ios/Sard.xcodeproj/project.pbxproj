@@ -222,7 +222,9 @@
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../crates/mobile/include";
+				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Sard;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Sard uses the camera to scan the pairing code your computer shows.";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Sard connects to your computers on this network to show their screens and terminals.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -274,7 +276,9 @@
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../crates/mobile/include";
+				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Sard;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Sard uses the camera to scan the pairing code your computer shows.";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Sard connects to your computers on this network to show their screens and terminals.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;

@@ -9,6 +9,10 @@ struct SardApp: App {
             HomeView()
                 .environmentObject(model)
                 .preferredColorScheme(.dark)
+                // A pairing QR code scanned with the iPhone's Camera opens here.
+                .onOpenURL { url in
+                    if url.scheme == "sard" { model.scannedLink = url.absoluteString }
+                }
         }
     }
 }
@@ -45,6 +49,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var anywhereEnabled = false
     /// The user's own names for computers, by key.
     @Published private var names: [String: String] = [:]
+    /// A scanned pairing code waiting to be paired.
+    @Published var scannedLink: String?
+    /// Ask the home screen to open the scanner (from the manual pairing sheet).
+    @Published var scanRequested = false
 
     init() {
         let defaults = UserDefaults.standard
@@ -61,6 +69,10 @@ final class AppModel: ObservableObject {
         names = defaults.dictionary(forKey: Pref.names) as? [String: String] ?? [:]
         SardCore.start(deviceName: defaults.string(forKey: Pref.deviceName) ?? "iPhone")
         reload()
+        #if DEBUG
+        // Development: `-SardPairLink sard://pair?...` acts like a scanned code.
+        scannedLink = defaults.string(forKey: "SardPairLink")
+        #endif
     }
 
     func reload() {
@@ -82,6 +94,14 @@ final class AppModel: ObservableObject {
         let r = await Task.detached { SardCore.take(sard_pair(address, code)) }.value
         reload()
         if r["ok"] as? Bool == true { return .success(r["name"] as? String ?? address) }
+        return .failure(PairError(message: r["error"] as? String ?? "Pairing failed."))
+    }
+
+    /// Pair from a scanned QR code (blocking work off the main thread).
+    func pair(link: String) async -> Result<String, PairError> {
+        let r = await Task.detached { SardCore.take(sard_pair_link(link)) }.value
+        reload()
+        if r["ok"] as? Bool == true { return .success(r["name"] as? String ?? "your computer") }
         return .failure(PairError(message: r["error"] as? String ?? "Pairing failed."))
     }
 

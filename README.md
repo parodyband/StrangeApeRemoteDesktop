@@ -73,8 +73,10 @@ The Sard iPhone app shows and controls your computers' screens, and opens
 terminals on them. It isn't on the App Store yet: build it from this repository
 with Xcode (see [docs/TECHNICAL.md](docs/TECHNICAL.md#iphone-app)).
 
-- **Pair:** on the computer choose **Pair a New Computer…**, then tap **+** in the
-  app and enter the address and code it shows.
+- **Pair:** on the computer choose **Pair a New Computer…** and scan the QR code it
+  shows, with the iPhone's Camera or **Scan Pairing Code** in the app. (Typing the
+  address and code works too.) `sard host --pair` prints the QR code in the
+  terminal.
 - **Screen:** drag to move the pointer, tap to click, two-finger tap to
   right-click, hold then drag to drag, two fingers to scroll, pinch to zoom. The
   keyboard button brings up the keyboard with Esc, Tab, Ctrl, Alt, ⌘ and arrow

@@ -4,6 +4,7 @@ struct HomeView: View {
     @EnvironmentObject var model: AppModel
     @State private var showPair = false
     @State private var showSettings = false
+    @State private var showScan = false
     #if DEBUG
     @State private var autoOpen: AutoOpen?
     #endif
@@ -12,7 +13,7 @@ struct HomeView: View {
         NavigationStack {
             Group {
                 if model.hosts.isEmpty {
-                    EmptyState(pair: { showPair = true })
+                    EmptyState(scan: { showScan = true }, pair: { showPair = true })
                 } else {
                     List {
                         Section {
@@ -35,11 +36,25 @@ struct HomeView: View {
                         .accessibilityLabel("Settings")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showPair = true } label: { Image(systemName: "plus") }
-                        .accessibilityLabel("Pair a computer")
+                    Menu {
+                        Button { showScan = true } label: { Label("Scan Pairing Code", systemImage: "qrcode.viewfinder") }
+                        Button { showPair = true } label: { Label("Enter Address and Code", systemImage: "keyboard") }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .accessibilityLabel("Pair a computer")
                 }
             }
             .sheet(isPresented: $showPair) { PairView() }
+            .fullScreenCover(isPresented: $showScan) { ScanSheet() }
+            .onChange(of: model.scanRequested) { _, wanted in
+                if wanted {
+                    showScan = true
+                    model.scanRequested = false
+                }
+            }
+            .sheet(item: Binding(get: { model.scannedLink.map(ScannedLink.init) },
+                                 set: { model.scannedLink = $0?.link })) { LinkPairView(link: $0.link) }
             #if DEBUG
             // Development: `-SardAutoOpen screen|terminal` opens the first
             // computer straight away (simulator runs without tapping).
@@ -83,7 +98,13 @@ private struct HostRow: View {
     }
 }
 
+private struct ScannedLink: Identifiable {
+    let link: String
+    var id: String { link }
+}
+
 private struct EmptyState: View {
+    let scan: () -> Void
     let pair: () -> Void
 
     var body: some View {
@@ -92,12 +113,16 @@ private struct EmptyState: View {
                 .font(.system(size: 54))
                 .foregroundStyle(.tint)
             Text("Pair a computer").font(.title2.bold())
-            Text("On the computer, open the Sard menu and choose **Pair a New Computer…** to see its address and a 6-digit code, then enter them here.")
+            Text("On the computer, open the Sard menu and choose **Pair a New Computer…**, then scan the code it shows.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
-            Button("Pair a Computer", action: pair)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+            Button(action: scan) {
+                Label("Scan Pairing Code", systemImage: "qrcode.viewfinder")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            Button("Enter Address and Code Instead", action: pair)
+                .font(.callout)
         }
         .padding(32)
         .frame(maxWidth: 460)

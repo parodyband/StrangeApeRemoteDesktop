@@ -150,6 +150,31 @@ pub extern "C" fn sard_hosts() -> *mut c_char {
     }))
 }
 
+/// Pair at `addr` with `code`; if `expect` is given, only a computer with that
+/// key is accepted (and saved).
+fn pair_at(addr: &str, code: &str, expect: Option<[u8; 32]>, timeout: Duration) -> Result<([u8; 32], String), String> {
+    let g = globals();
+    let identity = config::load_or_create_identity(&g.dir).map_err(|e| e.to_string())?;
+    let (key, name, at) =
+        Client::pair(addr, code, &identity, &net_config(lane::SCREEN), timeout).map_err(|e| e.to_string())?;
+    if expect.is_some_and(|k| k != key) {
+        return Err("the computer that answered isn't the one in the QR code; nothing was saved".into());
+    }
+    let name = config::clean_display(&name);
+    let stored = if at.port() == sard_core::DEFAULT_PORT { at.ip().to_string() } else { at.to_string() };
+    KnownHosts::load(&g.dir).and_then(|mut k| k.add(key, &stored, &name)).map_err(|e| e.to_string())?;
+    Ok((key, name))
+}
+
+fn pair_result(r: Result<([u8; 32], String), String>) -> String {
+    match r {
+        Ok((key, name)) => {
+            Json::object().bool("ok", true).str("key", &sard_core::wire::hex(&key)).str("name", &name).build()
+        }
+        Err(e) => Json::error(&e),
+    }
+}
+
 /// Pair with the computer at `addr` using the 6-digit code it shows.
 /// Blocking (up to ~10 s). `{"ok": true, "key", "name"}` or `{"ok": false, "error"}`.
 #[unsafe(no_mangle)]
@@ -157,23 +182,50 @@ pub unsafe extern "C" fn sard_pair(addr: *const c_char, code: *const c_char) -> 
     // SAFETY: caller contract.
     let (addr, code) = unsafe { (str_arg(addr).trim().to_string(), str_arg(code).to_string()) };
     out_string(guard(Json::error("internal error"), || {
-        let g = globals();
-        let r = (|| -> Result<([u8; 32], String), String> {
-            let identity = config::load_or_create_identity(&g.dir).map_err(|e| e.to_string())?;
-            let (key, name, at) =
-                Client::pair(&addr, &code, &identity, &net_config(lane::SCREEN), Duration::from_secs(10))
-                    .map_err(|e| e.to_string())?;
-            let name = config::clean_display(&name);
-            let stored = if at.port() == sard_core::DEFAULT_PORT { at.ip().to_string() } else { at.to_string() };
-            KnownHosts::load(&g.dir).and_then(|mut k| k.add(key, &stored, &name)).map_err(|e| e.to_string())?;
-            Ok((key, name))
-        })();
-        match r {
-            Ok((key, name)) => {
-                Json::object().bool("ok", true).str("key", &sard_core::wire::hex(&key)).str("name", &name).build()
-            }
-            Err(e) => Json::error(&e),
+        pair_result(pair_at(&addr, &code, None, Duration::from_secs(10)))
+    }))
+}
+
+/// What a scanned pairing link (`sard://pair?...`) holds:
+/// `{"ok": true, "name", "addrs": [...]}` or `{"ok": false, "error"}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sard_parse_pair_link(link: *const c_char) -> *mut c_char {
+    // SAFETY: caller contract.
+    let link = unsafe { str_arg(link) }.to_string();
+    out_string(guard(Json::error("internal error"), || match sard_core::pairlink::PairLink::parse(&link) {
+        Some(l) => {
+            let addrs: Vec<String> = l.addrs.iter().map(|a| json::escape(a)).collect();
+            Json::object().bool("ok", true).str("name", &l.name).raw("addrs", &format!("[{}]", addrs.join(","))).build()
         }
+        None => Json::error("that isn't a Sard pairing code"),
+    }))
+}
+
+/// Pair from a scanned link: tries its addresses in order and accepts only
+/// the computer whose key the link names. Blocking (up to ~12 s). Same
+/// result as `sard_pair`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sard_pair_link(link: *const c_char) -> *mut c_char {
+    // SAFETY: caller contract.
+    let link = unsafe { str_arg(link) }.to_string();
+    out_string(guard(Json::error("internal error"), || {
+        let Some(l) = sard_core::pairlink::PairLink::parse(&link) else {
+            return Json::error("that isn't a Sard pairing code");
+        };
+        let per = Duration::from_secs((12 / l.addrs.len().max(1) as u64).max(4));
+        let mut last = String::new();
+        for addr in &l.addrs {
+            match pair_at(addr, &l.code, l.key, per) {
+                Ok(r) => return pair_result(Ok(r)),
+                // The code was right but already used / wrong: other
+                // addresses reach the same computer, don't spend tries.
+                Err(e) if e.contains("wrong pairing code") || e.contains("isn't the one") => {
+                    return Json::error(&e);
+                }
+                Err(e) => last = e,
+            }
+        }
+        Json::error(&last)
     }))
 }
 

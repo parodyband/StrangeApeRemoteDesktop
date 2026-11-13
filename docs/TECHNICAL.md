@@ -57,6 +57,10 @@ One UDP socket and one network thread; there is no async runtime.
 
 - **Handshake:** Noise IK (X25519, ChaCha20-Poly1305, SHA-256). Handshakes carry a
   WireGuard-style *mac1* and are rate-limited.
+- **Pairing by QR code:** the pairing dialog (and `sard host --pair`) also shows
+  `sard://pair?a=<addresses>&c=<code>&k=<host key>&n=<name>` as a QR code
+  (`crates/core/src/qr.rs`, `pairlink.rs`). The phone tries each address and
+  saves the computer only if the key that answers is the one in the code.
 - **Pairing:** a 6-digit, single-use, 10-minute code. It goes through CPace (a PAKE
   on ristretto255), so the code can't be brute-forced offline, even by an attacker
   in the middle of the exchange. The host withdraws a code after 5 wrong tries. The

@@ -18,6 +18,14 @@ struct PairView: View {
         NavigationStack {
             Form {
                 Section {
+                    Button {
+                        dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { model.scanRequested = true }
+                    } label: {
+                        Label("Scan Pairing Code Instead", systemImage: "qrcode.viewfinder")
+                    }
+                }
+                Section {
                     TextField("Address, e.g. 192.168.1.20", text: $address)
                         .keyboardType(.numbersAndPunctuation)
                         .textInputAutocapitalization(.never)

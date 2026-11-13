@@ -114,6 +114,13 @@ pub fn choose(title: &str, message: &str, buttons: &[&str]) -> Option<usize> {
     crate::shell::choose(title, message, buttons)
 }
 
+/// [`choose`] showing a QR code (pairing a phone by scanning it).
+pub fn choose_with_qr(title: &str, message: &str, qr: &sard_core::qr::QrCode, buttons: &[&str]) -> Option<usize> {
+    // ~260 pt square, sharp on Retina (whole pixels per module at 2x).
+    let scale = (520 / (qr.size + 8)).max(2);
+    crate::shell::choose_with_image(title, message, &qr.to_png(scale), 260.0, buttons)
+}
+
 pub fn confirm(title: &str, message: &str, action: &str) -> bool {
     crate::shell::confirm(title, message, action)
 }

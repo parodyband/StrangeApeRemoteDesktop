@@ -47,6 +47,11 @@ char *sard_hosts(void);
 // Pair using the 6-digit code the computer shows. BLOCKS up to ~10 s.
 // {"ok": true, "key": hex, "name": "..."} or {"ok": false, "error": "..."}
 char *sard_pair(const char *addr, const char *code);
+// A scanned pairing QR code (`sard://pair?...`): {"ok", "name", "addrs"} or
+// {"ok": false, "error"}. sard_pair_link pairs from it (BLOCKS up to ~12 s;
+// tries each address; accepts only the computer whose key the code names).
+char *sard_parse_pair_link(const char *link);
+char *sard_pair_link(const char *link);
 bool sard_forget(const char *key);
 bool sard_set_address(const char *key, const char *addr);
 // Connect Anywhere: {"enabled": bool}; set the invite code ("" turns it off).

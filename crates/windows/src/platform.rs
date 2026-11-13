@@ -95,6 +95,33 @@ pub fn choose(title: &str, message: &str, buttons: &[&str]) -> Option<usize> {
     crate::shell::choose(title, message, buttons)
 }
 
+/// [`choose`] showing a QR code (pairing a phone by scanning it): the
+/// picture opens in the image viewer next to the dialog (task dialogs can't
+/// show one big enough to scan).
+pub fn choose_with_qr(title: &str, message: &str, qr: &sard_core::qr::QrCode, buttons: &[&str]) -> Option<usize> {
+    let dir = sard_core::config::config_dir();
+    let path = dir.join("pairing-qr.png");
+    if sard_core::config::write_private_file(&dir, "pairing-qr.png", "").is_ok()
+        && std::fs::write(&path, qr.to_png(8)).is_ok()
+    {
+        let (op, file) = (crate::sys::wide("open"), crate::sys::wide(&path.to_string_lossy()));
+        // SAFETY: valid NUL-terminated wide strings; no window, parameters or directory.
+        unsafe {
+            crate::sys::ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            );
+        }
+    }
+    let r = crate::shell::choose(title, message, buttons);
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
 pub fn set_launch_at_login(enabled: bool) -> media::Result<()> {
     crate::shell::set_launch_at_login(enabled)
 }
