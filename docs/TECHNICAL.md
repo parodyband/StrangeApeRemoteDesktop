@@ -44,7 +44,7 @@ does not include the display's scan-out.
 | Present | EGL + OpenGL via CUDA/GL interop | Metal (`CAMetalLayer`) | Direct3D 11 flip model |
 | Input | RemoteDesktop portal | CGEvent | SendInput |
 | Audio | PipeWire | ScreenCaptureKit / CoreAudio | WASAPI (loopback) |
-| Clipboard | Klipper (D-Bus), wl-clipboard | NSPasteboard | Win32 clipboard |
+| Clipboard | Text: Klipper (D-Bus) or wl-clipboard; images: wl-clipboard (`wl-paste --watch`) | NSPasteboard | Win32 clipboard (PNG and DIB) |
 | Cursor | PipeWire cursor metadata | NSCursor + CGEvent location | DXGI pointer shape |
 | Tray | StatusNotifierItem + dbusmenu | NSStatusItem | Notification area icon |
 
@@ -103,6 +103,28 @@ injects no input; the reliable channel then carries `ShellOpen` / `ShellData` /
 - Off until the host's owner turns on **Allow Terminal Access** (`terminal=on` in
   `settings.txt`, or `sard host --terminal`): pairing for screen sharing shouldn't
   silently grant a shell. Turning it off ends running shells.
+
+### Clipboard
+
+Both ends poll their clipboard every 300 ms (backends cache by the system's change
+counter, so an unchanged clipboard costs almost nothing) and send what changed over
+the reliable channel. Text wins when the clipboard has both: spreadsheets and word
+processors put a picture of the selection next to its text.
+
+- Images travel as PNG in 32 KB `Control::ClipboardImage` pieces, each sent only
+  while fewer than 128 reliable segments are unacknowledged, so a 10 MB screenshot
+  doesn't queue up in front of keystrokes (6 MB crosses loopback in about 0.3 s).
+  Newer clipboard contents abandon an unfinished image. Older peers ignore the
+  message.
+- Echoes are suppressed by remembering the last thing sent or received; an image
+  that comes back re-encoded (a clipboard manager taking it over) is compared by
+  pixels.
+- Windows apps often offer only a bitmap (`CF_DIB`, e.g. PrintScreen), and many
+  only paste one, so `core::png` decodes and encodes PNG and `core::deflate` has a
+  small zlib codec (no dependencies).
+- Linux needs `wl-clipboard` for images: Klipper's D-Bus API is text-only. A
+  `wl-paste --watch` child signals changes, which needs the data-control protocol
+  (KDE, wlroots desktops; not GNOME).
 
 ### Fit to the viewer's screen
 

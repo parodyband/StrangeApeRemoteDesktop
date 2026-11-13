@@ -1,4 +1,7 @@
-//! The Windows text clipboard (`CF_UNICODETEXT`).
+//! The Windows clipboard: text (`CF_UNICODETEXT`) and images. Images travel
+//! as PNG: read from the "PNG" format apps like browsers add, else converted
+//! from the bitmap (`CF_DIBV5` / `CF_DIB`, e.g. PrintScreen); written as both
+//! PNG and a bitmap so every app can paste.
 //!
 //! Setting the clipboard needs an owner window, and an owner window's thread
 //! must keep processing messages (other programs' `EmptyClipboard` sends it
@@ -8,16 +11,28 @@
 
 use crate::sys::{self, HWND, LPARAM, LRESULT, WPARAM};
 use sard_core::media::Clipboard;
-use std::sync::mpsc;
+use std::sync::{Arc, OnceLock, mpsc};
 
 const WM_CLIP_GET: u32 = sys::WM_APP + 1;
 const WM_CLIP_SET: u32 = sys::WM_APP + 2;
+const WM_CLIP_GET_IMAGE: u32 = sys::WM_APP + 3;
+const WM_CLIP_SET_IMAGE: u32 = sys::WM_APP + 4;
 
 pub struct WinClipboard {
     hwnd: usize,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Clipboard sequence number the caches below belong to.
     seq: u32,
-    cached: Option<String>,
+    /// None: not read since the clipboard changed.
+    text: Option<Option<String>>,
+    image: Option<Option<Arc<[u8]>>>,
+}
+
+/// The registered "PNG" clipboard format.
+fn png_format() -> u32 {
+    static F: OnceLock<u32> = OnceLock::new();
+    // SAFETY: NUL-terminated name.
+    *F.get_or_init(|| unsafe { sys::RegisterClipboardFormatW(sys::wide("PNG").as_ptr()) })
 }
 
 fn open(hwnd: HWND) -> bool {
@@ -55,6 +70,92 @@ fn read_text(hwnd: HWND) -> Option<String> {
     text.map(|t| t.replace("\r\n", "\n"))
 }
 
+/// Copy a clipboard format's bytes (clipboard open).
+///
+/// # Safety
+/// The clipboard is open on this thread.
+unsafe fn read_bytes(format: u32) -> Option<Vec<u8>> {
+    // SAFETY: the handle stays valid until CloseClipboard; we read within GlobalSize.
+    unsafe {
+        let h = sys::GetClipboardData(format);
+        if h.is_null() {
+            return None;
+        }
+        let p = sys::GlobalLock(h) as *const u8;
+        if p.is_null() {
+            return None;
+        }
+        let v = std::slice::from_raw_parts(p, sys::GlobalSize(h)).to_vec();
+        sys::GlobalUnlock(h);
+        Some(v)
+    }
+}
+
+/// Put bytes on the clipboard in `format` (clipboard open and emptied by us).
+///
+/// # Safety
+/// The clipboard is open on this thread, owned by our window.
+unsafe fn write_bytes(format: u32, data: &[u8]) -> bool {
+    // SAFETY: on success the system owns the memory; otherwise we free it.
+    unsafe {
+        let h = sys::GlobalAlloc(sys::GMEM_MOVEABLE, data.len().max(1));
+        if h.is_null() {
+            return false;
+        }
+        let p = sys::GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            sys::GlobalFree(h);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+        sys::GlobalUnlock(h);
+        if sys::SetClipboardData(format, h).is_null() {
+            sys::GlobalFree(h);
+            return false;
+        }
+        true
+    }
+}
+
+/// The clipboard's image as PNG, unless it also has text.
+fn read_image(hwnd: HWND) -> Option<Vec<u8>> {
+    // SAFETY: plain queries.
+    let has = |f: u32| unsafe { sys::IsClipboardFormatAvailable(f) } != 0;
+    let png = png_format();
+    if has(sys::CF_UNICODETEXT) || !(has(png) || has(sys::CF_DIB) || has(sys::CF_DIBV5)) || !open(hwnd) {
+        return None;
+    }
+    // SAFETY: clipboard open by us; closed below.
+    let (png, dib) = unsafe {
+        let p = if png != 0 { read_bytes(png) } else { None };
+        let p = p.and_then(|p| sard_core::png::byte_len(&p).map(|n| p[..n].to_vec()));
+        let d = if p.is_none() { read_bytes(sys::CF_DIBV5).or_else(|| read_bytes(sys::CF_DIB)) } else { None };
+        sys::CloseClipboard();
+        (p, d)
+    };
+    png.or_else(|| {
+        let (w, h, rgba) = sard_core::dib::to_rgba(&dib?)?;
+        Some(sard_core::png::encode_rgba(w, h, &rgba))
+    })
+}
+
+fn write_image(hwnd: HWND, png: &[u8], dib: Option<&[u8]>) -> bool {
+    if !open(hwnd) {
+        sard_core::debug!("clipboard busy; image not set");
+        return false;
+    }
+    // SAFETY: clipboard open by our window.
+    unsafe {
+        sys::EmptyClipboard();
+        let mut ok = png_format() != 0 && write_bytes(png_format(), png);
+        if let Some(d) = dib {
+            ok |= write_bytes(sys::CF_DIB, d);
+        }
+        sys::CloseClipboard();
+        ok
+    }
+}
+
 fn write_text(hwnd: HWND, text: &str) {
     let crlf = text.replace("\r\n", "\n").replace('\n', "\r\n");
     let w: Vec<u16> = crlf.encode_utf16().chain(std::iter::once(0)).collect();
@@ -82,6 +183,12 @@ fn write_text(hwnd: HWND, text: &str) {
     }
 }
 
+struct SetImage<'a> {
+    png: &'a [u8],
+    dib: Option<Vec<u8>>,
+    ok: bool,
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CLIP_GET => {
@@ -94,6 +201,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // SAFETY: the sender passes a live &str and waits for us.
             let text = unsafe { &*(lp as *const &str) };
             write_text(hwnd, text);
+            0
+        }
+        WM_CLIP_GET_IMAGE => {
+            // SAFETY: the sender passes a live &mut Option<Vec<u8>> and waits for us.
+            let out = unsafe { &mut *(lp as *mut Option<Vec<u8>>) };
+            *out = read_image(hwnd);
+            0
+        }
+        WM_CLIP_SET_IMAGE => {
+            // SAFETY: the sender passes a live SetImage and waits for us.
+            let req = unsafe { &mut *(lp as *mut SetImage) };
+            req.ok = write_image(hwnd, req.png, req.dib.as_deref());
             0
         }
         sys::WM_CLOSE => {
@@ -174,32 +293,71 @@ impl WinClipboard {
         if hwnd == 0 {
             return None;
         }
-        Some(WinClipboard { hwnd, thread: Some(thread), seq: 0, cached: None })
+        Some(WinClipboard { hwnd, thread: Some(thread), seq: 0, text: None, image: None })
+    }
+
+    /// Forget cached contents if the clipboard changed since they were read.
+    /// Unchanged: don't open the clipboard (other programs may be using it).
+    fn check_seq(&mut self) {
+        // SAFETY: plain query.
+        let seq = unsafe { sys::GetClipboardSequenceNumber() };
+        if seq == 0 || seq != self.seq {
+            self.seq = seq;
+            self.text = None;
+            self.image = None;
+        }
+    }
+
+    /// After we wrote the clipboard: our own write isn't a change to read back.
+    fn wrote(&mut self, text: Option<String>, image: Option<Arc<[u8]>>) {
+        // SAFETY: plain query.
+        self.seq = unsafe { sys::GetClipboardSequenceNumber() };
+        self.text = Some(text);
+        self.image = Some(image);
     }
 }
 
 impl Clipboard for WinClipboard {
     fn get(&mut self) -> Option<String> {
-        // Unchanged since the last read: don't open the clipboard (other programs may be using it).
-        // SAFETY: plain query.
-        let seq = unsafe { sys::GetClipboardSequenceNumber() };
-        if seq != 0 && seq == self.seq {
-            return self.cached.clone();
-        }
-        let mut out: Option<String> = None;
-        // SAFETY: synchronous; `out` outlives the call.
-        unsafe { sys::SendMessageW(self.hwnd as HWND, WM_CLIP_GET, 0, &mut out as *mut _ as LPARAM) };
-        self.seq = seq;
-        self.cached = out.clone();
-        out
+        self.check_seq();
+        let hwnd = self.hwnd as HWND;
+        self.text
+            .get_or_insert_with(|| {
+                let mut out: Option<String> = None;
+                // SAFETY: synchronous; `out` outlives the call.
+                unsafe { sys::SendMessageW(hwnd, WM_CLIP_GET, 0, &mut out as *mut _ as LPARAM) };
+                out
+            })
+            .clone()
     }
 
     fn set(&mut self, text: &str) {
         // SAFETY: synchronous; `text` outlives the call.
         unsafe { sys::SendMessageW(self.hwnd as HWND, WM_CLIP_SET, 0, &text as *const &str as LPARAM) };
-        // SAFETY: plain query.
-        self.seq = unsafe { sys::GetClipboardSequenceNumber() };
-        self.cached = Some(text.to_string());
+        self.wrote(Some(text.to_string()), None);
+    }
+
+    fn get_image(&mut self) -> Option<Arc<[u8]>> {
+        self.check_seq();
+        let hwnd = self.hwnd as HWND;
+        self.image
+            .get_or_insert_with(|| {
+                let mut out: Option<Vec<u8>> = None;
+                // SAFETY: synchronous; `out` outlives the call.
+                unsafe { sys::SendMessageW(hwnd, WM_CLIP_GET_IMAGE, 0, &mut out as *mut _ as LPARAM) };
+                out.map(Into::into)
+            })
+            .clone()
+    }
+
+    fn set_image(&mut self, png: &[u8]) -> bool {
+        // A bitmap too, for apps that don't read PNG (decoded here, off the window thread).
+        let dib = sard_core::png::decode(png).map(|i| sard_core::dib::from_rgba(i.width, i.height, &i.rgba));
+        let mut req = SetImage { png, dib, ok: false };
+        // SAFETY: synchronous; `req` outlives the call.
+        unsafe { sys::SendMessageW(self.hwnd as HWND, WM_CLIP_SET_IMAGE, 0, &mut req as *mut _ as LPARAM) };
+        self.wrote(None, Some(png.into()));
+        req.ok
     }
 }
 

@@ -592,6 +592,11 @@ fn forward_events(
                     c.on_remote(text);
                 }
             }
+            Event::Control(Control::ClipboardImage { serial, total, offset, data }) => {
+                if let Some(c) = &clip {
+                    c.on_remote_image(serial, total, offset, data);
+                }
+            }
             Event::Audio(bytes) => {
                 if let (Some(a), Ok(p)) = (&audio, AudioPacket::decode(&bytes)) {
                     a.push(p.seq, &p.samples);

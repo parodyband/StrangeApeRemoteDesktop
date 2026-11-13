@@ -913,6 +913,11 @@ fn input_loop(
                         c.on_remote(text);
                     }
                 }
+                Control::ClipboardImage { serial, total, offset, data } => {
+                    if let Some(c) = &clip {
+                        c.on_remote_image(serial, total, offset, data);
+                    }
+                }
                 other => sard_core::debug!("ignoring control message {other:?}"),
             },
             Event::CursorPos { .. } | Event::Audio(_) => {}

@@ -75,6 +75,8 @@ pub const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
 pub const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 pub const GMEM_MOVEABLE: u32 = 0x0002;
 pub const CF_UNICODETEXT: u32 = 13;
+pub const CF_DIB: u32 = 8;
+pub const CF_DIBV5: u32 = 17;
 pub const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
 pub const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
 
@@ -653,6 +655,8 @@ unsafe extern "system" {
     pub fn GetClipboardData(format: u32) -> HANDLE;
     pub fn SetClipboardData(format: u32, data: HANDLE) -> HANDLE;
     pub fn GetClipboardSequenceNumber() -> u32;
+    pub fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    pub fn IsClipboardFormatAvailable(format: u32) -> BOOL;
     pub fn GetDC(hwnd: HWND) -> HDC;
     pub fn ReleaseDC(hwnd: HWND, dc: HDC) -> i32;
     pub fn GetMonitorInfoW(monitor: HMONITOR, info: *mut MONITORINFOEXW) -> BOOL;

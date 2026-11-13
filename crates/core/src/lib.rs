@@ -11,6 +11,8 @@ pub mod av1;
 pub mod clock;
 pub mod config;
 pub mod crypto;
+pub mod deflate;
+pub mod dib;
 pub mod fec;
 pub mod input;
 pub mod log;

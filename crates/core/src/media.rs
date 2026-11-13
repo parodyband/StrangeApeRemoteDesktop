@@ -333,10 +333,22 @@ pub trait Tray: Send + Sync {
     fn set_active(&self, active: bool);
 }
 
-/// System clipboard (plain text).
+/// System clipboard: text, and images as PNG.
 pub trait Clipboard: Send {
+    /// The clipboard's text, if it has any.
     fn get(&mut self) -> Option<String>;
     fn set(&mut self, text: &str);
+    /// The clipboard's image as PNG, when it holds an image and no text
+    /// (text wins: spreadsheets and word processors put a picture of the
+    /// selection next to its text). Polled often, so implementations cache
+    /// by the system's change counter instead of re-reading.
+    fn get_image(&mut self) -> Option<std::sync::Arc<[u8]>> {
+        None
+    }
+    /// Put a PNG image on the clipboard; false if this platform can't.
+    fn set_image(&mut self, _png: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Small adaptive jitter buffer for interleaved stereo s16.

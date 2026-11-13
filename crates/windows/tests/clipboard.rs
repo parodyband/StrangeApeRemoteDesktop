@@ -19,6 +19,15 @@ fn round_trip() {
         Some(t) => assert_eq!(t, text),
         None => eprintln!("skipping: clipboard not readable in this session"),
     }
+
+    // Images: written as PNG and a bitmap, read back as the same PNG.
+    let png = sard_core::png::encode_rgba(3, 2, &[9u8; 24]);
+    assert!(a.set_image(&png));
+    assert_eq!(b.get(), None, "no text after an image");
+    assert_eq!(b.get_image().as_deref(), Some(&png[..]));
+    let mut c = WinClipboard::open().unwrap();
+    assert_eq!(c.get_image().as_deref(), Some(&png[..]));
+
     if let Some(t) = before {
         a.set(&t);
     }

@@ -10,7 +10,7 @@ Fast remote desktop for Mac, Linux and Windows, made for 3D and game development
 - **Feels local.** Your other computer's screen shows up in a window in a few
   milliseconds, smooth enough for Unity, Unreal, Blender and games.
 - **Every screen.** Switch between the other computer's monitors with one click.
-- **Sound and clipboard come along.** Copy on one computer, paste on the other.
+- **Sound and clipboard come along.** Copy text or a picture on one computer, paste it on the other.
 - **Private.** Your computers pair once with a 6-digit code and only talk to each
   other, encrypted. No accounts needed.
 - **From your iPhone too.** Control a computer's screen from your phone, or open a
@@ -124,6 +124,9 @@ permissions. The Sard menu shows a shortcut to each one that's missing:
 **Linux:** the first time someone connects, your desktop asks which screens to
 share. Select **all** of them if you want to switch between screens. Sard remembers
 your answer; **Choose Screens to Share…** in the menu asks again.
+Copying pictures between computers needs `wl-clipboard` (`sudo apt install
+wl-clipboard`, `sudo dnf install wl-clipboard` or `sudo pacman -S wl-clipboard`); text
+works without it.
 
 **Windows:** allow Sard through Windows Firewall when asked (the first time your PC
 is shared).

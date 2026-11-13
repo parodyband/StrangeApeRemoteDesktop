@@ -236,6 +236,16 @@ pub enum Control {
     Clipboard {
         text: String,
     },
+    /// Part of a clipboard image (PNG), sent in pieces so a big image never
+    /// floods the reliable channel ahead of input. Pieces of one image share
+    /// a `serial` and arrive in order; `offset + data.len() == total` ends it.
+    /// Newer clipboard contents (text or image) replace an unfinished image.
+    ClipboardImage {
+        serial: u32,
+        total: u32,
+        offset: u32,
+        data: Vec<u8>,
+    },
     /// Client asks for a different bitrate (0 = automatic).
     SetBitrate {
         kbps: u32,
@@ -377,6 +387,7 @@ mod tag {
     pub const SHELL_LIST: u8 = 23;
     pub const SHELLS: u8 = 24;
     pub const SHELL_ACK: u8 = 25;
+    pub const CLIPBOARD_IMAGE: u8 = 26;
 }
 
 impl Control {
@@ -443,6 +454,13 @@ impl Control {
             Control::Clipboard { text } => {
                 b.put_u8(tag::CLIPBOARD);
                 b.put_blob32(text.as_bytes());
+            }
+            Control::ClipboardImage { serial, total, offset, data } => {
+                b.put_u8(tag::CLIPBOARD_IMAGE);
+                b.put_u32(*serial);
+                b.put_u32(*total);
+                b.put_u32(*offset);
+                b.put_blob32(data);
             }
             Control::SetBitrate { kbps } => {
                 b.put_u8(tag::SET_BITRATE);
@@ -580,6 +598,12 @@ impl Control {
             tag::CLIPBOARD => {
                 Control::Clipboard { text: String::from_utf8(r.blob32()?.to_vec()).map_err(|_| WireError)? }
             }
+            tag::CLIPBOARD_IMAGE => Control::ClipboardImage {
+                serial: r.u32()?,
+                total: r.u32()?,
+                offset: r.u32()?,
+                data: r.blob32()?.to_vec(),
+            },
             tag::SET_BITRATE => Control::SetBitrate { kbps: r.u32()? },
             tag::RELEASE_ALL => Control::ReleaseAll,
             tag::AUDIO_CONFIG => Control::AudioConfig { sample_rate: r.u32()?, channels: r.u8()? },
@@ -799,6 +823,7 @@ mod tests {
                 rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
             },
             Control::Clipboard { text: "copy ✂".into() },
+            Control::ClipboardImage { serial: 4, total: 10, offset: 6, data: vec![1, 2, 3, 4] },
             Control::SetBitrate { kbps: 1 },
             Control::ReleaseAll,
             Control::AudioConfig { sample_rate: 48000, channels: 2 },
