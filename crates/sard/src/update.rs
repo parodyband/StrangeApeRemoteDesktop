@@ -717,7 +717,49 @@ fn install_binary(info: &UpdateInfo, exe: &Path) -> Result<()> {
     if let Ok(d) = fs::File::open(dir) {
         let _ = d.sync_all();
     }
+    refresh_icons(&single_entry(&x)?.join("share/icons/hicolor"), dir);
     Ok(())
+}
+
+/// Linux: replace the app icons `install.sh` put next to the binary (`<bin>/../share` or `$XDG_DATA_HOME`) with
+/// the release's, so a logo change reaches the menu, taskbar and viewer windows. Only icons that are already
+/// installed are replaced; best effort, since the binary update has already succeeded.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn refresh_icons(new: &Path, bindir: &Path) {
+    let mut roots: Vec<PathBuf> = bindir.parent().map(|p| p.join("share")).into_iter().collect();
+    match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        Some(d) => roots.push(PathBuf::from(d)),
+        None => roots.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))),
+    }
+    roots.dedup();
+    let Ok(sizes) = fs::read_dir(new) else { return };
+    let sizes: Vec<OsString> = sizes.filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+    for root in roots {
+        let theme = root.join("icons/hicolor");
+        let mut changed = false;
+        for size in &sizes {
+            let rel = Path::new(size).join("apps/sard.png");
+            let (src, dest) = (new.join(&rel), theme.join(&rel));
+            if !dest.is_file() || fs::read(&src).ok() == fs::read(&dest).ok() {
+                continue;
+            }
+            let staged = dest.with_extension(format!("png.tmp.{}", std::process::id()));
+            match fs::copy(&src, &staged).and_then(|_| fs::rename(&staged, &dest)) {
+                Ok(()) => changed = true,
+                Err(e) => {
+                    let _ = fs::remove_file(&staged);
+                    sard_core::warn!("cannot update {}: {e}", dest.display());
+                }
+            }
+        }
+        if changed {
+            // Icon caches (GTK's, KDE's) notice a newer theme directory and reload.
+            let _ = fs::File::open(&theme).and_then(|d| d.set_modified(std::time::SystemTime::now()));
+            if theme.join("icon-theme.cache").is_file() {
+                let _ = quiet("gtk-update-icon-cache").args(["-q", "-t", "-f"]).arg(&theme).status();
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -880,6 +922,24 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap_or_else(|| panic!("parse {s}"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn refresh_icons_replaces_only_installed_ones() {
+        let tmp = TempDir::new_in(&std::env::temp_dir(), "sard-icon-test").unwrap();
+        let (new, prefix) = (tmp.0.join("new"), tmp.0.join("prefix"));
+        for s in ["16x16", "32x32"] {
+            fs::create_dir_all(new.join(s).join("apps")).unwrap();
+            fs::write(new.join(s).join("apps/sard.png"), format!("new {s}")).unwrap();
+        }
+        let theme = prefix.join("share/icons/hicolor");
+        fs::create_dir_all(theme.join("16x16/apps")).unwrap();
+        fs::write(theme.join("16x16/apps/sard.png"), "old").unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        refresh_icons(&new, &prefix.join("bin"));
+        assert_eq!(fs::read_to_string(theme.join("16x16/apps/sard.png")).unwrap(), "new 16x16");
+        assert!(!theme.join("32x32/apps/sard.png").exists());
     }
 
     #[test]
