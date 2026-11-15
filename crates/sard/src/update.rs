@@ -717,7 +717,7 @@ fn install_binary(info: &UpdateInfo, exe: &Path) -> Result<()> {
     if let Ok(d) = fs::File::open(dir) {
         let _ = d.sync_all();
     }
-    refresh_icons(&single_entry(&x)?.join("share/icons/hicolor"), dir);
+    refresh_icons(&single_entry(&x)?.join("share/icons/hicolor"), &icon_roots(dir));
     Ok(())
 }
 
@@ -725,13 +725,18 @@ fn install_binary(info: &UpdateInfo, exe: &Path) -> Result<()> {
 /// the release's, so a logo change reaches the menu, taskbar and viewer windows. Only icons that are already
 /// installed are replaced; best effort, since the binary update has already succeeded.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn refresh_icons(new: &Path, bindir: &Path) {
+fn icon_roots(bindir: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = bindir.parent().map(|p| p.join("share")).into_iter().collect();
     match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         Some(d) => roots.push(PathBuf::from(d)),
         None => roots.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))),
     }
     roots.dedup();
+    roots
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn refresh_icons(new: &Path, roots: &[PathBuf]) {
     let Ok(sizes) = fs::read_dir(new) else { return };
     let sizes: Vec<OsString> = sizes.filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
     for root in roots {
@@ -936,8 +941,7 @@ mod tests {
         let theme = prefix.join("share/icons/hicolor");
         fs::create_dir_all(theme.join("16x16/apps")).unwrap();
         fs::write(theme.join("16x16/apps/sard.png"), "old").unwrap();
-        fs::create_dir_all(prefix.join("bin")).unwrap();
-        refresh_icons(&new, &prefix.join("bin"));
+        refresh_icons(&new, &[prefix.join("share")]);
         assert_eq!(fs::read_to_string(theme.join("16x16/apps/sard.png")).unwrap(), "new 16x16");
         assert!(!theme.join("32x32/apps/sard.png").exists());
     }
