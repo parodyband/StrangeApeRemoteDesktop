@@ -38,6 +38,9 @@ const RTT_BASE_US: u64 = 30_000_000;
 const REPORT_INTERVAL_US: u64 = 250_000;
 const KEEPALIVE_US: u64 = 1_000_000;
 const TIMEOUT_US: u64 = 10_000_000;
+/// macOS hosts: a session silent this long gets a new socket (see `Shared::revive`).
+#[cfg(target_os = "macos")]
+const REVIVE_AFTER_US: u64 = 1_000_000;
 
 #[derive(Debug)]
 pub enum NetError {
@@ -247,6 +250,11 @@ struct Conn {
     closed: AtomicBool,
     last_recv_us: AtomicU64,
     last_send_us: AtomicU64,
+    /// Socket replacements while silent (macOS hosts), and when the last was.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    revivals: AtomicU32,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    revived_at_us: AtomicU64,
     tx_bytes: AtomicU64,
     tx_packets: AtomicU64,
     mouse_seq_tx: AtomicU32,
@@ -321,6 +329,8 @@ impl Conn {
             closed: AtomicBool::new(false),
             last_recv_us: AtomicU64::new(now),
             last_send_us: AtomicU64::new(now),
+            revivals: AtomicU32::new(0),
+            revived_at_us: AtomicU64::new(now),
             tx_bytes: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),
             mouse_seq_tx: AtomicU32::new(0),
@@ -1125,6 +1135,63 @@ impl Shared {
         None
     }
 
+    /// macOS hosts: Local Network privacy now and then drops its cached
+    /// approval of Sard and re-checks it on the next LAN packet. A connected
+    /// socket set up or used during that re-check stays blocked both ways for
+    /// its lifetime: a live session goes silent until it times out, and a new
+    /// one never completes (the viewer's handshake resends land on the dead
+    /// socket), so connecting only worked on the second try.
+    ///
+    /// So a session that goes quiet on its own socket moves to the listening
+    /// socket (checked per packet; the dead socket closes once its reader
+    /// sees the switch, which also frees its address pair), and once packets
+    /// flow again it gets a fresh connected socket for speed. After a few
+    /// such rounds it stays on the listening socket.
+    #[cfg(target_os = "macos")]
+    fn revive(self: &Arc<Self>, c: &Arc<Conn>, now: u64) {
+        const MAX_REVIVALS: u32 = 3;
+        if self.connected.load(Ordering::Relaxed) || lock(&self.accept_tx).is_none() || c.closed.load(Ordering::Relaxed)
+        {
+            return; // clients use one connected socket for everything
+        }
+        let silent = now.saturating_sub(c.last_recv_us.load(Ordering::Relaxed));
+        if now.saturating_sub(c.revived_at_us.load(Ordering::Relaxed)) < REVIVE_AFTER_US {
+            return;
+        }
+        let (own, peer) = {
+            let io = lock(&c.io);
+            if io.relay.is_some() {
+                return;
+            }
+            (io.connected, io.peer)
+        };
+        let revivals = c.revivals.load(Ordering::Relaxed);
+        if own && silent >= REVIVE_AFTER_US {
+            info!(
+                "nothing from {} at {peer} for {} ms; moving it to the listening socket",
+                c.remote_name,
+                silent / 1000
+            );
+            c.revivals.fetch_add(1, Ordering::Relaxed);
+            c.revived_at_us.store(now, Ordering::Relaxed);
+            let mut io = lock(&c.io);
+            (io.socket, io.connected) = (Arc::clone(&self.socket), false);
+        } else if !own && revivals > 0 && revivals <= MAX_REVIVALS && silent < 4 * PING_INTERVAL_US {
+            // Retried every second until the old socket has closed.
+            c.revived_at_us.store(now, Ordering::Relaxed);
+            let Some(s) = self.session_socket(peer) else { return };
+            {
+                let mut io = lock(&c.io);
+                if io.peer != peer || io.connected {
+                    return; // roamed meanwhile
+                }
+                (io.socket, io.connected) = (Arc::clone(&s), true);
+            }
+            info!("{} at {peer} is back; giving it its own socket again", c.remote_name);
+            self.spawn_session_reader(s, Arc::clone(c));
+        }
+    }
+
     /// Receive loop for a per-session socket (ends when the session closes
     /// or the peer roams to another address).
     fn spawn_session_reader(self: &Arc<Self>, sock: Arc<UdpSocket>, conn: Arc<Conn>) {
@@ -1183,6 +1250,8 @@ impl Shared {
                 last_tick = now;
                 let sessions: Vec<Arc<Conn>> = lock(&self.sessions).values().cloned().collect();
                 for c in sessions {
+                    #[cfg(target_os = "macos")]
+                    self.revive(&c, now);
                     c.tick(now);
                     if c.closed.load(Ordering::Relaxed) {
                         lock(&self.sessions).remove(&c.local_index);
@@ -2140,5 +2209,58 @@ fn pairing_recv_error(e: io::Error, until: Instant) {
             debug!("pairing: receive: {e}");
             std::thread::sleep(until.saturating_duration_since(Instant::now()));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// A host session whose own socket goes dead (as when a macOS Local
+    /// Network privacy re-check blocks it) moves to a new socket instead of
+    /// timing out.
+    #[test]
+    fn dead_session_socket_is_replaced() {
+        let (host_id, client_id) = (Keypair::generate(), Keypair::generate());
+        let trusted = HashMap::from([(client_id.public(), "client".to_string())]);
+        let opts = HostOptions { trusted, pairing_code: None, on_paired: None };
+        let host = Host::bind("127.0.0.1:0".parse().unwrap(), host_id.clone(), NetConfig::default(), opts).unwrap();
+        let addr = host.local_addr().unwrap().to_string();
+        let client =
+            Client::connect(&addr, host_id.public(), client_id, NetConfig::default(), Duration::from_secs(3)).unwrap();
+        let served = host.accept(Duration::from_secs(3)).unwrap();
+        let events = served.take_events().unwrap();
+
+        let dead = {
+            let io = lock(&served.conn.io);
+            assert!(io.connected, "macOS hosts give each session its own socket");
+            Arc::clone(&io.socket)
+        };
+        // SAFETY: shutdown(2) on a descriptor that `dead` keeps open.
+        assert_eq!(unsafe { libc::shutdown(dead.as_raw_fd(), libc::SHUT_RDWR) }, 0);
+        drop(dead);
+
+        client.send_control(&Control::ReleaseAll);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Event::Control(Control::ReleaseAll)) => break,
+                Ok(Event::Disconnected(r)) => panic!("session dropped: {r}"),
+                Ok(_) => {}
+                Err(_) => panic!("nothing arrived after the session socket died"),
+            }
+        }
+        assert_eq!(served.conn.revivals.load(Ordering::Relaxed), 1);
+
+        // Once packets flow again it gets a working socket of its own back.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock(&served.conn.io).connected {
+            assert!(Instant::now() < deadline, "never moved back to its own socket");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        client.send_control(&Control::ReleaseAll);
+        assert!(matches!(events.recv_timeout(Duration::from_secs(2)), Ok(Event::Control(Control::ReleaseAll))));
+        assert!(!served.is_closed() && !client.is_closed());
     }
 }
