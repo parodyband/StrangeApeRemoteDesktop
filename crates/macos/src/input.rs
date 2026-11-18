@@ -373,6 +373,10 @@ impl CgInput {
     }
 
     fn key(&mut self, code: u16, down: bool) {
+        self.key_event(code, down, false);
+    }
+
+    fn key_event(&mut self, code: u16, down: bool, repeat: bool) {
         if let Some(m) = modifier_mask(code) {
             // Device-independent bit stays set while either side is held.
             let dev = m & 0xffff;
@@ -403,6 +407,7 @@ impl CgInput {
             let ev = CGEventCreateKeyboardEvent(self.source, vk, down);
             if !ev.is_null() {
                 CGEventSetFlags(ev, self.flags() | key_flags(vk));
+                CGEventSetIntegerValueField(ev, kCGKeyboardEventAutorepeat, repeat as i64);
             }
             ev
         };
@@ -465,6 +470,7 @@ impl InputSink for CgInput {
         }
         match *ev {
             InputEvent::Key { code, down } => self.key(code, down),
+            InputEvent::KeyRepeat { code } => self.key_event(code, true, true),
             InputEvent::Button { button, down } => self.mouse_button(button, down),
             InputEvent::MoveAbs { x, y } => {
                 let b = self.bounds.rect();
@@ -483,6 +489,22 @@ impl InputSink for CgInput {
         }
         Ok(())
     }
+
+    fn key_repeat(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        // The user's Keyboard settings (Delay until repeat, Key repeat rate).
+        // SAFETY: NSEvent class methods returning NSTimeInterval.
+        let (delay, every): (f64, f64) =
+            unsafe { (msg_send![class!(NSEvent), keyRepeatDelay], msg_send![class!(NSEvent), keyRepeatInterval]) };
+        Some(repeat_timing(delay, every))
+    }
+}
+
+/// Seconds → durations, within sane bounds (settings can be odd).
+fn repeat_timing(delay: f64, every: f64) -> (std::time::Duration, std::time::Duration) {
+    let secs = |v: f64, lo: f64, hi: f64, default: f64| {
+        std::time::Duration::from_secs_f64(if v.is_finite() && v > 0.0 { v.clamp(lo, hi) } else { default })
+    };
+    (secs(delay, 0.1, 3.0, 0.5), secs(every, 0.01, 1.0, 0.033))
 }
 
 impl Drop for CgInput {
@@ -521,6 +543,19 @@ mod tests {
         }
         assert!(pointer_moved(pos, CGPoint { x: 100.5, y: 200.0 }));
         assert!(pointer_moved(pos, CGPoint { x: 100.0, y: 200.5 }));
+    }
+
+    #[test]
+    fn repeat_timing_follows_keyboard_settings() {
+        // SAFETY: NSEvent class methods returning NSTimeInterval.
+        let (delay, every): (f64, f64) =
+            unsafe { (msg_send![class!(NSEvent), keyRepeatDelay], msg_send![class!(NSEvent), keyRepeatInterval]) };
+        let (d, e) = repeat_timing(delay, every);
+        assert!(d >= std::time::Duration::from_millis(100) && e <= std::time::Duration::from_secs(1), "{d:?} {e:?}");
+        assert_eq!(
+            repeat_timing(f64::NAN, 0.0),
+            (std::time::Duration::from_millis(500), std::time::Duration::from_millis(33))
+        );
     }
 
     #[test]

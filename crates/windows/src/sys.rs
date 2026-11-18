@@ -77,6 +77,8 @@ pub const GMEM_MOVEABLE: u32 = 0x0002;
 pub const CF_UNICODETEXT: u32 = 13;
 pub const CF_DIB: u32 = 8;
 pub const CF_DIBV5: u32 = 17;
+pub const SPI_GETKEYBOARDSPEED: u32 = 0x000A;
+pub const SPI_GETKEYBOARDDELAY: u32 = 0x0016;
 pub const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
 pub const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
 
@@ -611,6 +613,7 @@ unsafe extern "system" {
 
 #[link(name = "user32")]
 unsafe extern "system" {
+    pub fn SystemParametersInfoW(action: u32, param: u32, pv: *mut c_void, win_ini: u32) -> BOOL;
     pub fn RegisterClassExW(class: *const WNDCLASSEXW) -> u16;
     pub fn CreateWindowExW(
         ex_style: u32,

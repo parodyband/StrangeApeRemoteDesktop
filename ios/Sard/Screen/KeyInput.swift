@@ -68,8 +68,32 @@ final class KeyInputView: UIView, UIKeyInput {
         clearModifiers()
     }
 
+    /// When the current run of held-Backspace repeats started, and the last one.
+    private var deleteRun: (start: CFTimeInterval, last: CFTimeInterval) = (0, 0)
+
     func deleteBackward() {
-        press(KeyCode.backspace)
+        // Holding Backspace repeats it at a slow, steady rate here: text
+        // fields speed up by deleting words, which a bare key input can't.
+        // Speed up the same way: more Backspaces per repeat the longer it's held.
+        let now = CACurrentMediaTime()
+        if now - deleteRun.last > 0.3 { deleteRun.start = now }
+        deleteRun.last = now
+        let count = Self.backspaces(heldFor: now - deleteRun.start)
+        guard count > 1, modifiers.isEmpty, let s = session else { return press(KeyCode.backspace) }
+        for _ in 0..<count {
+            s.key(KeyCode.backspace, down: true)
+            s.key(KeyCode.backspace, down: false)
+        }
+    }
+
+    /// Backspaces to send per keyboard repeat after holding for `held` seconds.
+    static func backspaces(heldFor held: CFTimeInterval) -> Int {
+        switch held {
+        case ..<0.6: 1
+        case ..<1.5: 2
+        case ..<3: 4
+        default: 8
+        }
     }
 
     /// Press and release `code` with the sticky modifiers held.

@@ -701,6 +701,12 @@ impl Connection {
     /// Reliable-channel segments sent but not yet acknowledged: bulk senders
     /// (terminal output) wait while this is high instead of queueing without
     /// bound.
+    /// Time since anything arrived from the peer.
+    pub fn silent_for(&self) -> std::time::Duration {
+        let last = self.conn.last_recv_us.load(Ordering::Relaxed);
+        std::time::Duration::from_micros(clock::now_us().saturating_sub(last))
+    }
+
     pub fn reliable_backlog(&self) -> usize {
         lock(&self.conn.state).reliable.unacked_len()
     }

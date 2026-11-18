@@ -830,15 +830,24 @@ fn input_loop(
     let mut pressed = PressedSet::default();
     let mut pending: Option<Event> = None;
     let mut rc = RateControl { ceiling, current: ceiling, last_change: Instant::now(), clean_reports: 0 };
+    let mut repeat = KeyRepeat::new(input.key_repeat());
     let inject = |input: &mut Box<dyn InputSink>, ev: InputEvent| {
         if let Err(e) = input.inject(&ev) {
             warn!("input injection failed: {e}");
         }
     };
     while !shared.stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        // Pause repeating while the viewer is silent: a stalled network must
+        // not leave a held Backspace deleting until the connection times out.
+        if let Some(code) = repeat.due(now)
+            && conn.silent_for() < Duration::from_millis(600)
+        {
+            inject(&mut input, InputEvent::KeyRepeat { code });
+        }
         let mut ev = match pending.take() {
             Some(ev) => ev,
-            None => match events.recv_timeout(Duration::from_millis(100)) {
+            None => match events.recv_timeout(repeat.wait(now)) {
                 Ok(ev) => ev,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(_) => break,
@@ -885,6 +894,7 @@ fn input_loop(
                 Control::Key { code, down } => {
                     if pressed.key(code, down) {
                         inject(&mut input, InputEvent::Key { code, down });
+                        repeat.key(code, down, Instant::now());
                     }
                 }
                 Control::MouseButton { button, down, x, y } => {
@@ -895,7 +905,10 @@ fn input_loop(
                 }
                 Control::Scroll { dx, dy, discrete } => inject(&mut input, InputEvent::Scroll { dx, dy, discrete }),
                 Control::MouseRel { dx, dy } => inject(&mut input, InputEvent::MoveRel { dx, dy }),
-                Control::ReleaseAll => release_all(&mut pressed, &mut input),
+                Control::ReleaseAll => {
+                    repeat.stop();
+                    release_all(&mut pressed, &mut input);
+                }
                 Control::SelectDisplay { id } => {
                     *shared.select_display.lock().unwrap() = Some(id);
                 }
@@ -926,6 +939,74 @@ fn input_loop(
     release_all(&mut pressed, &mut input);
     shared.stop.store(true, Ordering::Relaxed);
     let _ = conn;
+}
+
+/// Repeats the last key pressed while it's held, like a physical keyboard,
+/// for hosts whose OS doesn't repeat injected keys (macOS, Windows).
+struct KeyRepeat {
+    /// (delay before the first repeat, time between repeats); None: off.
+    timing: Option<(Duration, Duration)>,
+    /// The key repeating and when it next repeats.
+    held: Option<(u16, Instant)>,
+}
+
+impl KeyRepeat {
+    fn new(timing: Option<(Duration, Duration)>) -> Self {
+        Self { timing, held: None }
+    }
+
+    fn key(&mut self, code: u16, down: bool, now: Instant) {
+        let Some((delay, _)) = self.timing else { return };
+        if down && repeats(code) {
+            self.held = Some((code, now + delay));
+        } else if !down && self.held.is_some_and(|(c, _)| c == code) {
+            self.held = None;
+        }
+    }
+
+    fn stop(&mut self) {
+        self.held = None;
+    }
+
+    /// The key to repeat now, if one is due.
+    fn due(&mut self, now: Instant) -> Option<u16> {
+        let every = self.timing?.1;
+        let (code, next) = self.held.as_mut()?;
+        if now < *next {
+            return None;
+        }
+        // After a stall, carry on from now rather than catching up.
+        *next += every;
+        if *next <= now {
+            *next = now + every;
+        }
+        Some(*code)
+    }
+
+    /// How long to wait for input before the next repeat is due.
+    fn wait(&self, now: Instant) -> Duration {
+        let idle = Duration::from_millis(100);
+        self.held.map_or(idle, |(_, next)| next.saturating_duration_since(now).min(idle))
+    }
+}
+
+/// Whether holding `code` repeats it: everything but modifiers and locks.
+fn repeats(code: u16) -> bool {
+    use sard_core::input::key::*;
+    !matches!(
+        code,
+        LEFTCTRL
+            | RIGHTCTRL
+            | LEFTSHIFT
+            | RIGHTSHIFT
+            | LEFTALT
+            | RIGHTALT
+            | LEFTMETA
+            | RIGHTMETA
+            | CAPSLOCK
+            | NUMLOCK
+            | SCROLLLOCK
+    )
 }
 
 fn release_all(pressed: &mut PressedSet, input: &mut Box<dyn InputSink>) {
@@ -1003,6 +1084,34 @@ fn interface_ips() -> Vec<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_keys_repeat() {
+        use sard_core::input::key::{A, BACKSPACE, LEFTSHIFT};
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut r = KeyRepeat::new(Some((ms(500), ms(50))));
+        r.key(BACKSPACE, true, t0);
+        assert_eq!((r.due(t0 + ms(499)), r.wait(t0)), (None, ms(100)));
+        assert_eq!(r.due(t0 + ms(500)), Some(BACKSPACE));
+        assert_eq!(r.due(t0 + ms(520)), None);
+        assert_eq!(r.due(t0 + ms(550)), Some(BACKSPACE));
+        // A stall doesn't make it catch up with a burst.
+        assert_eq!(r.due(t0 + ms(2000)), Some(BACKSPACE));
+        assert_eq!(r.due(t0 + ms(2001)), None);
+        // Modifiers don't take over; another key does; its release stops it.
+        r.key(LEFTSHIFT, true, t0 + ms(2010));
+        assert_eq!(r.due(t0 + ms(2050)), Some(BACKSPACE));
+        r.key(A, true, t0 + ms(2060));
+        r.key(BACKSPACE, false, t0 + ms(2070));
+        assert_eq!(r.due(t0 + ms(2560)), Some(A));
+        r.key(A, false, t0 + ms(2570));
+        assert_eq!(r.due(t0 + ms(5000)), None);
+        // Hosts whose apps repeat keys themselves: never.
+        let mut off = KeyRepeat::new(None);
+        off.key(BACKSPACE, true, t0);
+        assert_eq!(off.due(t0 + ms(5000)), None);
+    }
 
     #[test]
     fn lan_address_comes_first() {

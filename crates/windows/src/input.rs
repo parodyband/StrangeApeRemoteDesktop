@@ -186,6 +186,8 @@ impl InputSink for SendInputSink {
     fn inject(&mut self, ev: &InputEvent) -> media::Result<()> {
         match *ev {
             InputEvent::Key { code, down } => self.key(code, down),
+            // Another key-down while held: Windows counts it as a repeat.
+            InputEvent::KeyRepeat { code } => self.key(code, true),
             InputEvent::Button { button, down } => self.button(button, down),
             InputEvent::MoveAbs { x, y } => self.move_abs(x, y),
             InputEvent::MoveRel { dx, dy } => self.move_rel(dx, dy),
@@ -193,6 +195,26 @@ impl InputSink for SendInputSink {
         }
         Ok(())
     }
+
+    fn key_repeat(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        // The user's Keyboard settings: delay 0..=3 (250 ms steps from 250 ms),
+        // speed 0..=31 (about 2.5 to 30 repeats a second).
+        let (mut delay, mut speed) = (1u32, 31u32);
+        // SAFETY: each call writes one UINT.
+        unsafe {
+            sys::SystemParametersInfoW(sys::SPI_GETKEYBOARDDELAY, 0, (&mut delay as *mut u32).cast(), 0);
+            sys::SystemParametersInfoW(sys::SPI_GETKEYBOARDSPEED, 0, (&mut speed as *mut u32).cast(), 0);
+        }
+        Some(repeat_timing(delay, speed))
+    }
+}
+
+fn repeat_timing(delay: u32, speed: u32) -> (std::time::Duration, std::time::Duration) {
+    let per_sec = 2.5 + speed.min(31) as f64 * (27.5 / 31.0);
+    (
+        std::time::Duration::from_millis(250 * (delay.min(3) as u64 + 1)),
+        std::time::Duration::from_secs_f64(1.0 / per_sec),
+    )
 }
 
 /// Input sink for the test pattern: logs events and moves the marker.

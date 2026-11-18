@@ -449,6 +449,7 @@ pub const kCGEventOtherMouseDragged: u32 = 27;
 pub const kCGMouseEventClickState: u32 = 1;
 pub const kCGMouseEventButtonNumber: u32 = 3;
 pub const kCGMouseEventDeltaX: u32 = 4;
+pub const kCGKeyboardEventAutorepeat: u32 = 8;
 pub const kCGMouseEventDeltaY: u32 = 5;
 pub const kCGScrollWheelEventIsContinuous: u32 = 88;
 

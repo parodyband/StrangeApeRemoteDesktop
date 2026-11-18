@@ -210,6 +210,10 @@ pub enum InputEvent {
         code: u16,
         down: bool,
     },
+    /// A held key repeating (only for sinks whose `key_repeat` is Some).
+    KeyRepeat {
+        code: u16,
+    },
     /// `button` uses `proto::button` values.
     Button {
         button: u8,
@@ -234,6 +238,12 @@ pub enum InputEvent {
 /// Host-side input injection.
 pub trait InputSink: Send {
     fn inject(&mut self, ev: &InputEvent) -> Result<()>;
+    /// (delay before a held key repeats, time between repeats) when the
+    /// host must repeat held keys itself: macOS and Windows only repeat
+    /// physical keyboards. None where apps repeat injected keys (Wayland).
+    fn key_repeat(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        None
+    }
 }
 
 /// Timing of one decoded+presented frame.

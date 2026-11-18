@@ -826,6 +826,7 @@ impl InputSink for PortalSink {
     fn inject(&mut self, ev: &InputEvent) -> media::Result<()> {
         let r = match *ev {
             InputEvent::Key { code, down } => self.input.key(code, down),
+            InputEvent::KeyRepeat { .. } => Ok(()), // apps repeat held keys themselves
             InputEvent::Button { button, down } => match wire_button_to_evdev(button) {
                 Some(b) => self.input.button(b, down),
                 None => Ok(()),
