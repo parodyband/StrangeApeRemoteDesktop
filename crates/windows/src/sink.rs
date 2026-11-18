@@ -66,10 +66,21 @@ pub struct D3dVideoSink {
     win: (u32, u32),
     decoder: Option<Decoder>,
     snapshot: Option<PathBuf>,
+    /// A still picture shown until video arrives (see `show_image`).
+    still: Option<Still>,
 }
 
-// SAFETY: created on the UI thread, then used only by the render thread; the
-// D3D11 device is free-threaded and the context is only touched there.
+/// NV12 planes uploaded from the CPU: luma (R8) and chroma (R8G8).
+struct Still {
+    width: u32,
+    height: u32,
+    _planes: [d3d::ID3D11Texture2D; 2],
+    srvs: [d3d::ID3D11ShaderResourceView; 2],
+}
+
+// SAFETY: created on the UI thread, then used by one thread at a time (the
+// "connecting" screen's, then the render thread); the D3D11 device is
+// free-threaded and the context is never used concurrently.
 unsafe impl Send for D3dVideoSink {}
 
 const BUFFERS: u32 = 2;
@@ -142,6 +153,7 @@ impl D3dVideoSink {
             win: (width.max(1), height.max(1)),
             decoder: None,
             snapshot: None,
+            still: None,
         };
         s.make_rtv()?;
         Ok(s)
@@ -168,6 +180,11 @@ impl D3dVideoSink {
             let (x, y, w, h) = letterbox(ww, wh, p.width, p.height);
             let vp = d3d::viewport(x.round(), y.round(), w.round(), h.round());
             self.passes.present(dev, rtv, &vp, &p.srvs, p.planar444, p.full_range)?;
+        } else if let Some(s) = &self.still {
+            let (x, y, w, h) = letterbox(ww, wh, s.width, s.height);
+            let vp = d3d::viewport(x.round(), y.round(), w.round(), h.round());
+            let srvs = [s.srvs[0].as_raw(), s.srvs[1].as_raw()];
+            self.passes.present(dev, rtv, &vp, &srvs, false, false)?;
         }
         let flags = if self.tearing { d3d::DXGI_PRESENT_ALLOW_TEARING } else { 0 };
         // SAFETY: live swap chain.
@@ -198,9 +215,38 @@ impl VideoSink for D3dVideoSink {
         if let Some(path) = self.snapshot.take() {
             save_snapshot(&self.gpu.dev, self.decoder.as_ref().unwrap(), &path);
         }
+        self.still = None;
         let t1 = Instant::now();
         self.draw()?;
         Ok(PresentStats { decode_us, present_us: t1.elapsed().as_micros() as u32 })
+    }
+
+    fn show_image(&mut self, image: &media::Nv12Image) -> media::Result<()> {
+        let dev = &self.gpu.dev;
+        let (w, h) = (image.width, image.height);
+        let plane = |pw: u32, ph: u32, format: u32, data: &[u8]| {
+            let desc = d3d::D3D11_TEXTURE2D_DESC::new(
+                pw,
+                ph,
+                format,
+                d3d::D3D11_USAGE_DEFAULT,
+                d3d::D3D11_BIND_SHADER_RESOURCE,
+                0,
+            );
+            // Both planes are `w` bytes per row (chroma: w/2 Cb/Cr pairs).
+            let init =
+                d3d::D3D11_SUBRESOURCE_DATA { pSysMem: data.as_ptr().cast(), SysMemPitch: w, SysMemSlicePitch: 0 };
+            let tex = dev.texture(&desc, Some(&init))?;
+            let srv = dev.srv(&tex, format)?;
+            Ok::<_, String>((tex, srv))
+        };
+        let (ty, sy) = plane(w, h, d3d::DXGI_FORMAT_R8_UNORM, image.luma())?;
+        let (tc, sc) = plane(w / 2, h / 2, d3d::DXGI_FORMAT_R8G8_UNORM, image.chroma())?;
+        self.still = Some(Still { width: w, height: h, _planes: [ty, tc], srvs: [sy, sc] });
+        if self.decoder.as_ref().is_some_and(|d| d.has_frame) {
+            self.decoder = None; // the still replaces old video
+        }
+        self.draw().map_err(media::err)
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -222,7 +268,7 @@ impl VideoSink for D3dVideoSink {
     }
 
     fn redraw(&mut self) -> media::Result<()> {
-        if self.decoder.as_ref().is_some_and(|d| d.has_frame) {
+        if self.still.is_some() || self.decoder.as_ref().is_some_and(|d| d.has_frame) {
             self.draw()?;
         }
         Ok(())

@@ -267,8 +267,82 @@ pub trait VideoSink: Send {
     fn snapshot_next(&mut self, _path: &std::path::Path) -> Result<()> {
         Err(err("snapshots are not supported by this video output"))
     }
+    /// Show a still picture (the "connecting…" screen) until the next
+    /// [`present`](Self::present) or `show_image`. May be called from a
+    /// different thread than later calls, but never concurrently.
+    fn show_image(&mut self, _image: &Nv12Image) -> Result<()> {
+        Err(err("still images are not supported by this video output"))
+    }
     fn describe(&self) -> String {
         String::new()
+    }
+}
+
+/// A tightly packed NV12 picture, BT.709 video range (what the decoders
+/// produce, so every video output can show it): `width × height` luma bytes,
+/// then `width × height / 2` interleaved Cb/Cr bytes. Even dimensions.
+#[derive(Clone, Debug, Default)]
+pub struct Nv12Image {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+impl Nv12Image {
+    /// Black. Odd sizes are rounded down to even (at least 2×2).
+    pub fn new(width: u32, height: u32) -> Self {
+        let (w, h) = ((width & !1).max(2), (height & !1).max(2));
+        let luma = w as usize * h as usize;
+        let mut data = vec![16u8; luma + luma / 2];
+        data[luma..].fill(128);
+        Nv12Image { width: w, height: h, data }
+    }
+
+    pub fn luma(&self) -> &[u8] {
+        &self.data[..self.width as usize * self.height as usize]
+    }
+
+    pub fn chroma(&self) -> &[u8] {
+        &self.data[self.width as usize * self.height as usize..]
+    }
+
+    /// Convert an RGB8 patch (`w × h`, tightly packed) and store it at
+    /// (`x`, `y`). The patch is clipped to the picture; `x`/`y` round down
+    /// to even so chroma lines up.
+    pub fn put_rgb(&mut self, x: u32, y: u32, w: u32, h: u32, rgb: &[u8]) {
+        debug_assert!(rgb.len() >= w as usize * h as usize * 3);
+        let (x, y) = (x & !1, y & !1);
+        let (pw, ph) = (self.width as usize, self.height as usize);
+        let cols = (w as usize).min(pw.saturating_sub(x as usize)) & !1;
+        let rows = (h as usize).min(ph.saturating_sub(y as usize)) & !1;
+        let (x, y, stride) = (x as usize, y as usize, w as usize * 3);
+        let (luma, chroma) = self.data.split_at_mut(pw * ph);
+        // BT.709, video range.
+        let yv = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        for row in 0..rows {
+            let src = &rgb[row * stride..];
+            let dst = &mut luma[(y + row) * pw + x..];
+            for col in 0..cols {
+                let p = &src[col * 3..col * 3 + 3];
+                dst[col] = (16.0 + yv(p[0] as f32, p[1] as f32, p[2] as f32) * (219.0 / 255.0) + 0.5) as u8;
+            }
+        }
+        for row in (0..rows).step_by(2) {
+            let dst = &mut chroma[(y + row) / 2 * pw + x..];
+            for col in (0..cols).step_by(2) {
+                let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
+                for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let p = &rgb[(row + dy) * stride + (col + dx) * 3..];
+                    (r, g, b) = (r + p[0] as f32, g + p[1] as f32, b + p[2] as f32);
+                }
+                let (r, g, b) = (r / 4.0, g / 4.0, b / 4.0);
+                let l = yv(r, g, b);
+                let cb = 128.0 + (b - l) / 1.8556 * (224.0 / 255.0);
+                let cr = 128.0 + (r - l) / 1.5748 * (224.0 / 255.0);
+                dst[col] = (cb + 0.5).clamp(0.0, 255.0) as u8;
+                dst[col + 1] = (cr + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
     }
 }
 
@@ -446,7 +520,21 @@ pub fn letterbox(win_w: u32, win_h: u32, vid_w: u32, vid_h: u32) -> (f32, f32, f
 
 #[cfg(test)]
 mod tests {
-    use super::{AUDIO_PACKET_FRAMES, DisplayMode, JitterBuffer, letterbox, pick_mode};
+    use super::{AUDIO_PACKET_FRAMES, DisplayMode, JitterBuffer, Nv12Image, letterbox, pick_mode};
+
+    #[test]
+    fn nv12_conversion() {
+        let mut img = Nv12Image::new(5, 3);
+        assert_eq!((img.width, img.height, img.data.len()), (4, 2, 12));
+        // A white patch that overhangs the picture (clipped), then a red one.
+        img.put_rgb(0, 0, 6, 2, &[[255u8; 3]; 12].concat());
+        assert_eq!(img.luma(), &[235; 8]);
+        assert_eq!(img.chroma(), &[128; 4]);
+        img.put_rgb(2, 0, 2, 2, &[[255u8, 0, 0]; 4].concat());
+        assert_eq!(&img.luma()[2..4], &[63, 63]);
+        assert_eq!(&img.chroma()[2..4], &[102, 240]);
+        assert_eq!(&img.chroma()[..2], &[128, 128]);
+    }
 
     fn m(width: u32, height: u32, scale: u32, refresh: f64) -> DisplayMode {
         DisplayMode { width, height, pixel_width: width * scale, pixel_height: height * scale, refresh }

@@ -127,6 +127,42 @@ fn pack(w: u32, h: u32) -> u64 {
     ((w as u64) << 32) | h as u64
 }
 
+/// A viewer window and its video output, made before the connection exists
+/// so it can show the "connecting…" screen.
+pub struct ViewerWindow {
+    pub window: Arc<Window>,
+    pub sink: Box<dyn VideoSink>,
+}
+
+impl ViewerWindow {
+    pub fn create(el: &ActiveEventLoop, label: &str, fullscreen: bool) -> Result<ViewerWindow> {
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
+            .with_title(format!("Sard — {label}"))
+            .with_inner_size(LogicalSize::new(1280.0, 720.0));
+        // Windows shows a generic icon on the title bar and taskbar otherwise.
+        #[cfg(windows)]
+        {
+            let rgba = include_bytes!("../assets/tray/color.rgba").to_vec();
+            attrs = attrs.with_window_icon(winit::window::Icon::from_rgba(rgba, 64, 64).ok());
+        }
+        let window = Arc::new(el.create_window(attrs)?);
+        if fullscreen {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
+        window.focus_window();
+        let size = window.inner_size();
+        let sink = platform::create_video_sink(
+            window.display_handle()?.as_raw(),
+            window.window_handle()?.as_raw(),
+            size.width,
+            size.height,
+        )?;
+        info!("video output: {}", sink.describe());
+        Ok(ViewerWindow { window, sink })
+    }
+}
+
 impl Session {
     /// Open the window, start decoding and say hello to the host.
     pub fn open(
@@ -137,32 +173,26 @@ impl Session {
         proxy: EventLoopProxy<AppEvent>,
         id: u64,
     ) -> Result<Session> {
+        let vw = ViewerWindow::create(el, &label, opts.fullscreen)?;
+        Self::start(el, vw, conn, label, opts, proxy, id)
+    }
+
+    /// Start a session in a window made beforehand (see [`ViewerWindow`]).
+    pub fn start(
+        el: &ActiveEventLoop,
+        vw: ViewerWindow,
+        conn: Connection,
+        label: String,
+        opts: SessionOpts,
+        proxy: EventLoopProxy<AppEvent>,
+        id: u64,
+    ) -> Result<Session> {
         let events = conn.take_events().ok_or("events already taken")?;
         let frames = conn.take_video().ok_or("video already taken")?;
-        #[allow(unused_mut)]
-        let mut attrs = Window::default_attributes()
-            .with_title(format!("Sard — connecting to {label}…"))
-            .with_inner_size(LogicalSize::new(1280.0, 720.0));
-        // Windows shows a generic icon on the title bar and taskbar otherwise.
-        #[cfg(windows)]
-        {
-            let rgba = include_bytes!("../assets/tray/color.rgba").to_vec();
-            attrs = attrs.with_window_icon(winit::window::Icon::from_rgba(rgba, 64, 64).ok());
-        }
-        let window = Arc::new(el.create_window(attrs)?);
-        if opts.fullscreen {
-            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        }
-        window.focus_window();
+        let ViewerWindow { window, sink } = vw;
         let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
         let win_size = Arc::new(AtomicU64::new(pack(size.width, size.height)));
-        let sink = platform::create_video_sink(
-            window.display_handle()?.as_raw(),
-            window.window_handle()?.as_raw(),
-            size.width,
-            size.height,
-        )?;
-        info!("video output: {}", sink.describe());
 
         let monitor = window.current_monitor().or_else(|| el.primary_monitor());
         let (mw, mh, hz) = monitor
@@ -199,7 +229,7 @@ impl Session {
             let (conn, stop, win_size, label) = (conn.clone(), Arc::clone(&stop), Arc::clone(&win_size), label.clone());
             std::thread::Builder::new()
                 .name("sard-render".into())
-                .spawn(move || render_loop(sink, frames, conn, proxy, id, stop, win_size, label))?
+                .spawn(move || render_loop(sink, frames, conn, proxy, id, stop, win_size, label, scale))?
         };
         Ok(Session {
             id,
@@ -631,8 +661,13 @@ fn render_loop(
     stop: Arc<AtomicBool>,
     win_size: Arc<AtomicU64>,
     label: String,
+    scale: f32,
 ) {
     let mut size = 0u64;
+    // "Starting video…" until the first frame shows (None once it has, or if
+    // this video output can't show stills).
+    let mut waiting = Some(crate::status::Painter::default());
+    let (started, mut painted) = (Instant::now(), None::<Instant>);
     let mut e2e = Samples::default();
     let mut decode = Samples::default();
     let (mut n, mut bytes, mut errors, mut log_n) = (0u32, 0usize, 0u32, 0u32);
@@ -645,12 +680,35 @@ fn render_loop(
             size = s;
             sink.resize((s >> 32) as u32, s as u32);
             let _ = sink.redraw();
+            painted = None;
+        }
+        if let Some(p) = &mut waiting
+            && painted.is_none_or(|t| t.elapsed() >= Duration::from_millis(33))
+        {
+            painted = Some(Instant::now());
+            let t = started.elapsed().as_secs_f32();
+            let screen = crate::status::Screen {
+                title: format!("Connected to {label}"),
+                detail: if t < 8.0 {
+                    "Starting video…".into()
+                } else {
+                    format!("Still waiting for video from {label}…")
+                },
+                hint: String::new(),
+                busy: true,
+            };
+            let img = p.render(&screen, (size >> 32) as u32, size as u32, scale, t);
+            if let Err(e) = sink.show_image(img) {
+                info!("no status screen: {e}");
+                waiting = None;
+            }
         }
         match frames.recv_timeout(Duration::from_millis(16)) {
             Ok(f) => {
                 let Ok((meta, bits)) = FrameMeta::read(&f.data) else { continue };
                 match sink.present(meta.codec, bits, meta.flags & frame_flags::KEYFRAME != 0) {
                     Ok(ps) => {
+                        waiting = None;
                         if let Some(cap) = conn.remote_to_local_us(meta.capture_us) {
                             e2e.add(clock::now_us().saturating_sub(cap) as u32);
                         }

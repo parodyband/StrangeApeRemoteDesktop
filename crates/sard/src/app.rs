@@ -4,6 +4,7 @@
 
 use crate::args::Args;
 use crate::client;
+use crate::connecting::{Pending, Reply};
 use crate::host::{HostService, HostStatus};
 use crate::session::{AppEvent, Outcome, Session, SessionEvent, SessionOpts};
 use crate::{Result, platform};
@@ -212,8 +213,8 @@ struct App {
     host_error: Option<String>,
     settings: Settings,
     sessions: Vec<Session>,
-    /// Connect attempts in flight: (session id, label, target).
-    connecting: Vec<(u64, String, String)>,
+    /// Connect attempts in flight (or failed, showing why), each in its own window.
+    connecting: Vec<Pending>,
     next_id: u64,
     /// Menu item id → action (ids are never reused, so stale clicks miss).
     actions: Vec<(u32, Action)>,
@@ -460,14 +461,15 @@ impl App {
             let warn = if stalls { "⚠ " } else { "" };
             m.push(MenuEntry::Submenu { label: format!("{warn}Viewing {label}"), enabled: true, items: sub });
         }
-        for (_, label, _) in &self.connecting {
-            m.push(Self::text(format!("Connecting to {label}…")));
+        for p in &self.connecting {
+            let what = if p.failed() { "Couldn't connect to" } else { "Connecting to" };
+            m.push(Self::text(format!("{what} {}…", p.label)));
         }
         // Paired computers that aren't open: one click connects.
         let hosts = paired_hosts();
         for h in &hosts {
             let busy = self.sessions.iter().any(|s| s.target == h.target)
-                || self.connecting.iter().any(|(_, _, t)| *t == h.target);
+                || self.connecting.iter().any(|p| p.target == h.target);
             if !busy {
                 let e = self.item(format!("Connect to {}", h.label), Action::Connect(h.target.clone()));
                 m.push(e);
@@ -551,19 +553,24 @@ impl App {
             t.set_tooltip(&tip.join(" · "));
             t.set_active(active);
         }
-        platform::set_dock_visible(!self.sessions.is_empty());
+        platform::set_dock_visible(!self.sessions.is_empty() || !self.connecting.is_empty());
     }
 
-    fn connect(&mut self, target: String) {
+    /// Open a window showing the attempt right away, and dial in the background.
+    fn connect(&mut self, el: &ActiveEventLoop, target: String) {
         if let Some(s) = self.sessions.iter().find(|s| s.target == target) {
             s.focus();
             return;
         }
-        if self.connecting.iter().any(|(_, _, t)| *t == target) {
+        if let Some(i) = self.connecting.iter().position(|p| p.target == target) {
+            self.connecting[i].focus();
+            if self.connecting[i].failed() {
+                self.dial(i);
+            }
             return;
         }
-        let (host, addr) = match client::resolve(&target) {
-            Ok(x) => x,
+        let label = match client::resolve(&target) {
+            Ok((host, _)) => host.name,
             Err(e) => {
                 notify("Sard", &e.to_string());
                 return;
@@ -571,11 +578,32 @@ impl App {
         };
         let id = self.next_id;
         self.next_id += 1;
-        let label = host.name.clone();
-        self.connecting.push((id, label.clone(), target));
+        match Pending::open(el, id, label.clone(), target) {
+            Ok(p) => self.connecting.push(p),
+            Err(e) => {
+                notify("Sard", &format!("Cannot open a window for {label}: {e}"));
+                return;
+            }
+        }
+        self.dial(self.connecting.len() - 1);
+    }
+
+    /// (Re)start the background connect for `self.connecting[i]`.
+    fn dial(&mut self, i: usize) {
+        let p = &mut self.connecting[i];
+        p.retry();
+        let (host, addr) = match client::resolve(&p.target) {
+            Ok(x) => x,
+            Err(e) => {
+                p.fail(&e.to_string());
+                return;
+            }
+        };
+        let (id, label, progress) = (p.id, p.label.clone(), p.progress());
         let (proxy, args) = (self.proxy.clone(), self.args.clone());
         std::thread::spawn(move || {
-            let result = client::dial(&host, &addr, &args).map_err(|e| e.to_string());
+            let result = client::dial_with_progress(&host, &addr, &args, sard_core::proto::lane::SCREEN, progress)
+                .map_err(|e| e.to_string());
             let _ = proxy.send_event(AppEvent::Connected { id, label, result });
         });
         self.refresh();
@@ -665,7 +693,7 @@ impl App {
         let Some(a) = self.actions.iter().find(|(i, _)| *i == id).map(|(_, a)| a.clone()) else { return };
         info!("menu: {a:?}");
         match a {
-            Action::Connect(t) => self.connect(t),
+            Action::Connect(t) => self.connect(el, t),
             Action::Focus(sid) => {
                 if let Some(s) = self.sessions.iter().find(|s| s.id == sid) {
                     s.focus();
@@ -974,7 +1002,7 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::Paired(r) => {
                 self.pairing_busy = false;
                 match r {
-                    Ok(Some(target)) => self.connect(target),
+                    Ok(Some(target)) => self.connect(el, target),
                     Ok(None) => self.refresh(),
                     Err(e) => {
                         notify("Pairing failed", &e);
@@ -983,11 +1011,27 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Connected { id, label, result } => {
-                let Some(i) = self.connecting.iter().position(|(cid, _, _)| *cid == id) else { return };
-                let (_, _, target) = self.connecting.remove(i);
+                // Not found: cancelled (its window was closed); the connection just drops.
+                let Some(i) = self.connecting.iter().position(|p| p.id == id && !p.failed()) else { return };
                 match result {
                     Ok(conn) => {
-                        match Session::open(el, conn, label.clone(), SessionOpts::defaults(), self.proxy.clone(), id) {
+                        let p = self.connecting.remove(i);
+                        let target = p.target.clone();
+                        let opened = match p.into_viewer() {
+                            Some(vw) => Session::start(
+                                el,
+                                vw,
+                                conn,
+                                label.clone(),
+                                SessionOpts::defaults(),
+                                self.proxy.clone(),
+                                id,
+                            ),
+                            None => {
+                                Session::open(el, conn, label.clone(), SessionOpts::defaults(), self.proxy.clone(), id)
+                            }
+                        };
+                        match opened {
                             Ok(mut s) => {
                                 s.target = target;
                                 s.focus();
@@ -996,7 +1040,10 @@ impl ApplicationHandler<AppEvent> for App {
                             Err(e) => notify("Sard", &format!("Cannot open a window for {label}: {e}")),
                         }
                     }
-                    Err(e) => notify("Sard", &format!("Could not connect to {label}: {e}")),
+                    Err(e) => {
+                        info!("could not connect to {label}: {e}");
+                        self.connecting[i].fail(&e);
+                    }
                 }
                 self.refresh();
             }
@@ -1017,6 +1064,18 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, wid: WindowId, event: WindowEvent) {
+        if let Some(i) = self.connecting.iter().position(|p| p.window_id() == wid) {
+            match self.connecting[i].window_event(&event) {
+                Reply::Nothing => {}
+                Reply::Retry => self.dial(i),
+                Reply::Cancel => {
+                    let p = self.connecting.remove(i);
+                    info!("connecting to {}: cancelled", p.label);
+                    self.refresh();
+                }
+            }
+            return;
+        }
         let Some(s) = self.sessions.iter_mut().find(|s| s.window_id() == wid) else { return };
         if let Outcome::Closed(r) = s.window_event(event) {
             let sid = s.id;

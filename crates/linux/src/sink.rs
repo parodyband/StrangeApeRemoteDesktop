@@ -61,9 +61,13 @@ pub struct GlVideoSink {
     full_range: bool,
     has_frame: bool,
     error: Option<String>,
+    /// The thread the GL context is current on (stills may be shown from
+    /// another thread before the render thread takes over).
+    gl_thread: Option<std::thread::ThreadId>,
 }
 
-// SAFETY: moved to the render thread once and used only there.
+// SAFETY: used by one thread at a time; the GL context is made current on
+// whichever thread uses it (see `ensure_gl`) and released after stills.
 unsafe impl Send for GlVideoSink {}
 
 impl GlVideoSink {
@@ -91,16 +95,21 @@ impl GlVideoSink {
             full_range: false,
             has_frame: false,
             error: None,
+            gl_thread: None,
         })
     }
 
     /// First use on the render thread: make the context current and build GL objects.
     fn ensure_gl(&mut self) -> media::Result<()> {
+        let me = std::thread::current().id();
+        if self.gl_thread != Some(me) {
+            self.egl.make_current()?;
+            self.egl.set_swap_interval(0);
+            self.gl_thread = Some(me);
+        }
         if self.gls.is_some() {
             return Ok(());
         }
-        self.egl.make_current()?;
-        self.egl.set_swap_interval(0);
         let gl = Gl::load(&self.egl)?;
         let program = gl.program(FULLSCREEN_VS, YUV_FS)?;
         let mut vao = 0;
@@ -291,6 +300,44 @@ impl VideoSink for GlVideoSink {
         Ok(PresentStats { decode_us, present_us: t1.elapsed().as_micros() as u32 })
     }
 
+    fn show_image(&mut self, image: &media::Nv12Image) -> media::Result<()> {
+        self.ensure_gl()?;
+        let r = (|| -> media::Result<()> {
+            let (w, h) = (image.width, image.height);
+            self.ensure_textures(w, h, false)?;
+            let (g, t) = (self.gls.as_ref().unwrap(), self.textures.as_ref().unwrap());
+            let gl = &g.gl;
+            // SAFETY: context current; the planes match the textures' sizes.
+            unsafe {
+                (gl.glPixelStorei)(gl::UNPACK_ALIGNMENT, 1);
+                for (tex, (pw, ph, format, data)) in
+                    t.tex.iter().zip([(w, h, gl::RED, image.luma()), (w / 2, h / 2, gl::RG, image.chroma())])
+                {
+                    (gl.glBindTexture)(gl::TEXTURE_2D, *tex);
+                    (gl.glTexSubImage2D)(
+                        gl::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        pw as i32,
+                        ph as i32,
+                        format,
+                        gl::UNSIGNED_BYTE,
+                        data.as_ptr().cast(),
+                    );
+                }
+                (gl.glPixelStorei)(gl::UNPACK_ALIGNMENT, 4);
+            }
+            self.full_range = false;
+            self.has_frame = true;
+            self.draw()
+        })();
+        // The render thread takes the context next.
+        self.egl.release_current();
+        self.gl_thread = None;
+        r
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         self.win = (width.max(1), height.max(1));
         self.egl.resize(self.win.0, self.win.1);
@@ -311,6 +358,10 @@ impl VideoSink for GlVideoSink {
 
 impl Drop for GlVideoSink {
     fn drop(&mut self) {
+        if self.gls.is_some() && self.gl_thread != Some(std::thread::current().id()) {
+            // Dropped on another thread than the last user (a cancelled connect).
+            let _ = self.egl.make_current();
+        }
         self.decoder = None;
         self.release_textures();
     }

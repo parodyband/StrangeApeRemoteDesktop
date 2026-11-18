@@ -43,6 +43,9 @@ pub struct MetalVideoSink {
     presenter: Presenter,
     decoder: Option<VtDecoder>,
     snapshot: Option<PathBuf>,
+    /// Pixel buffers for still images, used in turn (one may still be on screen).
+    stills: Vec<CfRef>,
+    next_still: usize,
 }
 
 // SAFETY: created on the main thread, then moved to and used only by the
@@ -59,7 +62,7 @@ impl MetalVideoSink {
         // SAFETY: called on the main thread by the client (see platform docs);
         // `view` is the live NSView of the winit window.
         let presenter = unsafe { Presenter::new(view, width, height) }.map_err(media::err)?;
-        Ok(MetalVideoSink { presenter, decoder: None, snapshot: None })
+        Ok(MetalVideoSink { presenter, decoder: None, snapshot: None, stills: Vec::new(), next_still: 0 })
     }
 }
 
@@ -94,6 +97,24 @@ impl VideoSink for MetalVideoSink {
     fn snapshot_next(&mut self, path: &Path) -> media::Result<()> {
         self.snapshot = Some(path.to_path_buf());
         Ok(())
+    }
+
+    fn show_image(&mut self, image: &media::Nv12Image) -> media::Result<()> {
+        const RING: usize = 3;
+        if self.stills.first().is_some_and(|pb| vt::dimensions(pb) != (image.width, image.height)) {
+            self.stills.clear();
+        }
+        if self.stills.len() < RING {
+            let pb = vt::new_pixel_buffer(image.width, image.height).map_err(media::err)?;
+            vt::tag_bt709(&pb);
+            self.stills.push(pb);
+            self.next_still = self.stills.len() - 1;
+        }
+        let pb = &self.stills[self.next_still % self.stills.len()];
+        self.next_still = (self.next_still + 1) % RING;
+        vt::write_nv12(pb, &image.data, image.width as usize, image.height as usize).map_err(media::err)?;
+        self.presenter.set_frame(pb).map_err(media::err)?;
+        self.presenter.draw().map_err(media::err)
     }
 
     fn describe(&self) -> String {

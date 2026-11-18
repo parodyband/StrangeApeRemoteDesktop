@@ -54,11 +54,22 @@ pub fn dial(host: &KnownHost, addr: &str, args: &Args) -> Result<Connection> {
 
 /// [`dial`] for a session in `lane` (`proto::lane`).
 pub fn dial_lane(host: &KnownHost, addr: &str, args: &Args, lane: u8) -> Result<Connection> {
+    dial_with_progress(host, addr, args, lane, std::sync::Arc::new(|_| {}))
+}
+
+/// [`dial_lane`], reporting how far it has got (for the connecting screen).
+pub fn dial_with_progress(
+    host: &KnownHost,
+    addr: &str,
+    args: &Args,
+    lane: u8,
+    progress: anywhere::Progress,
+) -> Result<Connection> {
     let dir = config::config_dir();
     let identity = config::load_or_create_identity(&dir)?;
     let mut cfg = crate::net_config(args)?;
     cfg.lane = lane;
-    Ok(anywhere::connect(&dir, host, addr, identity, cfg)?)
+    Ok(anywhere::connect_with_progress(&dir, host, addr, identity, cfg, progress)?)
 }
 
 pub fn opts_from_args(args: &Args) -> Result<SessionOpts> {

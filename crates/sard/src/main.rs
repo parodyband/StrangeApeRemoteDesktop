@@ -4,12 +4,15 @@ mod app;
 mod args;
 mod client;
 mod clipsync;
+mod connecting;
 mod console;
+mod font_atlas;
 mod host;
 mod keymap;
 mod platform;
 mod session;
 mod shell;
+mod status;
 mod terminal;
 mod update;
 

@@ -320,6 +320,20 @@ fn serve(mut ws: WebSocket, hooks: &HostHooks, stop: &AtomicBool, status: &Mutex
     }
 }
 
+/// How far a [`connect_with_progress`] attempt has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Trying the address it had (usually on this network).
+    Local,
+    /// The rendezvous service found it online: also trying its public address.
+    Internet,
+    /// No direct path: going through the relay.
+    Relay,
+}
+
+/// Called (from any thread) as a connect attempt moves through [`Stage`]s.
+pub type Progress = Arc<dyn Fn(Stage) + Send + Sync>;
+
 /// Connect to a paired host: directly at `addr`, and with Connect Anywhere
 /// set up in `dir` also through the rendezvous service (public addresses,
 /// hole punching, then the relay). Whichever path answers first is used.
@@ -331,9 +345,22 @@ pub fn connect(
     identity: crate::crypto::Keypair,
     cfg: crate::net::NetConfig,
 ) -> Result<crate::net::Connection, String> {
+    connect_with_progress(dir, host, addr, identity, cfg, Arc::new(|_| {}))
+}
+
+/// [`connect`], reporting each [`Stage`] it reaches to `progress`.
+pub fn connect_with_progress(
+    dir: &Path,
+    host: &crate::config::KnownHost,
+    addr: &str,
+    identity: crate::crypto::Keypair,
+    cfg: crate::net::NetConfig,
+    progress: Progress,
+) -> Result<crate::net::Connection, String> {
     use crate::net::{Client, NetError};
     use crate::{stun, turn};
     let text = |e: &dyn std::fmt::Display| e.to_string();
+    progress(Stage::Local);
     let Some(service) = Service::load(dir) else {
         return Client::connect(addr, host.key, identity, cfg, Duration::from_secs(8)).map_err(|e| text(&e));
     };
@@ -346,10 +373,13 @@ pub fn connect(
     let host_addrs: Arc<Mutex<Option<Vec<SocketAddr>>>> = Arc::default();
     {
         let (service, found) = (service.clone(), Arc::clone(&host_addrs));
-        let (host_key, me, name) = (host.key, identity.public(), host.name.clone());
+        let (host_key, me, name, progress) = (host.key, identity.public(), host.name.clone(), Arc::clone(&progress));
         std::thread::spawn(move || match service.introduce(&host_key, &me, public.as_slice()) {
             Ok(Some(addrs)) => {
                 info!("Connect Anywhere: {name} is at {addrs:?}");
+                if addrs.iter().any(|a| !crate::net::is_lan(a.ip())) {
+                    progress(Stage::Internet);
+                }
                 *found.lock().unwrap() = Some(addrs.clone());
                 let _ = tx.send(addrs);
             }
@@ -394,6 +424,7 @@ pub fn connect(
     };
     let Some(creds) = service.relay_credentials().map_err(|e| text(&e))? else { return Err(not_reached()) };
     info!("Connect Anywhere: no direct path to {}; using the relay", host.name);
+    progress(Stage::Relay);
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| text(&e))?;
     let relay = turn::allocate(&socket, &creds, host_public, Duration::from_secs(4)).map_err(|e| text(&e))?;
     info!("Connect Anywhere: relay address {}", relay.relayed);
